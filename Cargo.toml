@@ -1,0 +1,39 @@
+# @yah:relay(R582, "oss split: extract yah-base + kamaji from yubaba; finish Stage 2 publish")
+# @yah:status(review)
+# @yah:at(2026-06-28T21:01:26Z)
+# @yah:assignee(agent:bundle-anthropic-ashguard)
+# @yah:parent(Q538)
+# @arch:see(.yah/docs/working/W230-oss-crate-publishing.md)
+# @yah:verify("cargo metadata --format-version 1 --manifest-path oss/yah-base/Cargo.toml >/dev/null")
+# @yah:verify("cargo metadata --format-version 1 --manifest-path oss/kamaji/Cargo.toml >/dev/null")
+# @yah:verify("cargo metadata --format-version 1 >/dev/null")
+# @yah:assumes("Stage 1 verified cargo metadata RESOLUTION only, not a full cargo build/test.")
+# @yah:assumes("yah- renames assume package= alias keeps Rust use workload_spec working without code edits — verify on first rename.")
+# @yah:gotcha("srcgraph publish-HOLD (2026-06-19): do NOT publish srcgraph-* or drop its [patch.crates-io] lines (root Cargo.toml ~640-659); that bridge is load-bearing.")
+# @yah:gotcha("cheers-mock now lives in oss/kamaji (only kamaji-bin uses it, test-only) — intentional, not a stray.")
+# @yah:gotcha("Direct agent git writes are auto-denied by policy; git must run inside an approved ./scripts/*.sh invocation. Shared camp tree — only touch the split files, peers have other in-flight edits.")
+# @yah:gotcha("kamaji-bin AND cheers-mock are publish=false. yubaba dev-deps kamaji-bin (now =0.8.16) + strip-on-export means the standalone yubaba mirror's `cargo test --workspace` (release.yml) can't resolve kamaji-bin from crates.io. Steady-state per-mirror yubaba publish needs either kamaji-bin made publishable OR the kamaji-bin integration test feature-gated out of the standalone build. Does NOT affect the monorepo build (patch redirects to local path regardless of publish=false).")
+# @yah:handoff("Stage 2 plumbing DONE: converted ALL kamaji+yubaba cross-workspace bare path-deps to version=0.8.16 + workspace [patch.crates-io] redirects (qed pattern); added kamaji entries to yubaba patch + workload-spec patch to kamaji; release.yml (OIDC) to yah-base+kamaji; yah-base+kamaji into export-oss.sh ALL_REPOS; strip-on-export (drops workspace [patch.crates-io] on export via ls-tree->awk->mktree, root srcgraph hold untouched); fixed stale qed comment.")
+# @yah:handoff("Rename + repos + scoped commit DONE. yah- renamed workload-spec->yah-workload-spec and local-driver->yah-local-driver across ALL consumers (root patch seam, crates/yah/{agent-tools,hub,gnomes}, app/yah/cli, xtask, oss/{qed,kamaji,yubaba} crates) via package= aliases so `use workload_spec`/`use local_driver` source is unchanged; local-driver pins [lib] name=local_driver; functional -p workload-spec invocations updated (check-workload-spec-ts.sh, export-ts emitted header, generated index.ts + package.json). Created empty public mirrors yah-ai/yah-base + yah-ai/kamaji. Committed Stage1+2+rename as 75d8df7 via scripts/commit-oss-split.sh (EXPLICIT paths only — git recorded the crate moves as renames; the 4 peer/other uncommitted files scryer/long_tier.rs, task-runs/Cargo.toml, cloud/pond.rs, pond_reconciler_smoke.rs were deliberately excluded and remain unstaged). NOT tagged, NOT pushed.")
+# @yah:handoff("Verified: all 5 workspaces (root, yah-base, kamaji, qed, yubaba) cargo-metadata resolve post-rename; commit confirmed clean (excluded files unstaged, none swept). HARD STOP before any crates.io publish — see @yah:next for the operator-gated leaf-first plan.")
+# @yah:next("PUBLISH (operator-gated HARD STOP — do NOT run unconfirmed; leaf-first bootstrap is irreversible). Bootstrap FIRST publish from the MONOREPO (mirrors don't resolve standalone until deps published). Order: (1) DRY_RUN=1 scripts/oss-publish.sh oss/yah-base  # preview; (2) scripts/oss-publish.sh oss/yah-base (publishes yah-workload-spec, fob, yah-object-store, yah-local-driver topology-ordered); (3) oss/kamaji; (4) oss/qed; (5) oss/yubaba. cargo publish --workspace skips publish=false members + waits for registry propagation between crates. Uses local CARGO_REGISTRY_TOKEN/CRATES_IO_TOKEN.")
+# @yah:next("crates.io trusted-publisher per crate (owner yah-ai/<repo>, workflow release.yml) — operator-only; required for STEADY-STATE per-mirror GHA publish, NOT for the monorepo bootstrap above.")
+# @yah:next("First mirror export: scripts/export-oss.sh yah-base kamaji (empty-mirror first-time path), then scripts/export-oss.sh --dry-run qed yubaba to validate strip-on-export against committed HEAD.")
+# @yah:next("R539 (yah- rename relay) is SUBSUMED by R582 — renames landed here in commit 75d8df7. Archive R539 or repoint it.")
+# @yah:next("Steady-state yubaba mirror CI wrinkle (see gotcha): kamaji-bin + cheers-mock are publish=false and yubaba dev-deps kamaji-bin, so the standalone yubaba `cargo test --workspace` can't fetch it from crates.io. Resolve (make kamaji-bin publishable or feature-gate the test) before relying on per-mirror GHA publish of yubaba.")
+
+[workspace]
+members = [
+    "crates/workload-spec",
+    "crates/keys",
+    "crates/object-store",
+    "crates/local-driver",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.8.16"
+edition = "2021"
+authors = ["yah Dev <human@yah.dev>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yah-ai/yah-base"
