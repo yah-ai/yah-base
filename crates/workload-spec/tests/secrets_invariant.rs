@@ -19,8 +19,9 @@ mod secrets {
         let json = serde_json::to_string(&mount).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        let source = &parsed["source"];
-        assert_eq!(source["type"], "local_file", "source.type must be local_file");
+        // Externally tagged: the variant is the key, fields nest beneath it.
+        let source = &parsed["source"]["local_file"];
+        assert!(source.is_object(), "source must be the local_file variant");
 
         // Path reference appears
         assert!(json.contains("api-key"), "path reference must be in JSON");
@@ -47,8 +48,8 @@ mod secrets {
         let json = serde_json::to_string(&mount).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        let source = &parsed["source"];
-        assert_eq!(source["type"], "cluster");
+        let source = &parsed["source"]["cluster"];
+        assert!(source.is_object(), "source must be the cluster variant");
         assert_eq!(source["name"], "cluster-db-password");
 
         assert!(source.get("value").is_none(), "secret value must not appear in JSON");
@@ -63,9 +64,10 @@ mod secrets {
         let json = serde_json::to_string(&target).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed["type"], "env_var");
-        assert_eq!(parsed["name"], "DATABASE_PASSWORD");
-        assert!(parsed.get("value").is_none(), "secret value must not appear in target JSON");
+        let inner = &parsed["env_var"];
+        assert!(inner.is_object(), "target must be the env_var variant");
+        assert_eq!(inner["name"], "DATABASE_PASSWORD");
+        assert!(inner.get("value").is_none(), "secret value must not appear in target JSON");
     }
 
     #[test]
@@ -77,10 +79,11 @@ mod secrets {
         let json = serde_json::to_string(&target).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed["type"], "file");
+        let inner = &parsed["file"];
+        assert!(inner.is_object(), "target must be the file variant");
         assert!(json.contains("tls.crt"), "target path must be in JSON");
-        assert!(parsed.get("content").is_none(), "file content must not appear");
-        assert!(parsed.get("bytes").is_none(), "file bytes must not appear");
+        assert!(inner.get("content").is_none(), "file content must not appear");
+        assert!(inner.get("bytes").is_none(), "file bytes must not appear");
     }
 
     #[test]

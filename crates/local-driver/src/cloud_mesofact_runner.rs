@@ -1,7 +1,7 @@
 //! Cloud-tier mesofact runner bring-up primitives (R330-F11, W059).
 //!
-//! Sibling to [`crate::pond_mesofact_dev`] but for the cloud tier: a single
-//! long-lived bun process supervised by yubaba on the machine F16 places
+//! The cloud-tier counterpart of the (now-retired) pond mesofact-dev bring-up:
+//! a single long-lived bun process supervised by yubaba on the machine F16 places
 //! the `yah-cloud` service onto (today: `us-west-001`, selected by mesh-tag
 //! `tag:cloud-runner` — see `crates/yah/cloud/src/config.rs::CloudConfig::resolve_machine_by_mesh_tags`).
 //!
@@ -31,8 +31,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use workload_spec::{
     EnvValue, EnvVar, ExposeSpec, HealthProbe, Healthcheck, ImageRef, MeshExpose, MeshIdent,
-    Millis, ResourceLimits, RestartPolicy, SchemaVersion, StopPolicy, TierTag, Workload,
-    WorkloadSpec, HOST_NETWORK_ANNOTATION, HOST_NETWORK_VALUE,
+    Millis, NamespaceId, ResourceLimits, RestartPolicy, SchemaVersion, StopPolicy, TenantId,
+    TierTag, Workload, WorkloadSpec, HOST_NETWORK_ANNOTATION, HOST_NETWORK_VALUE,
 };
 
 /// DNS name + mesh identity of the cloud-tier runner workload.
@@ -131,6 +131,8 @@ impl MesofactRunnerSpec {
             name: RUNNER_WORKLOAD_NAME.into(),
             image,
             tier: TierTag("infra".into()),
+            tenant: TenantId::singleton(),
+            namespace: NamespaceId::singleton(),
             replicas: 1,
             // build_oci_spec ignores the image ENTRYPOINT/CMD and runs
             // `command` directly, so spell out tini → almanac-serve here.
@@ -147,7 +149,7 @@ impl MesofactRunnerSpec {
             volumes: vec![],
             resources: ResourceLimits {
                 memory_mb: 256,
-                cpu_shares: 512,
+                cpu_millis: 512,
                 ephemeral_storage_mb: 512,
             },
             depends_on: vec![],
@@ -163,6 +165,7 @@ impl MesofactRunnerSpec {
                 failure_threshold: 3,
             }),
             restart_policy: RestartPolicy::Always,
+            archetype: None,
             stop_policy: StopPolicy {
                 signal: 15,
                 grace_period: grace,
@@ -214,8 +217,7 @@ mod duration_secs_serde {
 }
 
 /// Coordinates of a running cloud-runner returned by the yubaba-side
-/// bring-up. Mirrors [`crate::pond_mesofact_dev::MesofactDevRunning`] in
-/// purpose; only the host endpoint exists at this tier (no bridge).
+/// bring-up; only the host endpoint exists at this tier (no bridge).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MesofactRunnerRunning {
     /// Host-side endpoint — `http://127.0.0.1:<bind_port>`.

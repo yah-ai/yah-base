@@ -544,10 +544,10 @@ pub fn semantic(
         return Err(WorkloadValidationError::Semantic(SemanticError::Unknown {
             path: FieldPath::Resources,
             reason: format!(
-                "machine {:?} lacks capacity (memory={}MB cpu_shares={} ephemeral={}MB)",
+                "machine {:?} lacks capacity (memory={}MB cpu_millis={} ephemeral={}MB)",
                 machine_id.0,
                 spec.resources.memory_mb,
-                spec.resources.cpu_shares,
+                spec.resources.cpu_millis,
                 spec.resources.ephemeral_storage_mb
             ),
         }));

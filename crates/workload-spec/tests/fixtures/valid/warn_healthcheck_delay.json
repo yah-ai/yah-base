@@ -11,16 +11,21 @@
   "replicas": 1,
   "resources": {
     "memory_mb": 128,
-    "cpu_shares": 512,
+    "cpu_millis": 512,
     "ephemeral_storage_mb": 128
   },
-  "restart_policy": {"type": "always"},
+  "restart_policy": "always",
   "stop_policy": {
     "signal": 15,
     "grace_period": 5000
   },
   "healthcheck": {
-    "probe": {"type": "http_get", "path": "/healthz", "port": 8080},
+    "probe": {
+      "http_get": {
+        "path": "/healthz",
+        "port": 8080
+      }
+    },
     "interval": 10000,
     "timeout": 5000,
     "initial_delay": 2000,
@@ -29,7 +34,9 @@
   "expose": {
     "mesh": {
       "identity": "api-svc",
-      "ports": [8080]
+      "ports": [
+        8080
+      ]
     }
   }
 }

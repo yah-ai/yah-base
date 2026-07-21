@@ -11,17 +11,21 @@
   "replicas": 1,
   "resources": {
     "memory_mb": 64,
-    "cpu_shares": 256,
+    "cpu_millis": 256,
     "ephemeral_storage_mb": 64
   },
   "volumes": [
     {
-      "source": {"type": "bind", "host_path": "/opt/yah/config"},
+      "source": {
+        "bind": {
+          "host_path": "/opt/yah/config"
+        }
+      },
       "target": "/config",
       "read_only": true
     }
   ],
-  "restart_policy": {"type": "always"},
+  "restart_policy": "always",
   "stop_policy": {
     "signal": 15,
     "grace_period": 5000
@@ -29,7 +33,9 @@
   "expose": {
     "mesh": {
       "identity": "test-svc",
-      "ports": [8080]
+      "ports": [
+        8080
+      ]
     }
   }
 }

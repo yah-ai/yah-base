@@ -38,6 +38,10 @@ anyhow = "1.0"
 [dev-dependencies]
 serde_json = "1.0"
 toml = "0.8"
+# Binary, non-self-describing wire — the kamaji UDS format. Used to guard that
+# a WorkloadSpec (with its nested ImageRef) survives a postcard round-trip
+# (R590-B3: the untagged ImageRef Deserialize used to die on postcard decode).
+postcard = { version = "1.1", features = ["use-std"] }
 
 # `cargo run -p yah-workload-spec --bin export-ts` regenerates
 # packages/yah/workload-spec/index.ts from the Rust source of truth.

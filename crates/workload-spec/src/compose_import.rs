@@ -29,8 +29,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    EnvValue, EnvVar, ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, RestartPolicy,
-    ResourceLimits, SchemaVersion, StopPolicy, TierTag, VolumeMount, VolumeSource, WorkloadSpec,
+    EnvValue, EnvVar, ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, NamespaceId,
+    RestartPolicy, ResourceLimits, SchemaVersion, StopPolicy, TenantId, TierTag, VolumeMount,
+    VolumeSource, WorkloadSpec,
 };
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -252,6 +253,8 @@ fn translate_service(
         name: mesh_name.clone(),
         image,
         tier: TierTag(tier_str.into()),
+        tenant: TenantId::singleton(),
+        namespace: NamespaceId::singleton(),
         replicas: 1,
         command,
         entrypoint,
@@ -262,12 +265,13 @@ fn translate_service(
         volumes,
         resources: ResourceLimits {
             memory_mb: 256,
-            cpu_shares: 512,
+            cpu_millis: 512,
             ephemeral_storage_mb: 512,
         },
         depends_on,
         healthcheck: None,
         restart_policy,
+        archetype: None,
         stop_policy: StopPolicy {
             signal: 15,
             grace_period: Millis::from_secs(10),

@@ -1,0 +1,37 @@
+[package]
+name = "yah-mesofact-bundle"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "W272 mesofact bundle format: content-addressed manifest + digest types, and a feature-gated R2 blob store (publish / node-side materialize / LRU cache)."
+
+[lib]
+name = "yah_mesofact_bundle"
+path = "src/lib.rs"
+
+[features]
+# Default is types-only (serde + blake3 + toml). The mesofact-build subcamp
+# consumer (R599-F2) links this crate with `default-features = false` so it
+# never pulls the object-store / reqwest weight across the workspace boundary.
+default = []
+
+# The node/cloud store surface: publish an assembled bundle to an object store
+# (append-only, blob-deduped) and materialize one back into an LRU cache dir.
+# Pulls yah-object-store (reqwest). cloud + kamaji enable this; mesofact-build
+# does not.
+store = ["dep:yah-object-store"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+blake3 = "1"
+toml = "0.8"
+thiserror = "1"
+
+# Only linked when the `store` feature is on.
+yah-object-store = { path = "../object-store", version = "0.8.20", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

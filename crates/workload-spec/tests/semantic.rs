@@ -5,9 +5,9 @@ use workload_spec::validate::{
     self, ContextError, FieldPath, ValidationContext, WorkloadValidationError,
 };
 use workload_spec::{
-    ExposeSpec, ImageRef, MachineId, MeshExpose, MeshIdent, Millis,
+    ExposeSpec, ImageRef, MachineId, MeshExpose, MeshIdent, Millis, NamespaceId,
     OperatorExpose, PublicExpose, PublicTls, ResourceLimits, RestartPolicy, SecretMount, SecretRef,
-    SecretTarget, StopPolicy, TierTag, WorkloadSpec,
+    SecretTarget, StopPolicy, TenantId, TierTag, WorkloadSpec,
 };
 use workload_spec::SchemaVersion;
 
@@ -153,6 +153,8 @@ fn minimal_spec() -> WorkloadSpec {
             tag: "3.19".into(),
             digest: workload_spec::testing::test_digest(),
         },
+        tenant: TenantId::singleton(),
+        namespace: NamespaceId::singleton(),
         tier: TierTag("private".into()),
         replicas: 1,
         command: None,
@@ -164,12 +166,13 @@ fn minimal_spec() -> WorkloadSpec {
         volumes: vec![],
         resources: ResourceLimits {
             memory_mb: 64,
-            cpu_shares: 256,
+            cpu_millis: 256,
             ephemeral_storage_mb: 64,
         },
         depends_on: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Always,
+        archetype: None,
         stop_policy: StopPolicy {
             signal: 15,
             grace_period: Millis::from_secs(5),

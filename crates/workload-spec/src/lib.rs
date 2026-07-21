@@ -210,6 +210,41 @@
 //! @yah:verify("Parity test asserts both lowerings produce TaskPlacement{Local, Container} + ForgeCommand::Subprocess + sha256-pinned image — the shared executor dispatch invariant")
 //! @yah:gotcha("Test location pivot: original ticket said `cargo test -p workload-spec lowering_golden_*` but the lowering primitives don't live in workload-spec — ForgeSpec/TaskPlacement are in task, and the actual lowering helpers are in cloud (both consumers live there). Tests landed in cloud as `reconciler::lowering_golden`. If a future consumer outside cloud needs the BuildMode lowering, lift `lower_build_to_forge_spec` up to task::transforms alongside the existing recipe lowering primitives.")
 //! @yah:gotcha("No snapshot/insta infra in workspace — 'Golden files versioned; updates require explicit --update flag' verify line interpreted as hand-coded explicit assertions instead. Drift surfaces as a single-file test diff on the lowering helper, which is more readable than a .snap diff for the small ForgeSpec shape these tests cover.")
+//!
+//! @yah:ticket(R594-F2, "Ingress workload kind in workload-spec: pinned-per-node appliance on public-ip-tainted machines")
+//! @yah:status(review)
+//! @yah:assignee(agent:claude)
+//! @yah:at(2026-07-03T06:03:30Z)
+//! @yah:phase(P2)
+//! @yah:parent(R594)
+//! @yah:next("Add the ingress workload kind to the Workload enum (lib.rs:296) as an appliance in the R572 archetype sense: pinned-per-node, non-drainable, placed by yubaba only on machines carrying a public-ip taint, supervised by kamaji. Depends on R572-F1 (lifecycle archetype discriminator) so the archetype field exists to mark it. Breaking change is fine (pre-release house style); update kamaji-bin server.rs InvalidSpec rejection list deliberately — kamaji MUST accept this kind (it supervises the proxy), unlike MesofactStatic/Almanac/StaticAsset.")
+//! @yah:verify("cargo test -p yah-workload-spec; cargo check -p yubaba -p kamaji-bin; kamaji admission accepts kind=ingress in a unit fixture")
+//! @yah:gotcha("RUNS SOLO: workload-spec is the shared-type DAG sink (yah-base) — every lane (yubaba, kamaji, qed, host app) rebuilds on its change. Pause all other wave-2/3 implementer lanes while this is active, and check R572-T2 (cpu_millis, Handoff) + R572-F1 owner state before claiming — same file.")
+//! @yah:depends_on(R572-F1)
+//! @yah:tier(Cleric)
+//! @yah:handoff("Modeled the W267 public-ingress appliance as a container-shaped workload (Workload::Container(WorkloadSpec)), not a new Workload variant: mark archetype = Some(LifecycleArchetype::Appliance) (R572-F1, pinned/non-drainable) and declare the public-ip placement requirement via a new annotation-based marker on WorkloadSpec (same zero-blast-radius pattern as existing wants_host_network/HOST_NETWORK_ANNOTATION, chosen specifically to avoid the ~26-call-site churn a new plain field forced for R572-F1's archetype field, and to avoid an exhaustive-match update in peer-owned kamaji-proto/codec.rs that a new Workload variant would force). Added: WorkloadSpec::requires_taint() -> Option<&str>, const REQUIRES_TAINT_ANNOTATION = \"yah.placement.requires-taint\", const PUBLIC_IP_TAINT = \"public-ip\", plus doc comments on Workload::Container recording the modeling decision and its rationale, all in oss/yah-base/crates/workload-spec/src/lib.rs (single file changed). This only declares the requirement as inert metadata — matching taint field on machine TOML is R572-F3 (not yet present) and scheduler enforcement is R572-F5; both out of scope here, noted in the doc comments. Verified kamaji needs NO change: deploy_workload's match in kamaji-bin/src/server.rs already dispatches any Workload::Container(_) to the containerd backend regardless of tier/annotations (only MesofactStatic/Almanac/StaticAsset hit the InvalidSpec rejection arm), confirmed by reading the code and by the existing deploy_container_without_feature_says_so / deploy_mesofast_static_is_rejected_as_invalid_spec unit tests both still passing unmodified. 2 new unit tests added (ingress_marked_spec_is_appliance_and_carries_public_ip_placement_requirement, ingress_marked_spec_round_trips_through_json_as_a_container_workload). cargo test -p yah-workload-spec --lib: 38/38 pass. cargo test -p yah-workload-spec --test round_trip: 7 pass, exactly the same pre-existing 2 postcard failures (round_trip_full_spec_through_postcard, workload_container_round_trips_through_postcard — R590-B3, unrelated) as before this change, confirmed not increased. cargo check -p yah-workload-spec / -p yubaba / -p kamaji-bin all clean, plus full cargo check --workspace in both oss/kamaji and oss/yubaba clean (only pre-existing unrelated warnings). No peer-owned file touched or needed.")
+//!
+//! @yah:ticket(R590-B10, "forge workload 256MB cgroup memory limit SIGKILLs real builds — rusty-v8 checkout OOMs (bumped to 32GB stopgap)")
+//! @yah:at(2026-07-12T00:14:52Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:claude)
+//! @yah:parent(R590)
+//! @yah:severity(blocks-on-box-green)
+//! @yah:next("Proper fix: thread a per-step memory request from the pipeline (QedStep) through ForgeSpec -> WorkloadSpec so a build declares its footprint, instead of a blanket forge default. Also consider: build_oci_spec should treat memory_mb==0 as 'omit the cgroup limit' (unlimited) so dedicated build-workers aren't capped by an arbitrary constant; pair with a node-sized default. Revisit the 32GB stopgap once per-step resources land.")
+//! @yah:verify("yah qed run rusty-v8-musl on us-west-002 completes the checkout + gn/ninja compile without an OOM SIGKILL; a small forge task still runs (32GB is a ceiling, not a reservation).")
+//! @yah:gotcha("PROVEN live (2026-07-11): with B7 networking fixed, the rusty-v8 build cloned the full V8 tree then `git checkout third_party/icu` DIED OF SIGNAL 9 (OOM). WorkloadSpec::for_forge set resources.memory_mb=256, which build_oci_spec turns into a hard cgroup memory.limit. /tmp is a RAM-backed tmpfs so the multi-GB source checkout counts against that 256MB too. Bumped for_forge to 32768 (32GB) as a CLI-side stopgap; verified the build proceeds past icu.")
+//! @yah:handoff("FIXED + PROVEN LIVE (2026-07-11). WorkloadSpec::for_forge memory_mb 256 -> 32768 (oss/yah-base/crates/workload-spec/src/lib.rs). CLI-only change (spec is client-built), no kamaji redeploy. RESULT: with B7 networking, the rusty-v8 build previously OOM'd (SIGKILL/signal 9) at the icu git-checkout under the 256MB cgroup cap; now it clones the full V8 tree AND proceeds past icu into cargo/gn compilation (Compiling icu_locale_data/icu_calendar_data...) with task RUNNING. Stopgap 32GB ceiling; proper per-step memory request from the pipeline is the follow-up in the ticket body.")
+//!
+//! @yah:ticket(R546-B7, "workload_spec::Workload envelope is externally tagged (missing serde tag=kind) — no flat on-disk workload.toml can parse through it, broke yah cloud apply for EVERY static-asset component")
+//! @yah:at(2026-07-20T23:52:55Z)
+//! @yah:status(open)
+//! @yah:parent(R546)
+//! @yah:next("DO NOT simply add `#[serde(tag = \"kind\")]` without checking postcard: `Workload` is also a postcard wire type on the kamaji RPC path (kamaji-proto/src/codec.rs matches on it; round_trip tests exist). postcard is non-self-describing and cannot decode internally-tagged enums, so naive tagging risks breaking the kamaji wire. Decide deliberately: (a) tag it and prove the postcard round-trips still pass, or (b) split the types — an on-disk `WorkloadManifest` with tag=kind, leaving `Workload` as the untagged wire type.")
+//! @yah:next("INTERIM FIX ALREADY LANDED (unblocks publishing): static_asset.rs::load_workload no longer routes through the envelope — it deserializes a small `KindProbe { kind }`, validates kind == \"static-asset\", then parses `StaticAssetWorkload` directly. Same approach seed_derivation_for_target already used successfully. This restored `yah cloud apply` and got the x86_64 rusty-v8 artifact published to the CDN (HTTP 200). The ENVELOPE itself is still broken for every other caller/kind.")
+//! @yah:next("Fix the test/example disagreement: lib.rs ~L2544 should assert the FLAT `kind = \"...\"` shape that real files use, and examples/parse_whisper_toml.rs should run in CI so this cannot regress silently again.")
+//! @yah:gotcha("SEVERITY: this silently broke `yah cloud apply` for EVERY static-asset component, not just rusty-v8. Verified against the long-published whisper catalog via the repo's own examples/parse_whisper_toml.rs, which panics with the identical error — so the breakage is general and pre-existing, not caused by the R546 hash edits.")
+//! @yah:gotcha("ROOT CAUSE: `pub enum Workload` (oss/yah-base/crates/workload-spec/src/lib.rs ~L386) derives Deserialize with ONLY `#[serde(rename_all = \"kebab-case\")]` — there is NO `#[serde(tag = \"kind\")]`, despite its own doc comment stating 'the `kind` field on the wire is the serde discriminator'. Without the tag it is EXTERNALLY tagged, so serde wants a map with exactly ONE key (the variant name). Every real workload.toml is FLAT (`kind = \"static-asset\"` + `schema_version` + `[[asset]]` + `[aliases]`), i.e. a multi-key map -> `TomlError: wanted exactly 1 element, more than 1 element`, reported confusingly at line 1 col 1.")
+//! @yah:gotcha("WHY THE UNIT TEST DIDN'T CATCH IT: the passing test at lib.rs ~L2544 feeds the EXTERNALLY-tagged shape `[[static-asset.asset]]`, which no on-disk file actually uses. So the test asserts the broken encoding and the example (parse_whisper_toml.rs) asserting the REAL encoding was never run in CI. The test and the example disagree; the example is right.")
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -219,6 +254,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub mod compose_import;
+pub mod control_plane_install;
 pub mod rollout;
 pub mod secrets;
 pub mod validate;
@@ -280,6 +316,74 @@ pub struct MeshIdent(pub String);
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct TierTag(pub String);
 
+/// Default single-tenant identity written to specs that predate the tenant
+/// axis (W206). Its concrete string is arbitrary — what matters is that a
+/// single-tenant cluster only ever sees this one value, so every per-tenant
+/// isolation primitive collapses to a no-op. See [`TenantId::singleton`].
+pub const DEFAULT_TENANT: &str = "default";
+
+/// Default single-namespace identity for specs that predate the namespace
+/// axis (W206). See [`NamespaceId::singleton`].
+pub const DEFAULT_NAMESPACE: &str = "default";
+
+/// Tenant **isolation** axis (W206). Separates one operator's workloads from
+/// another's at the network / DB / mesh-identity level. Orthogonal to
+/// [`NamespaceId`] (routing/naming) and [`TierTag`] (workload class within a
+/// `(tenant, namespace)` pair).
+///
+/// **Degenerate case:** when a yubaba reconciler sees only one `TenantId`
+/// across every workload on a machine, per-tenant Podman networks collapse
+/// into the shared tier networks, the tenant prefix on mesh identity is
+/// dropped, and PostgreSQL role separation is skipped — isolation primitives
+/// become no-ops. You pay only when more than one tenant is present. Specs
+/// written before this axis existed deserialize to [`TenantId::singleton`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct TenantId(pub String);
+
+impl TenantId {
+    /// The singleton tenant used for back-compat with single-tenant (current)
+    /// deployments. Specs written before the tenant axis existed deserialize
+    /// to this value via the `#[serde(default)]` on [`WorkloadSpec::tenant`],
+    /// keeping the whole cluster single-tenant so every isolation primitive
+    /// stays a no-op.
+    pub fn singleton() -> Self {
+        Self(DEFAULT_TENANT.to_string())
+    }
+
+    /// Whether this is the singleton (degenerate single-tenant) identity.
+    pub fn is_singleton(&self) -> bool {
+        self.0 == DEFAULT_TENANT
+    }
+}
+
+/// Namespace **routing/naming** axis (W206). A pure naming key that never
+/// affects isolation: it selects the config root, disambiguates service DNS
+/// names within a tenant, prefixes object-store bucket names within a tenant's
+/// bucket scope, and selects the provider zone (e.g. `noisetable.com` vs
+/// `yah.dev`). Two namespaces in the same tenant share networks, mesh-identity
+/// space, and PG cluster — they simply cannot collide on workload names or
+/// external domains. Specs written before this axis existed deserialize to
+/// [`NamespaceId::singleton`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct NamespaceId(pub String);
+
+impl NamespaceId {
+    /// The singleton namespace used for back-compat with single-namespace
+    /// (current) deployments. Specs written before the namespace axis existed
+    /// deserialize to this value via the `#[serde(default)]` on
+    /// [`WorkloadSpec::namespace`].
+    pub fn singleton() -> Self {
+        Self(DEFAULT_NAMESPACE.to_string())
+    }
+
+    /// Whether this is the singleton (degenerate single-namespace) identity.
+    pub fn is_singleton(&self) -> bool {
+        self.0 == DEFAULT_NAMESPACE
+    }
+}
+
 // ── Workload (on-disk envelope) ──────────────────────────────────────────────
 
 /// On-disk `workload.toml` manifest. Each variant matches one
@@ -292,7 +396,7 @@ pub struct TierTag(pub String);
 /// kinds carry their own per-reconciler payload shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 pub enum Workload {
     /// Static-site build that publishes an artifact directory to the
     /// service's `static` provider slot. Reconciled by the
@@ -301,6 +405,20 @@ pub enum Workload {
 
     /// Containerd workload handed to yubaba over RPC. The inline fields
     /// are the full [`WorkloadSpec`] minus the `kind` discriminator.
+    ///
+    /// This is also the shape of the W267 sovereign-public-ingress appliance
+    /// (R594-F2): a container-kind workload with `archetype =
+    /// Some(LifecycleArchetype::Appliance)` and
+    /// `requires_taint() == Some(PUBLIC_IP_TAINT)`, **not** a dedicated
+    /// `Workload::ingress(..)` variant. It runs an ordinary OCI image (the
+    /// `passway` proxy, R594-F4) supervised by kamaji exactly like any other
+    /// `Container`, so no admission-list or wire-codec change was needed to
+    /// let kamaji accept it. A new enum variant would have forced an
+    /// exhaustive-match update in every `Workload` consumer, including
+    /// peer-owned `kamaji-proto/src/codec.rs` — the archetype + annotation
+    /// combination expresses "this is the public ingress appliance" without
+    /// that blast radius. See [`WorkloadSpec::requires_taint`] and
+    /// [`LifecycleArchetype::Appliance`].
     Container(WorkloadSpec),
 
     /// Data-pipeline job with declared I/O and a readiness policy. The
@@ -339,7 +457,7 @@ pub struct MesofactStaticWorkload {
     /// Where the build command runs. Default: `HostSide` (mesofact-dev on the
     /// host). Set to `InContainer` for cloud/HA where no host watcher is
     /// present and CI-fidelity build environments are required.
-    #[serde(default, skip_serializing_if = "build_mode_is_default")]
+    #[serde(default)]
     pub build_mode: BuildMode,
 
     /// Optional SSR/SPA runtime companion container.
@@ -353,9 +471,77 @@ pub struct MesofactStaticWorkload {
     /// the object store and all other paths to this container. The companion
     /// uses `RestartPolicy::Always`; the orchestrator (camp or yubaba)
     /// ensures it stays up alongside the Caddy edge.
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub ssr_runtime: Option<WorkloadSpec>,
+
+    /// Serve-time reference to a published W272 bundle (R599-F4).
+    ///
+    /// `Some` → the built app is deployed as a content-addressed bundle that
+    /// kamaji materializes from the bundle store (R599-F1) and serves via its
+    /// native backend, instead of (or in addition to) the build reconciler
+    /// pushing `dist/` to the object-store/CDN. `None` → legacy
+    /// build-and-publish-only workload — kamaji rejects that form as yubaba's
+    /// `mesofact-static` reconciler's responsibility.
+    ///
+    /// No `skip_serializing_if`: like `ssr_runtime`, this field is always
+    /// encoded so the postcard wire codec (non-self-describing, positional)
+    /// round-trips — `skip_serializing_if` would omit the byte on serialize
+    /// while decode still expects it. `#[serde(default)]` keeps every existing
+    /// `mesofact-static` TOML/JSON that predates this field parsing to `None`.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub serve_bundle: Option<MesofactServeBundle>,
+}
+
+/// Serve-time reference to a published W272 bundle (R599-F4) — the
+/// `{bundle_digest, runtime, lifecycle}` triple a `mesofact-static` workload
+/// carries when kamaji, not the build reconciler, serves it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct MesofactServeBundle {
+    /// BLAKE3 digest of the published bundle manifest — the content-address
+    /// kamaji materializes from the bundle store (`yah_mesofact_bundle`,
+    /// R599-F1). Same 64-hex shape the bundle crate's `BundleHash` validates.
+    pub digest: BlakeHash,
+
+    /// Runtime that serves the bundle: `"self"` (bundle ships its own
+    /// `bins/<triple>/serve`) or `"mesofact/<version>"` (resolve the stock
+    /// serve runtime asset from the node cache). Wire-mirrors
+    /// `yah_mesofact_bundle::BundleRuntime`; kept as a plain `String` here so
+    /// workload-spec stays free of the bundle crate and its non-TS/schema
+    /// newtypes.
+    pub runtime: String,
+
+    /// How kamaji supervises the served bundle. Default: keep-alive.
+    #[serde(default)]
+    pub lifecycle: BundleLifecycle,
+}
+
+/// Lifecycle mode for a served bundle (W272 §3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum BundleLifecycle {
+    /// Fork at deploy, keep resident, restart per policy — today's server
+    /// archetype. Memory is resident for the workload's lifetime.
+    KeepAlive,
+
+    /// Kamaji owns the listen socket, forks the runtime on the first connection
+    /// (fd-passing), and reaps it after `idle_ttl` with zero connections — the
+    /// "serverless" tier (zero memory when idle). The JIT fork/reap mechanics
+    /// land in R599-F6; this variant only declares the intent + budget.
+    OnDemand {
+        /// Idle time with no live connections before kamaji reaps the process.
+        idle_ttl: Millis,
+    },
+}
+
+impl Default for BundleLifecycle {
+    /// Keep-alive — the resident server archetype — matches the current
+    /// deploy-and-supervise default.
+    fn default() -> Self {
+        BundleLifecycle::KeepAlive
+    }
 }
 
 /// Build step that produces the static artifact published by a
@@ -368,6 +554,14 @@ pub struct BuildConfig {
 
     /// Output directory (relative to the manifest) the reconciler uploads.
     pub out_dir: PathBuf,
+
+    /// Data-only re-render command (W225 §3 "revalidate"), run from the
+    /// manifest's directory against the **already-built** `out_dir` — no
+    /// bundler. `{route}` is substituted with the invalidated route pattern,
+    /// e.g. `"cargo run -p mesofact-build -- render . --route {route} --all"`.
+    /// Absent → a revalidate dispatch republishes `out_dir` as-is.
+    #[serde(default)]
+    pub render_command: Option<String>,
 }
 
 // ── BuildMode ─────────────────────────────────────────────────────────────────
@@ -385,7 +579,7 @@ pub struct BuildConfig {
 /// sim tiers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum BuildMode {
     /// Build command runs on the host (mesofact-dev watcher). The watcher
     /// publishes the output to the tier's object store (DistPointer for dev,
@@ -406,13 +600,6 @@ pub enum BuildMode {
     },
 }
 
-/// Returns `true` when `m` is the default `BuildMode::HostSide`, used by
-/// `skip_serializing_if` to omit the field from TOML output when it's at the
-/// default value.
-fn build_mode_is_default(m: &BuildMode) -> bool {
-    matches!(m, BuildMode::HostSide)
-}
-
 // ── AlmanacManifest ───────────────────────────────────────────────────────────
 
 /// An observable endpoint the almanac scheduler probes to check readiness.
@@ -423,13 +610,12 @@ fn build_mode_is_default(m: &BuildMode) -> bool {
 /// required; a simple TCP connect or HTTP GET is enough for the dev/sim tier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum AlmanacTarget {
     /// Issue an HTTP GET to `url`; ready when the server responds with
     /// `expect_status` (default: any 2xx).
     Http {
         url: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional = nullable)]
         expect_status: Option<u16>,
     },
@@ -450,7 +636,7 @@ pub enum AlmanacTarget {
 /// handle transient glitches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "policy", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum NotReadyPolicy {
     /// Wait up to `timeout` for all preconditions to pass before aborting
     /// the run. The run is skipped (not rescheduled); the next cadence tick
@@ -488,7 +674,7 @@ impl Default for NotReadyPolicy {
 /// When the almanac scheduler triggers a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum Cadence {
     /// Run once at first opportunity, then never again.
     Once,
@@ -538,12 +724,12 @@ pub struct AlmanacManifest {
 
     /// Input targets that must be reachable before the command runs.
     /// Empty list → no precondition checks (degenerate case).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub inputs: Vec<AlmanacTarget>,
 
     /// Output targets verified after a successful run.
     /// Empty list → no post-run verification.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub outputs: Vec<AlmanacTarget>,
 
     /// What to do when a precondition check fails.
@@ -556,7 +742,7 @@ pub struct AlmanacManifest {
     /// downstream consumers can reload their data (e.g. mesofact-dev
     /// triggers a rebuild when the OpenRouter cache refreshes).
     /// Empty list → no downstream invalidation.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub invalidates: Vec<MeshIdent>,
 }
 
@@ -650,7 +836,7 @@ pub struct TransformSpec {
     /// `{{key}}` substitutions passed to the recipe argv at element
     /// granularity (no shell, no string concat). Empty when the recipe is
     /// fully parameterless.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub params: BTreeMap<String, String>,
 }
 
@@ -686,7 +872,7 @@ pub struct AssetDerive {
 
     /// Post-fetch transform. `None` → the fetched bytes ARE the asset
     /// (entry `blake3` must match fetch `blake3`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     #[ts(optional = nullable)]
     pub transform: Option<TransformSpec>,
 
@@ -694,7 +880,7 @@ pub struct AssetDerive {
     /// receipt). Absent until the first successful build writes it via the
     /// bind path. When present and current, enables the substituter-style
     /// build skip.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     #[ts(optional = nullable)]
     pub lock: Option<DeriveLock>,
 }
@@ -720,7 +906,7 @@ pub struct AssetEntry {
 
     /// Path to a local source file, relative to the `workload.toml` directory.
     /// Mutually exclusive with `derive`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     #[ts(optional = nullable)]
     pub source: Option<PathBuf>,
 
@@ -728,7 +914,7 @@ pub struct AssetEntry {
     /// materializes the bytes into a content-addressed cache; the cache path
     /// then replaces `source` for the rest of the upload pipeline. Mutually
     /// exclusive with `source`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     #[ts(optional = nullable)]
     pub derive: Option<AssetDerive>,
 
@@ -761,7 +947,7 @@ pub struct StaticAssetWorkload {
     ///
     /// Named `asset` on disk (TOML `[[asset]]` array-of-tables) to follow TOML
     /// convention; accessed as `.assets` in Rust code.
-    #[serde(rename = "asset", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "asset", default)]
     pub assets: Vec<AssetEntry>,
 
     /// Canonical logical-name → filename mappings for this component.
@@ -770,8 +956,77 @@ pub struct StaticAssetWorkload {
     /// [`validate::shape_static_asset`]. Mirror files may override individual
     /// entries via `[asset_aliases]` but may never reference filenames absent
     /// from this catalog.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+}
+
+// ── Lifecycle archetype (R572-F1 / W244) ───────────────────────────────────────
+
+/// Explicit lifecycle archetype for a `kind = "container"` workload (W244).
+///
+/// The question that actually matters to a scheduler: *"can I kill this and
+/// recreate it somewhere else?"* Before this field existed, the answer was
+/// inferred per-spec from `volumes.is_empty()` + `restart_policy` — fragile
+/// absence-as-policy, the same trap W243 calls out on the node-taint side.
+/// This type makes the answer structural instead of guessed.
+///
+/// This ticket (R572-F1) adds the discriminator only. The reconciler does not
+/// yet branch on it (R572-F4) and neither does the scheduler (R572-F5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum LifecycleArchetype {
+    /// k8s analogue: Deployment. Stateless and fungible — the scheduler may
+    /// move it, scale it to N replicas, or restart it on a different node
+    /// with zero consequence. Drainable.
+    Server,
+
+    /// k8s analogue: StatefulSet. Stable identity + a volume that must
+    /// follow it; at most one live instance. Not drainable — the reconciler
+    /// must not schedule it onto a different node. Example: a postgres peer,
+    /// headscale (W267/R591).
+    Appliance,
+
+    /// k8s analogue: Job. Runs to completion with declared inputs/outputs,
+    /// then is gone — no steady-state identity. `almanac` is the first
+    /// job-family member; forge runs (`WorkloadSpec::for_forge`, used by QED)
+    /// are the `container`-kind instance of this archetype.
+    Job,
+}
+
+impl LifecycleArchetype {
+    /// The repel-taint key for this archetype (R572-F5). A node carrying the
+    /// taint `"no-<key>"` repels workloads of this class unless they
+    /// explicitly tolerate it.
+    ///
+    /// Examples: `Server` → `"server"` (repelled by `"no-server"`);
+    /// `Appliance` → `"appliance"` (repelled by `"no-appliance"`).
+    pub fn taint_key(&self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Appliance => "appliance",
+            Self::Job => "job",
+        }
+    }
+
+    /// The pre-R572 inference this field replaces, kept only to give
+    /// `WorkloadSpec::effective_archetype` a behavior-preserving fallback for
+    /// specs written before this field existed (`archetype: None`).
+    ///
+    /// A volume that must follow the workload is the strongest signal of
+    /// durable state → [`Self::Appliance`]. Absent that, `RestartPolicy::Never`
+    /// is the existing forge/run-once convention (see
+    /// [`RestartPolicy::Never`]'s doc comment) → [`Self::Job`]. Everything
+    /// else defaults to the common case, [`Self::Server`].
+    fn infer(volumes: &[VolumeMount], restart_policy: &RestartPolicy) -> Self {
+        if !volumes.is_empty() {
+            LifecycleArchetype::Appliance
+        } else if matches!(restart_policy, RestartPolicy::Never) {
+            LifecycleArchetype::Job
+        } else {
+            LifecycleArchetype::Server
+        }
+    }
 }
 
 // ── WorkloadSpec ──────────────────────────────────────────────────────────────
@@ -800,57 +1055,80 @@ pub struct WorkloadSpec {
     /// Tier tag controlling admission control and mesh filtering.
     pub tier: TierTag,
 
+    /// Tenant **isolation** axis (W206). Separates operators' workloads at the
+    /// network / DB / mesh-identity level. Defaults to [`TenantId::singleton`]
+    /// for specs that predate the axis, so single-tenant clusters keep every
+    /// isolation primitive a no-op. Orthogonal to [`Self::tier`] (class) and
+    /// [`Self::namespace`] (routing).
+    #[serde(default = "TenantId::singleton")]
+    pub tenant: TenantId,
+
+    /// Namespace **routing/naming** axis (W206). A pure naming key — never
+    /// affects isolation; disambiguates DNS names and selects config root /
+    /// provider zone within a tenant. Defaults to [`NamespaceId::singleton`].
+    #[serde(default = "NamespaceId::singleton")]
+    pub namespace: NamespaceId,
+
     /// Target replica count. `0` registers the workload without deploying it.
     /// Range: 0–100 (cluster-wide cap; operator can raise it).
     pub replicas: u32,
 
     /// Override the image's `CMD`. `None` leaves the image default.
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub command: Option<Vec<String>>,
 
     /// Override the image's `ENTRYPOINT`. `None` leaves the image default.
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub entrypoint: Option<Vec<String>>,
 
     /// Working directory inside the container.
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub workdir: Option<PathBuf>,
 
     /// User to run as, e.g. `"1000:1000"` or `"appuser"`.
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub user: Option<String>,
 
     /// Environment variables. Values may be literals, secret refs, or
     /// mesh-address references resolved by yubaba at deploy time.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub env: Vec<EnvVar>,
 
     /// Secret mounts. Values never appear in the spec JSON — only references.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub secrets: Vec<SecretMount>,
 
     /// Volume mounts.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub volumes: Vec<VolumeMount>,
 
     /// Hard resource caps enforced by containerd/cgroups.
     pub resources: ResourceLimits,
 
     /// Mesh idents that must reach `Ready` before this workload starts.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub depends_on: Vec<MeshIdent>,
 
     /// Container liveness/readiness probe.
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub healthcheck: Option<Healthcheck>,
 
     /// What yubaba does when the container exits.
     pub restart_policy: RestartPolicy,
+
+    /// Explicit lifecycle archetype (R572-F1 / W244): `server`, `appliance`,
+    /// or `job`. `None` means the spec predates this field (or the author
+    /// didn't set it) — callers MUST NOT read this directly to decide
+    /// drainability; use [`WorkloadSpec::effective_archetype`], which falls
+    /// back to the pre-R572 `volumes`/`restart_policy` inference so no
+    /// existing spec's effective meaning changes.
+    ///
+    /// Additive: this field did not exist before R572-F1. Reconciler (F4)
+    /// and scheduler (F5) branching on the resolved archetype are separate,
+    /// later tickets — this field alone changes no runtime behavior.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub archetype: Option<LifecycleArchetype>,
 
     /// Graceful shutdown configuration.
     pub stop_policy: StopPolicy,
@@ -860,12 +1138,12 @@ pub struct WorkloadSpec {
     pub expose: ExposeSpec,
 
     /// OCI-style labels, passed through to the container. Opaque to yubaba.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
     pub labels: HashMap<String, String>,
 
     /// Yah-specific metadata, conventionally prefixed `yah.*`. Opaque to
     /// yubaba beyond `yah.forge=true` which suppresses the Never-restart guard.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
     pub annotations: HashMap<String, String>,
 }
 
@@ -876,6 +1154,10 @@ impl WorkloadSpec {
     /// forget any of them:
     ///
     /// - `restart_policy = Never`
+    /// - `archetype = Some(LifecycleArchetype::Job)` — a forge run is
+    ///   exactly the `container`-kind instance of the job archetype (W244);
+    ///   set explicitly rather than left to infer since this constructor
+    ///   knows its own shape
     /// - `expose.public = None`, `expose.operator = None`
     /// - `expose.mesh.identity = "forge.<forge_id>"`
     /// - `annotations["yah.forge"] = "true"` (suppresses the shape warning)
@@ -895,9 +1177,16 @@ impl WorkloadSpec {
 
         WorkloadSpec {
             schema_version: SchemaVersion::V1,
+            // NB: DNS-label safe (no dots) — `check_name` validation rejects
+            // dots here. The container_id derives from this; the state-poll
+            // keys off `expose.mesh.identity` (`forge.<id>`) instead, so those
+            // two must be reconciled at the read path, NOT by dotting the name
+            // (see R590-B9).
             name: format!("forge-{forge_id}"),
             image,
             tier,
+            tenant: TenantId::singleton(),
+            namespace: NamespaceId::singleton(),
             replicas: 1,
             command: None,
             entrypoint: None,
@@ -907,13 +1196,26 @@ impl WorkloadSpec {
             secrets: vec![],
             volumes: vec![],
             resources: ResourceLimits {
-                memory_mb: 256,
-                cpu_shares: 512,
+                // R590-B10: forge workloads are BUILDS (cargo, buildkit, a
+                // from-source V8 checkout+compile), not tiny services. The old
+                // 256 MB placeholder became a hard cgroup memory.limit in
+                // build_oci_spec and SIGKILL'd the rusty-v8 build mid-checkout
+                // (git checkout of third_party/icu died of signal 9) — the
+                // more so because /tmp is a RAM-backed tmpfs, so the source
+                // tree counts against this limit too. 32 GiB is a bounded
+                // ceiling that fits the V8 build's >12 GB peak with headroom,
+                // protects the host from a runaway (vs truly unlimited), and is
+                // above physical RAM on smaller build-workers (⇒ effectively
+                // unlimited there). A per-step memory request threaded from the
+                // pipeline is the eventual right model (see R590-B10).
+                memory_mb: 32768,
+                cpu_millis: 512,
                 ephemeral_storage_mb: 512,
             },
             depends_on: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Never,
+            archetype: Some(LifecycleArchetype::Job),
             stop_policy: StopPolicy {
                 signal: 15,
                 grace_period: Millis::from_secs(30),
@@ -952,6 +1254,66 @@ impl WorkloadSpec {
             .map(|v| v == HOST_NETWORK_VALUE)
             .unwrap_or(false)
     }
+
+    /// Resolve the lifecycle archetype (R572-F1 / W244): the explicit
+    /// [`Self::archetype`] if set, otherwise the pre-R572 inference from
+    /// `volumes`/`restart_policy` this field replaces.
+    ///
+    /// This is the one seam callers should use to ask "can I kill and
+    /// reschedule this?" — it is intentionally the *only* place that
+    /// implements the fallback, so behavior for pre-existing specs (no
+    /// `archetype` on disk) is identical to what it was before this field
+    /// existed. Consumers (reconciler R572-F4, scheduler R572-F5) branch on
+    /// the return value; this crate does not itself change any reconciler or
+    /// scheduler behavior.
+    pub fn effective_archetype(&self) -> LifecycleArchetype {
+        self.archetype
+            .unwrap_or_else(|| LifecycleArchetype::infer(&self.volumes, &self.restart_policy))
+    }
+
+    /// Fully-qualified mesh identity `<tenant>/<namespace>/<name>` (W206 /
+    /// R558-F3), where `<name>` is this workload's [`MeshExpose::identity`].
+    ///
+    /// Within a tenant, workloads still address each other by the short
+    /// identity (namespace disambiguates only on collision); the FQN is what
+    /// makes the identity unambiguous across tenants and is exactly what a
+    /// [`MeshPeer::CrossTenant`] grant names.
+    pub fn fq_mesh_identity(&self) -> String {
+        format!(
+            "{}/{}/{}",
+            self.tenant.0, self.namespace.0, self.expose.mesh.identity.0
+        )
+    }
+
+    /// The taint this workload requires its node to carry, if any (R594-F2 /
+    /// W267 sovereign public ingress).
+    ///
+    /// Opt-in via `annotations["yah.placement.requires-taint"] = "<taint
+    /// name>"` (see [`REQUIRES_TAINT_ANNOTATION`]) — same annotation-based,
+    /// zero-blast-radius shape as [`Self::wants_host_network`], chosen so
+    /// declaring this requirement does not force a struct-literal edit at
+    /// every existing `WorkloadSpec { .. }` construction site the way a new
+    /// plain field would (see R572-F1's handoff: ~26 sites for one field).
+    ///
+    /// **This only declares the requirement — nothing matches it yet.** The
+    /// taint itself doesn't exist on the machine-TOML side until
+    /// [R572-F3](yah://arch/symbol/R572) adds a `taints` list there, and
+    /// nothing enforces repel-unless-tolerate placement until
+    /// [R572-F5](yah://arch/symbol/R572)'s scheduler lands. Until then this
+    /// is inert metadata a future scheduler can read.
+    ///
+    /// The public-ingress appliance (W267) is the first user: a
+    /// `kind = "container"` workload with `archetype =
+    /// Some(LifecycleArchetype::Appliance)` and
+    /// `requires_taint() == Some(PUBLIC_IP_TAINT)`, so yubaba may one day
+    /// place it only on machines carrying the `"public-ip"` taint and kamaji
+    /// supervises it like any other container (no new `Workload` variant —
+    /// see [`Workload::Container`]'s doc comment).
+    pub fn requires_taint(&self) -> Option<&str> {
+        self.annotations
+            .get(REQUIRES_TAINT_ANNOTATION)
+            .map(String::as_str)
+    }
 }
 
 /// Annotation key requesting a workload share the host network namespace.
@@ -961,6 +1323,17 @@ pub const HOST_NETWORK_ANNOTATION: &str = "yah.network";
 /// Annotation value (for [`HOST_NETWORK_ANNOTATION`]) selecting host
 /// networking. Any other value leaves the workload in an isolated netns.
 pub const HOST_NETWORK_VALUE: &str = "host";
+
+/// Annotation key declaring that a workload must land only on a node
+/// carrying a specific taint. See [`WorkloadSpec::requires_taint`].
+pub const REQUIRES_TAINT_ANNOTATION: &str = "yah.placement.requires-taint";
+
+/// Taint name (for [`REQUIRES_TAINT_ANNOTATION`]) identifying machines with
+/// a publicly-routable IP — the W267 sovereign-ingress placement
+/// requirement. The corresponding taint field on the machine TOML doesn't
+/// exist yet (R572-F3); this constant is the agreed-upon name both sides
+/// will use once it does.
+pub const PUBLIC_IP_TAINT: &str = "public-ip";
 
 // ── ImageRef ─────────────────────────────────────────────────────────────────
 
@@ -1010,25 +1383,47 @@ impl<'de> Deserialize<'de> for ImageRef {
             digest: String,
         }
 
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            // Order matters for `untagged`: try the string form first so
-            // explicit strings don't get coerced into a struct error.
-            Pinned(String),
-            Struct(Fields),
-        }
-
-        match Repr::deserialize(de)? {
-            Repr::Pinned(s) => {
-                compose_import::parse_pinned_image_ref(&s).map_err(serde::de::Error::custom)
+        // The string-or-struct `untagged` probe requires `deserialize_any`,
+        // which only self-describing formats support. Postcard — the binary
+        // wire behind the kamaji UDS — returns `WontImplement` for it, so a
+        // `Workload::Container(WorkloadSpec)` carrying a nested `ImageRef`
+        // failed to decode and every container deploy 500'd (R590-B3).
+        //
+        // The string form is purely an authoring convenience in human-readable
+        // configs (`image = "ghcr.io/…@sha256:…"` in recipe/workload TOML and
+        // JSON); the binary wire only ever carries the derived struct form
+        // (Serialize is a plain struct derive). So branch on the format: text
+        // keeps the string-or-struct convenience via `untagged`; binary decodes
+        // the plain positional struct with no `deserialize_any`.
+        if de.is_human_readable() {
+            #[derive(Deserialize)]
+            #[serde(untagged)]
+            enum Repr {
+                // Order matters for `untagged`: try the string form first so
+                // explicit strings don't get coerced into a struct error.
+                Pinned(String),
+                Struct(Fields),
             }
-            Repr::Struct(f) => Ok(ImageRef {
+
+            match Repr::deserialize(de)? {
+                Repr::Pinned(s) => {
+                    compose_import::parse_pinned_image_ref(&s).map_err(serde::de::Error::custom)
+                }
+                Repr::Struct(f) => Ok(ImageRef {
+                    registry: f.registry,
+                    repository: f.repository,
+                    tag: f.tag,
+                    digest: f.digest,
+                }),
+            }
+        } else {
+            let f = Fields::deserialize(de)?;
+            Ok(ImageRef {
                 registry: f.registry,
                 repository: f.repository,
                 tag: f.tag,
                 digest: f.digest,
-            }),
+            })
         }
     }
 }
@@ -1044,8 +1439,12 @@ pub mod testing {
     /// Fixed valid-format sha256 digest for test fixtures. All-zeros marker
     /// is impossible for any real image, so a leaked test fixture in a
     /// production code-path surfaces obviously.
-    pub const TEST_DIGEST: &str =
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    ///
+    /// Aliases [`super::ImageRef::UNPINNED_DIGEST`] — the two are deliberately
+    /// the same value: the fixture sentinel and the production "unpinned"
+    /// marker must agree so [`super::ImageRef::pull_ref`]'s tag-fallback fires
+    /// on exactly the digest `catalog_image` writes.
+    pub const TEST_DIGEST: &str = super::ImageRef::UNPINNED_DIGEST;
 
     /// Owned `String` form of [`TEST_DIGEST`] for fixture constructors.
     pub fn test_digest() -> String {
@@ -1069,7 +1468,7 @@ pub struct EnvVar {
 /// Value source for an environment variable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum EnvValue {
     /// Static string baked into the spec.
     Literal { value: String },
@@ -1115,7 +1514,7 @@ pub struct SecretMount {
 /// Where yubaba resolves the secret value from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum SecretRef {
     /// Per-machine yubaba secret store at `/var/lib/yah/yubaba/secrets/`.
     LocalFile { path: PathBuf },
@@ -1128,7 +1527,7 @@ pub enum SecretRef {
 /// How the secret is surfaced inside the container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum SecretTarget {
     /// Injected as an environment variable. Value never appears in spec JSON.
     /// Prefer `File` — env vars leak through subprocess env and log dumps.
@@ -1157,7 +1556,7 @@ pub struct VolumeMount {
 /// Backing source for a volume mount.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum VolumeSource {
     /// Yubaba-managed named volume; created on first use.
     Named { name: String },
@@ -1171,6 +1570,90 @@ pub enum VolumeSource {
     Tmpfs { size_mb: u32 },
 }
 
+// ── Durable forge produced-artifact convention (R603-T5) ──────────────────────
+
+/// Convention for a remote forge step's durable produced artifacts.
+///
+/// A remote build (e.g. the rusty_v8 musl build on a build-worker) writes its
+/// output tarball to a path *inside* the container. The container's rootfs is
+/// destroyed when kamaji reaps the EXITED container — so if the camp daemon is
+/// down when the build finishes, the artifact is gone before boot-reconcile can
+/// retrieve it (R603-T4 surfaced this as `Success`-but-`UNPUBLISHED`).
+///
+/// The fix (R603-T5) is a **host-persistent bind mount**: forge Subprocess
+/// workloads mount [`HOST_ROOT`]`/<forge_id>` onto [`CONTAINER_DIR`], so a
+/// build that writes its `produces` under `/yah/produced` lands the bytes on
+/// the worker's host filesystem. yubaba then reads them back from the host path
+/// ([`host_path`]) — which outlives container reaping — instead of the
+/// unreachable container rootfs.
+///
+/// The container-side path and the host root are a shared convention between
+/// three crates: the qed `build_workload_spec` that adds the mount, kamaji that
+/// binds it, and the yubaba handler that reads + reaps it. Keeping it here (the
+/// crate all three already depend on) is the single source of truth.
+pub mod forge_produced {
+    use std::path::{Path, PathBuf};
+
+    /// Conventional container-side directory a remote forge step writes its
+    /// durable produced artifacts to. Bind-mounted onto a host-persistent dir.
+    pub const CONTAINER_DIR: &str = "/yah/produced";
+
+    /// Host root under which each forge's durable produced dir lives, one
+    /// subdir per run: `<HOST_ROOT>/<forge_id>/`. yubaba owns this directory —
+    /// it creates the per-forge subdir at deploy, serves reads from it, and
+    /// reaps it on teardown / TTL sweep.
+    pub const HOST_ROOT: &str = "/var/lib/yah/qed/produced";
+
+    /// Forge mesh idents are `forge.<id>` (see [`WorkloadSpec::for_forge`]).
+    /// Extract the bare `<id>`, or `None` for a non-forge ident.
+    ///
+    /// [`WorkloadSpec::for_forge`]: super::WorkloadSpec::for_forge
+    pub fn forge_id_from_ident(ident: &str) -> Option<&str> {
+        ident.strip_prefix("forge.")
+    }
+
+    /// The host-persistent produced directory for one forge run.
+    pub fn host_dir(forge_id: &str) -> PathBuf {
+        PathBuf::from(HOST_ROOT).join(forge_id)
+    }
+
+    /// Translate a container-side produced path to its durable host path for a
+    /// given forge run. Returns `None` when `container_path` is not under
+    /// [`CONTAINER_DIR`] (the caller then knows the artifact was not written to
+    /// the durable location and won't survive reaping), or when the relative
+    /// path contains a `..` component (a traversal attempt that could escape the
+    /// per-forge dir — the reader must never serve a file outside it).
+    pub fn host_path(forge_id: &str, container_path: &Path) -> Option<PathBuf> {
+        let rel = container_path.strip_prefix(CONTAINER_DIR).ok()?;
+        if rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return None;
+        }
+        Some(host_dir(forge_id).join(rel))
+    }
+
+    /// The durable produced-dir bind mount for a forge run: host
+    /// `<HOST_ROOT>/<forge_id>` → container [`CONTAINER_DIR`], writable.
+    pub fn durable_mount(forge_id: &str) -> super::VolumeMount {
+        super::VolumeMount {
+            source: super::VolumeSource::Bind {
+                host_path: host_dir(forge_id),
+            },
+            target: PathBuf::from(CONTAINER_DIR),
+            read_only: false,
+        }
+    }
+
+    /// True when `path` is (or is under) the conventional durable produced dir
+    /// — the guard qed uses to enforce that declared `produces` land somewhere
+    /// reap-durable.
+    pub fn is_durable_path(path: &Path) -> bool {
+        path.starts_with(CONTAINER_DIR)
+    }
+}
+
 // ── Resources ─────────────────────────────────────────────────────────────────
 
 /// Hard resource caps enforced by containerd/cgroups at runtime.
@@ -1181,11 +1664,25 @@ pub struct ResourceLimits {
     /// killed if it exceeds this.
     pub memory_mb: u32,
 
-    /// CPU weight (Linux `cpu.shares`). 1024 ≈ one full core.
-    pub cpu_shares: u32,
+    /// CPU **request** in millicores (k8s convention): `1000` = one full core,
+    /// `250` = `.25 CPU`. Unlike a Docker relative weight this is an
+    /// allocatable quantity a bin-packer can subtract from a node's budget.
+    /// `0` means "no CPU limit". Backends that speak a relative weight derive
+    /// it via [`ResourceLimits::cpu_shares`].
+    pub cpu_millis: u32,
 
     /// Cap on the writable layer + tmpfs footprint, in MiB.
     pub ephemeral_storage_mb: u32,
+}
+
+impl ResourceLimits {
+    /// The Docker/OCI relative CPU weight (`cpu.shares`, where `1024` ≈ one
+    /// core) equivalent to this millicore request. The containerd and docker
+    /// backends express CPU as a weight rather than a millicore request, so
+    /// they derive it here instead of storing shares: `1000m` ⇒ `1024`.
+    pub fn cpu_shares(&self) -> u64 {
+        (u64::from(self.cpu_millis) * 1024) / 1000
+    }
 }
 
 // ── Healthcheck ───────────────────────────────────────────────────────────────
@@ -1216,14 +1713,13 @@ pub struct Healthcheck {
 /// Mechanism used to check container health.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum HealthProbe {
     /// HTTP GET to `path` on `port`. A 2xx (or `expect_status` if set)
     /// response counts as healthy.
     HttpGet {
         path: String,
         port: u16,
-        #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional = nullable)]
         expect_status: Option<u16>,
     },
@@ -1240,7 +1736,7 @@ pub enum HealthProbe {
 /// What yubaba does when the container exits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum RestartPolicy {
     /// Restart unconditionally on any exit.
     Always,
@@ -1310,15 +1806,44 @@ pub struct ExposeSpec {
 
     /// Public internet exposure via a Cloudflare tunnel route. `None` means
     /// the workload is not internet-reachable.
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub public: Option<PublicExpose>,
 
     /// Operator-facing exposure via a Tailscale ACL tag. `None` means the
     /// workload is not operator-reachable via Tailscale.
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub operator: Option<OperatorExpose>,
+}
+
+/// A peer permitted to initiate mesh connections to a workload (W206 / R558-F3).
+///
+/// Cross-tenant access is **deny-by-default**: a workload accepts inter-tenant
+/// traffic only from peers it lists explicitly as [`MeshPeer::CrossTenant`].
+/// Same-tenant access stays tier-based ([`MeshPeer::Tier`]) — the pre-R558
+/// model — and an `allow_from` with no `Tier` entries still admits every
+/// same-tenant peer (the historical "empty = allow all" default).
+///
+/// External serde tagging keeps this postcard-safe (R590-B3): no internal tag,
+/// no untagged, no `skip_serializing_if`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MeshPeer {
+    /// Any **same-tenant** workload whose `tier` matches this tag. This is the
+    /// pre-R558 `allow_from` semantics.
+    Tier(TierTag),
+
+    /// A specific workload in **another tenant**, addressed by its fully
+    /// qualified mesh identity `<tenant>/<namespace>/<name>`. There is no
+    /// cross-tenant tier wildcard — each cross-tenant peer is granted
+    /// individually, so a shared fleet stays isolated unless an operator opts
+    /// in here.
+    CrossTenant {
+        tenant: TenantId,
+        namespace: NamespaceId,
+        /// Peer's mesh identity (its [`MeshExpose::identity`]).
+        name: MeshIdent,
+    },
 }
 
 /// Mesh-internal port exposure and peer access control.
@@ -1333,10 +1858,85 @@ pub struct MeshExpose {
     /// it at `<identity>:<port>` on the mesh.
     pub ports: Vec<u16>,
 
-    /// Which tiers may initiate connections to this workload on the mesh. An
-    /// empty list means no peer restriction (yubaba default: allow all).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow_from: Vec<TierTag>,
+    /// Peers permitted to initiate connections to this workload on the mesh
+    /// (W206 / R558-F3). Same-tenant tier rules and explicit cross-tenant
+    /// grants share this one list. With **no** [`MeshPeer::Tier`] entries every
+    /// same-tenant peer is admitted (the historical "empty = allow all"
+    /// default); cross-tenant peers are always denied unless named by a
+    /// [`MeshPeer::CrossTenant`] entry. See [`MeshExpose::admits_peer`].
+    #[serde(default)]
+    pub allow_from: Vec<MeshPeer>,
+}
+
+impl MeshExpose {
+    /// Whether a peer may initiate a mesh connection to a workload whose mesh
+    /// exposure is `self`. `own_tenant` is the tenant of the workload being
+    /// protected; the remaining arguments identify the connecting peer.
+    ///
+    /// Deny-by-default across tenants (W206 / R558-F3):
+    /// - **Same tenant** (`own_tenant == peer_tenant`): admitted when the
+    ///   peer's tier matches a [`MeshPeer::Tier`] rule, or when there are no
+    ///   `Tier` rules at all (historical "empty `allow_from` = allow all
+    ///   same-tenant").
+    /// - **Cross tenant**: admitted only when an explicit
+    ///   [`MeshPeer::CrossTenant`] entry matches the peer's
+    ///   `(tenant, namespace, name)`.
+    pub fn admits_peer(
+        &self,
+        own_tenant: &TenantId,
+        peer_tenant: &TenantId,
+        peer_namespace: &NamespaceId,
+        peer_name: &MeshIdent,
+        peer_tier: &TierTag,
+    ) -> bool {
+        if own_tenant == peer_tenant {
+            let mut has_tier_rule = false;
+            for peer in &self.allow_from {
+                if let MeshPeer::Tier(t) = peer {
+                    has_tier_rule = true;
+                    if t == peer_tier {
+                        return true;
+                    }
+                }
+            }
+            // No same-tenant tier restriction declared → admit all same-tenant.
+            !has_tier_rule
+        } else {
+            self.allow_from.iter().any(|peer| {
+                matches!(
+                    peer,
+                    MeshPeer::CrossTenant { tenant, namespace, name }
+                        if tenant == peer_tenant
+                            && namespace == peer_namespace
+                            && name == peer_name
+                )
+            })
+        }
+    }
+}
+
+/// The name by which a workload is addressed **within its own tenant** (W206 /
+/// R558-F3), given every `(namespace, identity)` pair present in that tenant.
+///
+/// Within a tenant, a workload is reached by its short mesh `identity` when that
+/// identity is unique across the tenant's namespaces. When two namespaces
+/// expose the same identity, the name is ambiguous, so both are disambiguated
+/// by a namespace prefix — `<namespace>.<identity>` (e.g. `yah.runner` vs
+/// `noisetable.runner`). Cross-tenant addressing always uses the full FQN
+/// ([`WorkloadSpec::fq_mesh_identity`]) and is out of scope here.
+pub fn intra_tenant_address(
+    namespace: &NamespaceId,
+    identity: &MeshIdent,
+    tenant_workloads: &[(NamespaceId, MeshIdent)],
+) -> String {
+    let collides = tenant_workloads
+        .iter()
+        .any(|(ns, id)| id == identity && ns != namespace);
+    if collides {
+        format!("{}.{}", namespace.0, identity.0)
+    } else {
+        identity.0.clone()
+    }
 }
 
 /// Public internet exposure via a Cloudflare tunnel route.
@@ -1358,7 +1958,7 @@ pub struct PublicExpose {
 /// TLS mode for a public endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum PublicTls {
     /// Cloudflare manages the TLS certificate (default; requires a proxied DNS
     /// record in the configured zone).
@@ -1383,11 +1983,49 @@ pub struct OperatorExpose {
 // ── ImageRef helpers ──────────────────────────────────────────────────────────
 
 impl ImageRef {
+    /// The all-zeros sha256 digest that marks an image reference as **not
+    /// content-pinned**. No real image can carry it, so a build that never
+    /// injected a compile-time digest (dev builds) or a catalog image that
+    /// isn't published-and-pinned yet lands on this sentinel. This is the
+    /// single source of truth both the catalog emitter
+    /// (`task::default_image::catalog_image`, which writes it) and the
+    /// container-runtime resolvers ([`Self::pull_ref`], via kamaji) agree on —
+    /// keeping them here means they cannot drift. [`testing::TEST_DIGEST`] is
+    /// the same value re-exported for fixtures.
+    pub const UNPINNED_DIGEST: &'static str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
     /// Format this reference as a Docker-compatible image string,
     /// `{registry}/{repository}:{tag}@{digest}`. Tag is included for human
-    /// readability; the digest is what the pull resolves against.
+    /// readability; the digest is what the pull resolves against. Always emits
+    /// the digest — this is the display/logging form; use [`Self::pull_ref`]
+    /// for the string handed to a container runtime.
     pub fn docker_ref(&self) -> String {
         format!("{}/{}:{}@{}", self.registry, self.repository, self.tag, self.digest)
+    }
+
+    /// True when this reference carries a real content-addressed digest, i.e.
+    /// its digest is not the all-zeros [`Self::UNPINNED_DIGEST`] sentinel.
+    pub fn is_pinned(&self) -> bool {
+        self.digest != Self::UNPINNED_DIGEST
+    }
+
+    /// The reference string to hand a container runtime for pull/resolve.
+    ///
+    /// - **Pinned** (real digest): `{registry}/{repository}:{tag}@{digest}` —
+    ///   content-addressed, the reproducible path.
+    /// - **Unpinned** (all-zeros [`Self::UNPINNED_DIGEST`]): `{registry}/{repository}:{tag}`
+    ///   — tag-only. No registry or local store holds an image under the
+    ///   sentinel digest, so `…@sha256:0000…` can never resolve; a
+    ///   tag-pulled or locally-built image is keyed by `registry/repo:tag`.
+    ///   This is the tag-fallback path that lets a not-yet-published catalog
+    ///   image (e.g. a from-source build-worker image) still pull by tag.
+    pub fn pull_ref(&self) -> String {
+        if self.is_pinned() {
+            format!("{}/{}:{}@{}", self.registry, self.repository, self.tag, self.digest)
+        } else {
+            format!("{}/{}:{}", self.registry, self.repository, self.tag)
+        }
     }
 }
 
@@ -1439,6 +2077,63 @@ pub trait WorkloadRuntime: Send + Sync {
 mod tests {
     use super::*;
 
+    // ── R603-T5 durable forge produced convention ──────────────────────────────
+
+    #[test]
+    fn forge_produced_ident_parse() {
+        assert_eq!(forge_produced::forge_id_from_ident("forge.abc123"), Some("abc123"));
+        assert_eq!(forge_produced::forge_id_from_ident("svc.web"), None);
+        assert_eq!(forge_produced::forge_id_from_ident("abc123"), None);
+    }
+
+    #[test]
+    fn forge_produced_host_path_translates_under_convention_dir() {
+        let hp = forge_produced::host_path(
+            "fid",
+            std::path::Path::new("/yah/produced/librusty_v8.tar.gz"),
+        )
+        .expect("path under the convention dir translates");
+        assert_eq!(
+            hp,
+            PathBuf::from("/var/lib/yah/qed/produced/fid/librusty_v8.tar.gz")
+        );
+    }
+
+    #[test]
+    fn forge_produced_host_path_rejects_paths_outside_convention_dir() {
+        assert_eq!(
+            forge_produced::host_path("fid", std::path::Path::new("/tmp/x.tar.gz")),
+            None,
+            "a path outside /yah/produced has no durable host mapping"
+        );
+    }
+
+    #[test]
+    fn forge_produced_host_path_rejects_traversal() {
+        // A `..` component must never let a read escape the per-forge dir.
+        assert_eq!(
+            forge_produced::host_path(
+                "fid",
+                std::path::Path::new("/yah/produced/../../etc/passwd")
+            ),
+            None,
+            "traversal out of the per-forge dir must be refused"
+        );
+    }
+
+    #[test]
+    fn forge_produced_durable_mount_shape() {
+        let m = forge_produced::durable_mount("fid");
+        assert_eq!(m.target, PathBuf::from("/yah/produced"));
+        assert!(!m.read_only, "the build must be able to write to it");
+        assert_eq!(
+            m.source,
+            VolumeSource::Bind {
+                host_path: PathBuf::from("/var/lib/yah/qed/produced/fid"),
+            }
+        );
+    }
+
     const HASH_64: &str = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
 
     #[test]
@@ -1464,6 +2159,45 @@ mod tests {
         let res: Result<BlakeHash, _> =
             serde_json::from_value(serde_json::Value::String(bad.into()));
         assert!(res.is_err());
+    }
+
+    fn image_ref(digest: &str) -> ImageRef {
+        ImageRef {
+            registry: "ghcr.io".into(),
+            repository: "yah-ai/rusty-v8-musl-builder".into(),
+            tag: "latest".into(),
+            digest: digest.into(),
+        }
+    }
+
+    #[test]
+    fn is_pinned_distinguishes_real_digest_from_sentinel() {
+        assert!(!image_ref(ImageRef::UNPINNED_DIGEST).is_pinned());
+        assert!(!image_ref(&testing::test_digest()).is_pinned());
+        assert!(image_ref("sha256:deadbeef").is_pinned());
+    }
+
+    #[test]
+    fn pull_ref_pinned_carries_tag_and_digest() {
+        assert_eq!(
+            image_ref("sha256:deadbeef").pull_ref(),
+            "ghcr.io/yah-ai/rusty-v8-musl-builder:latest@sha256:deadbeef",
+        );
+    }
+
+    #[test]
+    fn pull_ref_unpinned_falls_back_to_tag_only() {
+        // An unpinned catalog image (all-zeros sentinel) resolves by tag —
+        // no store holds `…@sha256:0000…`, so the tag is the only usable key.
+        assert_eq!(
+            image_ref(ImageRef::UNPINNED_DIGEST).pull_ref(),
+            "ghcr.io/yah-ai/rusty-v8-musl-builder:latest",
+        );
+    }
+
+    #[test]
+    fn test_digest_alias_is_the_unpinned_sentinel() {
+        assert_eq!(testing::TEST_DIGEST, ImageRef::UNPINNED_DIGEST);
     }
 
     #[test]
@@ -1804,12 +2538,15 @@ license = "mit"
 
     #[test]
     fn workload_envelope_dispatches_static_asset() {
+        // Externally-tagged: the `static-asset` variant is a wrapping table
+        // (R590-B3 flipped the Workload graph off internal `kind =` tags so the
+        // whole spec is postcard-decodable over the kamaji UDS).
         let src = format!(
             r#"
-kind = "static-asset"
+[static-asset]
 schema_version = "V1"
 
-[[asset]]
+[[static-asset.asset]]
 filename = "foo/bar.bin"
 source   = "sources/bar.bin"
 blake3   = "{HASH_64}"
@@ -1817,5 +2554,184 @@ blake3   = "{HASH_64}"
         );
         let w: Workload = toml::from_str(&src).expect("parse");
         assert!(matches!(w, Workload::StaticAsset(_)));
+    }
+
+    // ── R572-F1: lifecycle archetype discriminator ─────────────────────────
+
+    fn archetype_test_spec(name: &str) -> WorkloadSpec {
+        WorkloadSpec::for_forge(
+            name,
+            ImageRef {
+                registry: "ghcr.io".into(),
+                repository: "yah/test".into(),
+                tag: "latest".into(),
+                digest: testing::test_digest(),
+            },
+            TierTag("infra".into()),
+            vec![],
+        )
+    }
+
+    #[test]
+    fn explicit_archetype_round_trips_through_json_and_wins_over_inference() {
+        for archetype in [
+            LifecycleArchetype::Server,
+            LifecycleArchetype::Appliance,
+            LifecycleArchetype::Job,
+        ] {
+            let mut spec = archetype_test_spec("explicit");
+            // Volumes present + restart_policy Always would infer Appliance
+            // (see effective_archetype_infers_* below) — deliberately
+            // mismatched against every archetype under test so the
+            // assertion actually proves the explicit field wins, not that
+            // it happens to agree with inference.
+            spec.volumes = vec![VolumeMount {
+                source: VolumeSource::Named { name: "data".into() },
+                target: PathBuf::from("/data"),
+                read_only: false,
+            }];
+            spec.restart_policy = RestartPolicy::Always;
+            spec.archetype = Some(archetype);
+
+            let json = serde_json::to_string(&spec).expect("serialize");
+            assert!(
+                json.contains("\"archetype\""),
+                "explicit archetype must be present on the wire"
+            );
+            let back: WorkloadSpec = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(spec, back, "spec did not survive JSON round-trip");
+            assert_eq!(back.archetype, Some(archetype));
+            assert_eq!(
+                back.effective_archetype(),
+                archetype,
+                "explicit archetype must win over the volumes/restart_policy inference"
+            );
+        }
+    }
+
+    #[test]
+    fn archetype_serializes_as_null_when_none() {
+        let mut spec = archetype_test_spec("omitted");
+        spec.archetype = None;
+        let json = serde_json::to_value(&spec).expect("to_value");
+        // Postcard-native (R590-B3): no `skip_serializing_if` anywhere on the
+        // graph, so every field is always on the wire — a None Option is an
+        // explicit `null`, not an absent key. The binary UDS wire is positional
+        // and requires the slot to be present.
+        assert_eq!(json.get("archetype"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn spec_without_archetype_field_deserializes_to_none() {
+        // Simulates an on-disk spec written before R572-F1: no `archetype`
+        // key at all. Omitting the key must still parse to None (the additive-
+        // default contract) even though we now always *emit* the field.
+        let mut spec = archetype_test_spec("pre-existing");
+        spec.archetype = None;
+        let mut json = serde_json::to_value(&spec).expect("to_value");
+        json.as_object_mut().unwrap().remove("archetype");
+        let back: WorkloadSpec = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.archetype, None);
+    }
+
+    #[test]
+    fn effective_archetype_infers_appliance_from_volumes_when_field_absent() {
+        // Pre-R572 behavior: a workload with a volume was understood (by
+        // convention, never a type) to be stateful/pinned. Confirm that
+        // meaning is preserved bit-for-bit through effective_archetype().
+        let mut spec = archetype_test_spec("appliance-inferred");
+        spec.volumes = vec![VolumeMount {
+            source: VolumeSource::Named { name: "pgdata".into() },
+            target: PathBuf::from("/var/lib/postgresql/data"),
+            read_only: false,
+        }];
+        spec.restart_policy = RestartPolicy::Always;
+        spec.archetype = None;
+        assert_eq!(spec.effective_archetype(), LifecycleArchetype::Appliance);
+    }
+
+    #[test]
+    fn effective_archetype_infers_job_from_restart_never_when_field_absent() {
+        // Pre-R572 behavior: RestartPolicy::Never + no volumes is the forge
+        // run-once convention (see RestartPolicy::Never's own doc comment) —
+        // structurally a job. WorkloadSpec::for_forge already produces
+        // exactly this shape; isolate the pure-inference path by clearing
+        // the explicit archetype for_forge now sets.
+        let mut spec = archetype_test_spec("job-inferred");
+        assert!(spec.volumes.is_empty());
+        assert!(matches!(spec.restart_policy, RestartPolicy::Never));
+        spec.archetype = None;
+        assert_eq!(spec.effective_archetype(), LifecycleArchetype::Job);
+    }
+
+    #[test]
+    fn effective_archetype_defaults_to_server_as_the_common_case_when_field_absent() {
+        // Pre-R572 behavior: no volumes + a restartable policy (the common
+        // stateless-web-server shape) inferred as movable/fungible.
+        let mut spec = archetype_test_spec("server-inferred");
+        spec.restart_policy = RestartPolicy::Always;
+        spec.archetype = None;
+        assert_eq!(spec.effective_archetype(), LifecycleArchetype::Server);
+    }
+
+    // ── R594-F2: public-ingress appliance (container-shaped, not a new
+    // Workload variant — see Workload::Container's doc comment) ───────────
+
+    #[test]
+    fn ingress_marked_spec_is_appliance_and_carries_public_ip_placement_requirement() {
+        let mut spec = archetype_test_spec("public-ingress");
+        spec.archetype = Some(LifecycleArchetype::Appliance);
+        spec.annotations.insert(
+            REQUIRES_TAINT_ANNOTATION.to_string(),
+            PUBLIC_IP_TAINT.to_string(),
+        );
+
+        assert_eq!(
+            spec.effective_archetype(),
+            LifecycleArchetype::Appliance,
+            "ingress must be pinned-per-node/non-drainable, the R572 appliance sense"
+        );
+        assert_eq!(
+            spec.requires_taint(),
+            Some(PUBLIC_IP_TAINT),
+            "ingress must declare it can only land on a public-ip-tainted node"
+        );
+
+        // No taint exists to match against yet (R572-F3) and nothing
+        // enforces placement yet (R572-F5) — confirm this ticket stays
+        // declarative-only by checking a spec with no requirement stays
+        // unaffected.
+        let unrelated = archetype_test_spec("unrelated");
+        assert_eq!(unrelated.requires_taint(), None);
+    }
+
+    #[test]
+    fn ingress_marked_spec_round_trips_through_json_as_a_container_workload() {
+        // Mirrors the on-disk envelope: the externally-tagged `container`
+        // variant wrapping the WorkloadSpec, exactly like every other
+        // container-shaped workload. No new Workload variant, no new
+        // discriminator.
+        let mut inner = archetype_test_spec("public-ingress");
+        inner.archetype = Some(LifecycleArchetype::Appliance);
+        inner.annotations.insert(
+            REQUIRES_TAINT_ANNOTATION.to_string(),
+            PUBLIC_IP_TAINT.to_string(),
+        );
+        let workload = Workload::Container(inner.clone());
+
+        let json = serde_json::to_string(&workload).expect("serialize");
+        assert!(json.contains("\"container\""));
+        assert!(json.contains(REQUIRES_TAINT_ANNOTATION));
+        assert!(json.contains(PUBLIC_IP_TAINT));
+
+        let back: Workload = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            Workload::Container(spec) => {
+                assert_eq!(spec, inner);
+                assert_eq!(spec.effective_archetype(), LifecycleArchetype::Appliance);
+                assert_eq!(spec.requires_taint(), Some(PUBLIC_IP_TAINT));
+            }
+            other => panic!("expected Workload::Container, got {other:?}"),
+        }
     }
 }

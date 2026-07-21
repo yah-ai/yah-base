@@ -101,10 +101,32 @@ pub const WARDEN_STATE_CONTAINER_PATH: &str = "/var/lib/yah-yubaba";
 pub const DEFAULT_WARDEN_HTTP_PORT: u16 = 8800;
 
 /// Slot role used to scope `canonical_name` / `canonical_label` for the
-/// yubaba container. The full container name is
-/// `yah-pond-<service>-<env>-yubaba`, grep-friendly alongside the existing
+/// yubaba container. The full container name is `yah-pond-camp-<env>-yubaba`
+/// (see [`WARDEN_CAMP_SCOPE`]), grep-friendly alongside the per-service
 /// `yah-pond-<service>-<env>-object_store` MinIO containers.
 pub const WARDEN_SLOT: &str = "yubaba";
+
+/// The pond yubaba container is a **camp singleton**: one yubaba supervises
+/// every pond cell's sibling workloads, so its name must NOT embed a service
+/// (R602-B2 — before this, the name derived from the *first* pond mirror, so
+/// per-service probes for every non-first cell resolved nothing). It's scoped
+/// to this fixed sentinel + env instead, so every pond cell's probe resolves
+/// the same container. The per-cell appliance containers
+/// (`yah-pond-<svc>-<env>-{object_store,miniflare}`) stay service-scoped —
+/// only the yubaba is shared.
+pub const WARDEN_CAMP_SCOPE: &str = "camp";
+
+/// Canonical name of the camp's pond yubaba container for `env`:
+/// `yah-pond-camp-<env>-yubaba`. The camp (which starts it) and the desktop
+/// probes (which inspect it) MUST agree on this — always go through here.
+pub fn warden_container_name(env: &str) -> String {
+    canonical_name(WARDEN_CAMP_SCOPE, env, WARDEN_SLOT)
+}
+
+/// Canonical label of the camp's pond yubaba container: `camp:<env>:yubaba`.
+pub fn warden_container_label(env: &str) -> String {
+    canonical_label(WARDEN_CAMP_SCOPE, env, WARDEN_SLOT)
+}
 
 /// Bring-up parameters for the pond yubaba-container. Mirrors
 /// [`crate::pond_minio::MinioSpec`] in shape: callers (camp, cloud
@@ -114,9 +136,9 @@ pub struct WardenContainerSpec {
     /// Container image ref (digest-pinned in production; defaults to
     /// [`DEFAULT_WARDEN_IMAGE`] for local builds).
     pub image: String,
-    /// Service identifier used to derive the canonical name + label.
-    pub service: String,
-    /// Environment identifier ("pond", "local", etc).
+    /// Environment identifier ("pond", "local", etc). The container name +
+    /// label are camp-scoped ([`warden_container_name`]) — the yubaba is a
+    /// per-camp singleton, so `env` is the only identity axis it carries.
     pub env: String,
     /// Host port mapped to [`DEFAULT_WARDEN_HTTP_PORT`] inside the container.
     /// `0` picks a random port (caller resolves via `docker port` afterward).
@@ -128,6 +150,16 @@ pub struct WardenContainerSpec {
     /// Host directory that holds yubaba's persistent state across container
     /// life cycles. Bind-mounted to [`WARDEN_STATE_CONTAINER_PATH`].
     pub state_dir: PathBuf,
+    /// Camp's pond state root (`<camp_root>/.yah/infra/pond`), bind-mounted
+    /// **1:1 at the same absolute path** inside the container. The pond
+    /// deploy handler materialises files (miniflare's `worker.js`, MinIO
+    /// data dirs) under per-cell state dirs and then bind-mounts those same
+    /// paths into sibling containers via the host docker socket — the mount
+    /// sources resolve on the *host*, so writes made inside the yubaba
+    /// container must land on the host at the identical path or siblings
+    /// mount stale/absent files. `None` skips the mount (embedded/host-side
+    /// yubaba, tests).
+    pub pond_state_root: Option<PathBuf>,
     /// Extra env vars layered on top of the image defaults (e.g.
     /// `RUST_LOG=yubaba=debug`).
     pub extra_env: BTreeMap<String, String>,
@@ -136,14 +168,14 @@ pub struct WardenContainerSpec {
 impl WardenContainerSpec {
     /// Build a spec with default image + socket path. Caller still must set
     /// `state_dir` to a real host directory.
-    pub fn new(service: impl Into<String>, env: impl Into<String>, state_dir: PathBuf) -> Self {
+    pub fn new(env: impl Into<String>, state_dir: PathBuf) -> Self {
         Self {
             image: DEFAULT_WARDEN_IMAGE.into(),
-            service: service.into(),
             env: env.into(),
             http_port: 0,
             docker_socket_path: PathBuf::from(DEFAULT_DOCKER_SOCKET_PATH),
             state_dir,
+            pond_state_root: None,
             extra_env: BTreeMap::new(),
         }
     }
@@ -169,7 +201,7 @@ pub const DEFAULT_WARDEN_ARGS: &str =
 /// - `-v <docker_socket_path>:/var/run/docker.sock`
 /// - `-v <state_dir>:/var/lib/yah-yubaba`
 /// - `-p <http_port>:8800`
-/// - canonical label/name (`yah-pond-<svc>-<env>-yubaba`)
+/// - camp-scoped label/name (`yah-pond-camp-<env>-yubaba`)
 /// - `YAH_WARDEN_ARGS=--bind 0.0.0.0:8800 --state …` (flags only — the
 ///   `serve` subcommand is supplied by `pond-supervise.sh`; unless overridden
 ///   via [`WardenContainerSpec::extra_env`])
@@ -177,25 +209,42 @@ pub fn build_warden_run_spec(spec: &WardenContainerSpec) -> ContainerRunSpec {
     let mut env = spec.extra_env.clone();
     env.entry("YAH_WARDEN_ARGS".into())
         .or_insert_with(|| DEFAULT_WARDEN_ARGS.into());
+    // Inside this container, loopback is the container itself — pond
+    // liveness probes + S3 admin calls against host-published MinIO/
+    // miniflare ports must route through the host gateway instead
+    // (`crate::pond_probe_host`). OrbStack/Docker Desktop resolve
+    // host.docker.internal natively; the --add-host host-gateway mapping
+    // below covers plain Linux docker.
+    env.entry(crate::POND_PROBE_HOST_ENV.into())
+        .or_insert_with(|| "host.docker.internal".into());
+
+    let mut volumes = vec![
+        (
+            spec.docker_socket_path.clone(),
+            DOCKER_SOCKET_CONTAINER_PATH.into(),
+        ),
+        (spec.state_dir.clone(), WARDEN_STATE_CONTAINER_PATH.into()),
+    ];
+    // Pond state root mounts 1:1 (same path inside) so files the deploy
+    // handler writes for sibling bind-mounts land on the host — see the
+    // field doc on [`WardenContainerSpec::pond_state_root`].
+    if let Some(root) = &spec.pond_state_root {
+        volumes.push((root.clone(), root.display().to_string()));
+    }
 
     ContainerRunSpec {
-        name: canonical_name(&spec.service, &spec.env, WARDEN_SLOT),
+        name: warden_container_name(&spec.env),
         image: spec.image.clone(),
-        label: canonical_label(&spec.service, &spec.env, WARDEN_SLOT),
+        label: warden_container_label(&spec.env),
         ports: vec![(spec.http_port, DEFAULT_WARDEN_HTTP_PORT)],
         env,
-        volumes: vec![
-            (
-                spec.docker_socket_path.clone(),
-                DOCKER_SOCKET_CONTAINER_PATH.into(),
-            ),
-            (spec.state_dir.clone(), WARDEN_STATE_CONTAINER_PATH.into()),
-        ],
+        volumes,
         cmd: vec![],
         cap_add: vec!["SYS_ADMIN".into()],
         cgroupns: Some("private".into()),
         network: None,
         network_aliases: vec![],
+        extra_hosts: vec!["host.docker.internal:host-gateway".into()],
     }
 }
 
@@ -217,16 +266,20 @@ mod tests {
     use super::*;
 
     fn spec_for_test() -> WardenContainerSpec {
-        let mut s = WardenContainerSpec::new("dev-yah", "pond", PathBuf::from("/tmp/state"));
+        let mut s = WardenContainerSpec::new("pond", PathBuf::from("/tmp/state"));
         s.http_port = 8800;
         s
     }
 
     #[test]
-    fn run_spec_has_canonical_name_and_label() {
+    fn run_spec_has_camp_scoped_name_and_label() {
+        // R602-B2: name is camp-scoped, not derived from any service — every
+        // pond cell's probe resolves this same container.
         let crs = build_warden_run_spec(&spec_for_test());
-        assert_eq!(crs.name, "yah-pond-dev-yah-pond-yubaba");
-        assert!(crs.label.contains("dev-yah:pond:yubaba"));
+        assert_eq!(crs.name, "yah-pond-camp-pond-yubaba");
+        assert_eq!(crs.name, warden_container_name("pond"));
+        assert!(crs.label.contains("camp:pond:yubaba"));
+        assert_eq!(crs.label, warden_container_label("pond"));
     }
 
     #[test]

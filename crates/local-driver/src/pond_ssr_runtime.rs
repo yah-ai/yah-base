@@ -25,7 +25,6 @@
 //!   only the yubaba path consumes this (camp builds the spec then POSTs).
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -151,25 +150,33 @@ pub async fn ensure_ssr_runtime_running(
         cgroupns: None,
         network: spec.network.clone(),
         network_aliases,
+        extra_hosts: vec![],
     };
     runtime
         .run(&run_spec)
         .await
         .with_context(|| format!("starting SSR-runtime container {}", spec.container_name))?;
 
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), spec.host_port);
-    if !wait_for_port(addr, spec.ready_timeout).await {
+    // Probe via `pond_probe_host()` (host.docker.internal inside the
+    // containerized pond yubaba); the recorded origin_url stays host-facing.
+    let probe_host = crate::pond_probe_host();
+    if !wait_for_port(&probe_host, spec.host_port, spec.ready_timeout).await {
         let _ = runtime
             .stop_and_remove(&spec.container_name, Duration::from_secs(2))
             .await;
         bail!(
-            "SSR-runtime container did not bind {addr} within {:?}",
+            "SSR-runtime container did not bind {probe_host}:{} within {:?}",
+            spec.host_port,
             spec.ready_timeout,
         );
     }
 
     let origin_url = format!("http://127.0.0.1:{}", spec.host_port);
-    let probe_url = format!("{origin_url}{path}", path = spec.ready_path);
+    let probe_url = format!(
+        "http://{probe_host}:{port}{path}",
+        port = spec.host_port,
+        path = spec.ready_path
+    );
     if !wait_for_http_ready(&probe_url, spec.ready_timeout).await {
         let _ = runtime
             .stop_and_remove(&spec.container_name, Duration::from_secs(2))
@@ -311,11 +318,12 @@ fn lower_volume_mount(
     }
 }
 
-/// Wait for a TCP port to start accepting connections.
-async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
+/// Wait for a TCP port to start accepting connections. Host + port form so
+/// DNS names like `host.docker.internal` resolve (containerized yubaba).
+async fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+        if tokio::net::TcpStream::connect((host, port)).await.is_ok() {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -370,6 +378,8 @@ mod tests {
                 digest: workload_spec::testing::test_digest(),
             },
             tier: TierTag("service".into()),
+            tenant: workload_spec::TenantId::singleton(),
+            namespace: workload_spec::NamespaceId::singleton(),
             replicas: 1,
             command: Some(vec!["bun".into(), "run".into(), "src/ssr.ts".into()]),
             entrypoint: None,
@@ -391,12 +401,13 @@ mod tests {
             }],
             resources: ResourceLimits {
                 memory_mb: 256,
-                cpu_shares: 512,
+                cpu_millis: 512,
                 ephemeral_storage_mb: 256,
             },
             depends_on: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
+            archetype: None,
             stop_policy: StopPolicy {
                 signal: 15,
                 grace_period: workload_spec::Millis::from_secs(10),

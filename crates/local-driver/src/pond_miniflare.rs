@@ -28,7 +28,6 @@
 //!   `pond_smoke` and `yah cloud mirror up`.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -183,34 +182,39 @@ pub async fn ensure_miniflare_running(
         cgroupns: None,
         network: spec.network.clone(),
         network_aliases,
+        extra_hosts: vec![],
     };
     runtime
         .run(&run_spec)
         .await
         .with_context(|| format!("starting miniflare container {}", spec.container_name))?;
 
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), spec.port);
-    if !wait_for_port(addr, spec.ready_timeout).await {
+    // Probe via `pond_probe_host()` (host.docker.internal inside the
+    // containerized pond yubaba); the recorded dev_url stays host-facing.
+    let probe_host = crate::pond_probe_host();
+    if !wait_for_port(&probe_host, spec.port, spec.ready_timeout).await {
         let _ = runtime
             .stop_and_remove(&spec.container_name, Duration::from_secs(2))
             .await;
         bail!(
-            "miniflare container did not bind {addr} within {:?}",
+            "miniflare container did not bind {probe_host}:{} within {:?}",
+            spec.port,
+            spec.ready_timeout,
+        );
+    }
+
+    let probe_url = format!("http://{probe_host}:{}", spec.port);
+    if !wait_for_http_ready(&probe_url, spec.ready_timeout).await {
+        let _ = runtime
+            .stop_and_remove(&spec.container_name, Duration::from_secs(2))
+            .await;
+        bail!(
+            "miniflare container at {probe_url} did not respond within {:?}",
             spec.ready_timeout,
         );
     }
 
     let dev_url = format!("http://127.0.0.1:{}", spec.port);
-    if !wait_for_http_ready(&dev_url, spec.ready_timeout).await {
-        let _ = runtime
-            .stop_and_remove(&spec.container_name, Duration::from_secs(2))
-            .await;
-        bail!(
-            "miniflare container at {dev_url} did not respond within {:?}",
-            spec.ready_timeout,
-        );
-    }
-
     info!(
         dev_url = %dev_url,
         container = %spec.container_name,
@@ -223,11 +227,12 @@ pub async fn ensure_miniflare_running(
     })
 }
 
-/// Wait for a TCP port to start accepting connections.
-async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
+/// Wait for a TCP port to start accepting connections. Host + port form so
+/// DNS names like `host.docker.internal` resolve (containerized yubaba).
+async fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+        if tokio::net::TcpStream::connect((host, port)).await.is_ok() {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {

@@ -37,6 +37,8 @@ fn main() {
     emit!(MachineId);
     emit!(MeshIdent);
     emit!(TierTag);
+    emit!(TenantId);
+    emit!(NamespaceId);
 
     emit!(MeshLookup);
     emit!(EnvValue);
@@ -59,6 +61,7 @@ fn main() {
     emit!(RestartPolicy);
     emit!(StopPolicy);
 
+    emit!(MeshPeer);
     emit!(MeshExpose);
     emit!(PublicTls);
     emit!(PublicExpose);
@@ -70,6 +73,8 @@ fn main() {
     emit!(BuildConfig);
     emit!(BuildMode);
     emit!(MesofactStaticWorkload);
+    emit!(MesofactServeBundle);
+    emit!(BundleLifecycle);
 
     emit!(AlmanacTarget);
     emit!(NotReadyPolicy);

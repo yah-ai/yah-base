@@ -52,8 +52,47 @@ const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'~');
 
-/// Default content-type when the caller doesn't specify one.
+/// Default content-type for keys with no recognized extension.
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Content-type for an object key, inferred from its file extension.
+///
+/// R2 stores whatever Content-Type we send on PUT and serves it back verbatim
+/// (the CDN custom domain does no extension sniffing). An octet-stream default
+/// makes browsers *download* html shells instead of rendering them, so we set
+/// an explicit type for the extensions a static site actually ships. Unknown
+/// or extensionless keys (pointers, the `_yah-manifest.json` sidecar is `.json`
+/// and handled) fall back to [`DEFAULT_CONTENT_TYPE`].
+fn content_type_for_key(key: &str) -> &'static str {
+    let ext = match key.rsplit_once('.') {
+        // A `.` in a directory segment is not an extension.
+        Some((_, e)) if !e.contains('/') => e,
+        _ => "",
+    };
+    match ext.to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" | "map" => "application/json",
+        "webmanifest" => "application/manifest+json",
+        "xml" => "application/xml",
+        "txt" => "text/plain; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "wasm" => "application/wasm",
+        "pdf" => "application/pdf",
+        _ => DEFAULT_CONTENT_TYPE,
+    }
+}
 
 /// R2-backed [`ObjectStore`].
 ///
@@ -65,7 +104,22 @@ pub struct R2ObjectStore {
     bucket: String,
     access_key: String,
     secret_key: String,
-    client: Client,
+    client: Option<Client>,
+}
+
+impl Drop for R2ObjectStore {
+    fn drop(&mut self) {
+        // `reqwest::blocking::Client` owns a background tokio runtime whose
+        // Drop panics with "Cannot drop a runtime in a context where blocking
+        // is not allowed" when the drop happens inside an async context. This
+        // fires when an `Arc<R2ObjectStore>` reaches zero from inside an
+        // awaited future (e.g. publish_to_r2). Detach the shutdown onto a
+        // fresh OS thread which has no tokio runtime context, so the client's
+        // Drop can shut its internal runtime down cleanly. Dep-neutral — this
+        // crate keeps its sync/tokio-free profile.
+        let Some(client) = self.client.take() else { return };
+        std::thread::spawn(move || drop(client));
+    }
 }
 
 impl R2ObjectStore {
@@ -88,8 +142,14 @@ impl R2ObjectStore {
             bucket: bucket.into(),
             access_key: access_key.into(),
             secret_key: secret_key.into(),
-            client,
+            client: Some(client),
         })
+    }
+
+    fn client(&self) -> &Client {
+        self.client
+            .as_ref()
+            .expect("client is Some until Drop takes it")
     }
 
     /// Construct from the yah keystore (vault), falling back to env vars.
@@ -147,7 +207,7 @@ impl ObjectStore for R2ObjectStore {
         let headers = sign_s3_put_object(
             &url,
             &body_sha256,
-            DEFAULT_CONTENT_TYPE,
+            content_type_for_key(key),
             data.len(),
             R2_REGION,
             &self.access_key,
@@ -156,7 +216,7 @@ impl ObjectStore for R2ObjectStore {
         .map_err(|e| Error::Backend(format!("sign PUT {key}: {e}")))?;
 
         let resp = self
-            .client
+            .client()
             .put(&url)
             .headers(headers)
             .body(data)
@@ -182,7 +242,7 @@ impl ObjectStore for R2ObjectStore {
         .map_err(|e| Error::Backend(format!("sign GET {key}: {e}")))?;
 
         let resp = self
-            .client
+            .client()
             .get(&url)
             .headers(headers)
             .send()
@@ -214,7 +274,7 @@ impl ObjectStore for R2ObjectStore {
         .map_err(|e| Error::Backend(format!("sign HEAD {key}: {e}")))?;
 
         let resp = self
-            .client
+            .client()
             .head(&url)
             .headers(headers)
             .send()
@@ -239,7 +299,7 @@ impl ObjectStore for R2ObjectStore {
         .map_err(|e| Error::Backend(format!("sign DELETE {key}: {e}")))?;
 
         let resp = self
-            .client
+            .client()
             .delete(&url)
             .headers(headers)
             .send()
@@ -276,7 +336,7 @@ impl ObjectStore for R2ObjectStore {
         let mut headers = sign_s3_put_object(
             &url,
             &body_sha256,
-            DEFAULT_CONTENT_TYPE,
+            content_type_for_key(key),
             data.len(),
             R2_REGION,
             &self.access_key,
@@ -296,7 +356,7 @@ impl ObjectStore for R2ObjectStore {
         }
 
         let resp = self
-            .client
+            .client()
             .put(&url)
             .headers(headers)
             .body(data)
@@ -336,7 +396,7 @@ impl ObjectStore for R2ObjectStore {
         .map_err(|e| Error::Backend(format!("sign HEAD {key}: {e}")))?;
 
         let resp = self
-            .client
+            .client()
             .head(&url)
             .headers(headers)
             .send()
@@ -406,7 +466,7 @@ impl R2ObjectStore {
             .map_err(|e| Error::Backend(format!("sign LIST {prefix}: {e}")))?;
 
             let resp = self
-                .client
+                .client()
                 .get(&url_with_query)
                 .headers(headers)
                 .send()
@@ -603,5 +663,20 @@ mod tests {
             s.object_url("yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz"),
             "https://acct.r2.cloudflarestorage.com/b/yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz"
         );
+    }
+
+    #[test]
+    fn content_type_inferred_from_extension() {
+        assert_eq!(
+            content_type_for_key("yah-marketing/cloud/index.html"),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(content_type_for_key("app.css"), "text/css; charset=utf-8");
+        assert_eq!(content_type_for_key("bundle.mjs"), "text/javascript; charset=utf-8");
+        assert_eq!(content_type_for_key("illustrations/horse.webp"), "image/webp");
+        assert_eq!(content_type_for_key("manifest.json"), "application/json");
+        // Extensionless keys (pointers) and dotted directory segments fall back.
+        assert_eq!(content_type_for_key("pointers/releases"), DEFAULT_CONTENT_TYPE);
+        assert_eq!(content_type_for_key("v1.2/binary"), DEFAULT_CONTENT_TYPE);
     }
 }

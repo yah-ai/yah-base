@@ -445,6 +445,25 @@ impl LocalRuntime {
         Ok(true)
     }
 
+    /// Build a local image from a Dockerfile via `docker build -t <tag>
+    /// -f <dockerfile> <context>`. Unlike [`ensure_image`](Self::ensure_image)
+    /// (which pulls a published ref) this compiles the component's own image
+    /// from source — the `kind = "container"` reconciler path (R602-T1).
+    ///
+    /// `dockerfile` is the path to the Dockerfile; `context` is the build
+    /// context directory. Both are passed to `docker` verbatim, so the caller
+    /// resolves them to real paths first. Docker's layer cache makes repeat
+    /// builds of an unchanged tree cheap, so callers may build unconditionally
+    /// on every reconcile without a separate freshness check.
+    pub async fn build_image(&self, tag: &str, dockerfile: &Path, context: &Path) -> Result<()> {
+        let dockerfile = dockerfile.to_string_lossy();
+        let context = context.to_string_lossy();
+        self.run_capture(&["build", "-t", tag, "-f", &dockerfile, &context])
+            .await
+            .with_context(|| format!("docker build -t {tag}"))?;
+        Ok(())
+    }
+
     /// Idempotently create a docker bridge network. Returns `true` if a
     /// network was created, `false` if one already existed under `name`.
     /// Used by the pond per-cell bridge bring-up (R455-F1).
@@ -666,6 +685,13 @@ pub struct ContainerRunSpec {
     /// on the same bridge can reach this container by name regardless of its
     /// container name. Ignored when [`network`] is `None`.
     pub network_aliases: Vec<String>,
+    /// Extra `/etc/hosts` entries forwarded as `--add-host <entry>` (e.g.
+    /// `host.docker.internal:host-gateway`). The pond yubaba-container
+    /// (R408-T2) uses this so probes against host-published ports resolve on
+    /// Linux docker, where `host.docker.internal` is not provided by default
+    /// (OrbStack and Docker Desktop define it natively; the redundant
+    /// mapping is harmless there).
+    pub extra_hosts: Vec<String>,
 }
 
 impl ContainerRunSpec {
@@ -684,6 +710,7 @@ impl ContainerRunSpec {
             cgroupns: None,
             network: None,
             network_aliases: vec![],
+            extra_hosts: vec![],
         }
     }
 
@@ -715,6 +742,10 @@ impl ContainerRunSpec {
                 args.push("--network-alias".into());
                 args.push(alias.clone());
             }
+        }
+        for entry in &self.extra_hosts {
+            args.push("--add-host".into());
+            args.push(entry.clone());
         }
         for (host, container) in &self.ports {
             args.push("-p".into());
@@ -889,6 +920,7 @@ fn workload_spec_to_crs(spec: &WorkloadSpec) -> ContainerRunSpec {
         cgroupns: None,
         network: None,
         network_aliases: vec![],
+        extra_hosts: vec![],
     }
 }
 
@@ -1194,6 +1226,8 @@ mod tests {
                 digest: workload_spec::testing::test_digest(),
             },
             tier: TierTag("infra".into()),
+            tenant: workload_spec::TenantId::singleton(),
+            namespace: workload_spec::NamespaceId::singleton(),
             replicas: 1,
             command: None,
             entrypoint: None,
@@ -1202,10 +1236,11 @@ mod tests {
             env: vec![],
             secrets: vec![],
             volumes: vec![],
-            resources: ResourceLimits { memory_mb: 256, cpu_shares: 512, ephemeral_storage_mb: 256 },
+            resources: ResourceLimits { memory_mb: 256, cpu_millis: 512, ephemeral_storage_mb: 256 },
             depends_on: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
+            archetype: None,
             stop_policy: StopPolicy { signal: 15, grace_period: Millis::from_secs(10) },
             expose: ExposeSpec {
                 mesh: MeshExpose { identity: MeshIdent(name.into()), ports: vec![], allow_from: vec![] },

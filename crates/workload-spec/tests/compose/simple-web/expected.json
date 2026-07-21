@@ -12,13 +12,32 @@
       "tier": "private",
       "replicas": 1,
       "env": [
-        { "name": "LOG_LEVEL", "value": { "type": "literal", "value": "info" } }
+        {
+          "name": "LOG_LEVEL",
+          "value": {
+            "literal": {
+              "value": "info"
+            }
+          }
+        }
       ],
-      "resources": { "memory_mb": 256, "cpu_shares": 512, "ephemeral_storage_mb": 512 },
-      "restart_policy": { "type": "always" },
-      "stop_policy": { "signal": 15, "grace_period": 10000 },
+      "resources": {
+        "memory_mb": 256,
+        "cpu_millis": 512,
+        "ephemeral_storage_mb": 512
+      },
+      "restart_policy": "always",
+      "stop_policy": {
+        "signal": 15,
+        "grace_period": 10000
+      },
       "expose": {
-        "mesh": { "identity": "web", "ports": [80] }
+        "mesh": {
+          "identity": "web",
+          "ports": [
+            80
+          ]
+        }
       }
     }
   ]

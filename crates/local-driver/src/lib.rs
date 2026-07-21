@@ -33,7 +33,7 @@
 
 pub mod cloud_mesofact_runner;
 pub mod local_runtime;
-pub mod pond_mesofact_dev;
+pub mod passway_ingress;
 pub mod pond_miniflare;
 pub mod pond_minio;
 pub mod pond_ssr_runtime;
@@ -46,3 +46,23 @@ pub use local_runtime::{
     LocalRuntime, OwnedContainer, RuntimePref, RuntimeProvider, SocketRuntimeProvider, LABEL_KEY,
     NAME_PREFIX,
 };
+
+/// Env var overriding the host used to probe pond containers' published
+/// host ports. Unset (the host-side default) means `127.0.0.1`.
+///
+/// The containerized pond yubaba (R454-F1) sets this to
+/// `host.docker.internal`: inside that container, loopback is the yubaba
+/// container itself, so liveness probes and S3 admin calls against
+/// host-published MinIO/miniflare ports must route through the host
+/// gateway instead. `pond_warden::build_warden_run_spec` injects the env
+/// var + the `--add-host host.docker.internal:host-gateway` mapping.
+pub const POND_PROBE_HOST_ENV: &str = "YAH_POND_PROBE_HOST";
+
+/// Host used for probing pond containers' published host ports — see
+/// [`POND_PROBE_HOST_ENV`]. `127.0.0.1` unless the env var overrides it.
+pub fn pond_probe_host() -> String {
+    std::env::var(POND_PROBE_HOST_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}

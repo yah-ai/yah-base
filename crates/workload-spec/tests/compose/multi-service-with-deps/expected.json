@@ -12,15 +12,43 @@
       "tier": "private",
       "replicas": 1,
       "env": [
-        { "name": "DATABASE_URL", "value": { "type": "literal", "value": "postgres://db:5432/app" } },
-        { "name": "LOG_LEVEL", "value": { "type": "literal", "value": "debug" } }
+        {
+          "name": "DATABASE_URL",
+          "value": {
+            "literal": {
+              "value": "postgres://db:5432/app"
+            }
+          }
+        },
+        {
+          "name": "LOG_LEVEL",
+          "value": {
+            "literal": {
+              "value": "debug"
+            }
+          }
+        }
       ],
-      "resources": { "memory_mb": 256, "cpu_shares": 512, "ephemeral_storage_mb": 512 },
-      "depends_on": ["db"],
-      "restart_policy": { "type": "always" },
-      "stop_policy": { "signal": 15, "grace_period": 10000 },
+      "resources": {
+        "memory_mb": 256,
+        "cpu_millis": 512,
+        "ephemeral_storage_mb": 512
+      },
+      "depends_on": [
+        "db"
+      ],
+      "restart_policy": "always",
+      "stop_policy": {
+        "signal": 15,
+        "grace_period": 10000
+      },
       "expose": {
-        "mesh": { "identity": "api", "ports": [3000] }
+        "mesh": {
+          "identity": "api",
+          "ports": [
+            3000
+          ]
+        }
       }
     },
     {
@@ -35,13 +63,30 @@
       "tier": "private",
       "replicas": 1,
       "env": [
-        { "name": "POSTGRES_PASSWORD", "value": { "type": "literal", "value": "secret" } }
+        {
+          "name": "POSTGRES_PASSWORD",
+          "value": {
+            "literal": {
+              "value": "secret"
+            }
+          }
+        }
       ],
-      "resources": { "memory_mb": 256, "cpu_shares": 512, "ephemeral_storage_mb": 512 },
-      "restart_policy": { "type": "always" },
-      "stop_policy": { "signal": 15, "grace_period": 10000 },
+      "resources": {
+        "memory_mb": 256,
+        "cpu_millis": 512,
+        "ephemeral_storage_mb": 512
+      },
+      "restart_policy": "always",
+      "stop_policy": {
+        "signal": 15,
+        "grace_period": 10000
+      },
       "expose": {
-        "mesh": { "identity": "db", "ports": [] }
+        "mesh": {
+          "identity": "db",
+          "ports": []
+        }
       }
     }
   ]

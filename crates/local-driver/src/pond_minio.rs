@@ -36,7 +36,6 @@
 //! @yah:gotcha("MiniflareSupervision now carries runtime+container_name (was cancel-only) — registry teardown paths in pond.rs (insert_full prior-replace, mark_failed, shutdown_all) call stop_and_remove on it now.")
 //! @yah:gotcha("miniflare-sim.mjs reads MF_HOST (defaults to 127.0.0.1 for backward compat); container path injects MF_HOST=0.0.0.0 so the published port is reachable.")
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -175,45 +174,56 @@ pub async fn ensure_minio_running(
         cgroupns: None,
         network: spec.network.clone(),
         network_aliases,
+        extra_hosts: vec![],
     };
     runtime
         .run(&run_spec)
         .await
         .with_context(|| format!("starting MinIO container {}", spec.container_name))?;
 
-    let api_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), spec.api_port);
-    if !wait_for_port(api_addr, spec.ready_timeout).await {
+    // Probes + S3 admin calls go through `pond_probe_host()`: 127.0.0.1 when
+    // this code runs on the host (CLI, pond_smoke), `host.docker.internal`
+    // when it runs inside the containerized pond yubaba (R454-F1) — there,
+    // loopback would be the yubaba container itself, not the host that
+    // publishes MinIO's ports. Recorded endpoints stay host-facing so the
+    // desktop's links + credentials file keep working.
+    let probe_host = crate::pond_probe_host();
+    if !wait_for_port(&probe_host, spec.api_port, spec.ready_timeout).await {
         let _ = runtime
             .stop_and_remove(&spec.container_name, Duration::from_secs(2))
             .await;
         bail!(
-            "MinIO container did not bind {api_addr} within {:?}",
+            "MinIO container did not bind {probe_host}:{} within {:?}",
+            spec.api_port,
             spec.ready_timeout,
         );
     }
 
-    let endpoint = format!("http://127.0.0.1:{}", spec.api_port);
-    let health_url = format!("{endpoint}/minio/health/ready");
+    let probe_endpoint = format!("http://{probe_host}:{}", spec.api_port);
+    let health_url = format!("{probe_endpoint}/minio/health/ready");
     if !wait_for_http_ready(&health_url, spec.ready_timeout).await {
         let _ = runtime
             .stop_and_remove(&spec.container_name, Duration::from_secs(2))
             .await;
         bail!(
-            "MinIO container at {endpoint} did not pass {health_url} within {:?}",
+            "MinIO container at {probe_endpoint} did not pass {health_url} within {:?}",
             spec.ready_timeout,
         );
     }
 
-    if let Err(e) = ensure_bucket_public(&endpoint, &spec.bucket, &spec.user, &spec.password).await
+    if let Err(e) =
+        ensure_bucket_public(&probe_endpoint, &spec.bucket, &spec.user, &spec.password).await
     {
         let _ = runtime
             .stop_and_remove(&spec.container_name, Duration::from_secs(2))
             .await;
         return Err(e.context(format!(
-            "ensuring bucket {bucket:?} on pond MinIO at {endpoint}",
+            "ensuring bucket {bucket:?} on pond MinIO at {probe_endpoint}",
             bucket = spec.bucket,
         )));
     }
+
+    let endpoint = format!("http://127.0.0.1:{}", spec.api_port);
 
     let bridge_endpoint = spec
         .network
@@ -302,11 +312,13 @@ fn public_read_bucket_policy(bucket: &str) -> String {
     )
 }
 
-/// Wait for a TCP port to start accepting connections.
-async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
+/// Wait for a TCP port to start accepting connections. Takes host + port
+/// (rather than a `SocketAddr`) so DNS names like `host.docker.internal`
+/// resolve — the containerized pond yubaba probes through the host gateway.
+async fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+        if tokio::net::TcpStream::connect((host, port)).await.is_ok() {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
