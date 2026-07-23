@@ -30,7 +30,7 @@ toml = "0.8"
 thiserror = "1"
 
 # Only linked when the `store` feature is on.
-yah-object-store = { path = "../object-store", version = "0.8.20", optional = true }
+yah-object-store = { path = "../object-store", version = "0.8.21", optional = true }
 
 [dev-dependencies]
 serde_json = "1"

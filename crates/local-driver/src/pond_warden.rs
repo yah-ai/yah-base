@@ -188,8 +188,20 @@ impl WardenContainerSpec {
 /// clap sees a doubled subcommand and the container crash-loops (R471 redux).
 /// Callers that need a different bind address or extra flags can override via
 /// [`WardenContainerSpec::extra_env`].
-pub const DEFAULT_WARDEN_ARGS: &str =
-    "--bind 0.0.0.0:8800 --state /var/lib/yah-yubaba/identity.json";
+/// `--kamaji-socket` makes yubaba dial the kamaji sibling that
+/// `pond-supervise.sh` already starts in the same container. Without it yubaba
+/// never talks to kamaji and pond falls back to driving the docker CLI itself
+/// with per-slot resurrect loops (R626-F2). The path matches the image's
+/// `KAMAJI_SOCK` default and the supervisor script's own default.
+pub const DEFAULT_WARDEN_ARGS: &str = "--bind 0.0.0.0:8800 \
+     --state /var/lib/yah-yubaba/identity.json \
+     --kamaji-socket /run/kamaji/kamaji.sock";
+
+/// Docker socket path *inside* the warden container — the same bind mount the
+/// warden's own `LocalRuntime` uses. Kamaji is told to supervise this daemon
+/// explicitly rather than inheriting an ambient `DOCKER_HOST`: a supervisor
+/// must not adopt a daemon nobody asked it to (R626-F1).
+const KAMAJI_DOCKER_ENV_VALUE: &str = "unix:///var/run/docker.sock";
 
 /// Translate a [`WardenContainerSpec`] into the [`ContainerRunSpec`] that
 /// [`crate::LocalRuntime::run`] will emit as `docker run …`. Pure: builds
@@ -217,6 +229,12 @@ pub fn build_warden_run_spec(spec: &WardenContainerSpec) -> ContainerRunSpec {
     // below covers plain Linux docker.
     env.entry(crate::POND_PROBE_HOST_ENV.into())
         .or_insert_with(|| "host.docker.internal".into());
+    // Attach kamaji's docker backend to the mounted host socket (R626-F2), so
+    // the pond slots it deploys carry a restart policy and dockerd — not a
+    // yubaba loop — owns resurrecting them. `pond-supervise.sh` starts kamaji
+    // with no backend flags, and kamaji reads this env var itself.
+    env.entry("KAMAJI_DOCKER".into())
+        .or_insert_with(|| KAMAJI_DOCKER_ENV_VALUE.into());
 
     let mut volumes = vec![
         (
@@ -323,6 +341,35 @@ mod tests {
             Some(DEFAULT_WARDEN_ARGS),
             "build_warden_run_spec must inject YAH_WARDEN_ARGS so pond-supervise.sh \
              starts `yah-yubaba serve` on the expected port"
+        );
+    }
+
+    /// The two halves of R626-F2's wiring: yubaba must dial the kamaji sibling
+    /// (`--kamaji-socket`), and that kamaji must have a docker backend attached
+    /// (`KAMAJI_DOCKER`). Drop either and pond silently falls back to its own
+    /// resurrect loops — the exact behaviour the migration removes.
+    #[test]
+    fn warden_wiring_routes_pond_through_kamaji() {
+        let crs = build_warden_run_spec(&spec_for_test());
+        let args = crs.env.get("YAH_WARDEN_ARGS").map(String::as_str).unwrap();
+        assert!(
+            args.contains("--kamaji-socket /run/kamaji/kamaji.sock"),
+            "yubaba must dial the kamaji sibling: {args:?}"
+        );
+        assert_eq!(
+            crs.env.get("KAMAJI_DOCKER").map(String::as_str),
+            Some("unix:///var/run/docker.sock"),
+        );
+    }
+
+    /// `KAMAJI_DOCKER` names the socket the warden itself mounts — an
+    /// unreachable path there means kamaji hard-errors at startup and the whole
+    /// container crash-loops.
+    #[test]
+    fn kamaji_docker_points_at_the_mounted_socket() {
+        assert_eq!(
+            KAMAJI_DOCKER_ENV_VALUE,
+            format!("unix://{DOCKER_SOCKET_CONTAINER_PATH}"),
         );
     }
 

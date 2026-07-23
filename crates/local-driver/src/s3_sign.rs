@@ -3,6 +3,17 @@
 //! Shared by `provider::hetzner` (Hetzner Object Storage) and
 //! `provider::local_docker` (MinIO). Both speak S3 + AWS SigV4 for bucket
 //! create/head/delete; only the endpoint and region differ.
+//!
+//! @yah:ticket(R630-B1, "SigV4 canonical URI is unencoded — any S3/R2 key containing a colon fails SignatureDoesNotMatch")
+//! @yah:at(2026-07-23T03:12:20Z)
+//! @yah:status(open)
+//! @yah:parent(R630)
+//! @yah:severity(high)
+//! @yah:next("Repro, no setup: yah cloud bucket put --bucket yah-cr-cache 'test:colon' --file /tmp/any -> 403 SignatureDoesNotMatch. A colon-free key at the same moment succeeds, so it is not a credential problem.")
+//! @yah:next("Cause: the sign_s3_* helpers build the SigV4 canonical URI as parsed.path() verbatim (~line 30, 'let uri = parsed.path().to_string()'). SigV4 requires it percent-encoded outside A-Za-z0-9-_.~ and /, so ':' must be '%3A'. R2 canonicalizes per spec, we do not, and the signatures diverge. All four entrypoints are affected: sign_s3_empty_body, sign_s3_no_body, sign_s3_put_object, sign_s3_get_with_query.")
+//! @yah:verify("A key containing ':' round-trips through put/get/head/ls, AND existing colon-free keys still round-trip byte-identically (the double-encoding regression guard).")
+//! @yah:gotcha("Do NOT fix by re-encoding parsed.path(). Url::parse has already percent-encoded part of it, so re-encoding double-encodes '%' to '%25' and breaks keys that work today. The raw key must be threaded to the signer, or the encoding applied before URL construction. This is exactly why it was left unfixed rather than patched in passing.")
+//! @yah:gotcha("Blast radius is silent: the failure looks like bad credentials, not like a key-shape problem. cr.yah.dev stores OCI digests as sha256/<hex> rather than the natural sha256:<hex> purely to route around this — see digest_key in app/yah/cli/src/cr.rs and digestKey in app/yah/workers/yah-cr/src/index.ts, which must stay in lockstep.")
 
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
@@ -208,6 +219,12 @@ pub fn sign_s3_no_body(
 /// The caller pre-computes `body_sha256 = hex(sha256(body))` and passes
 /// `content_length = body.len()` separately so the headers can be computed
 /// without holding the bytes in this function.
+///
+/// `blake3_meta` attaches `x-amz-meta-blake3` to the object (R546-B10). This is
+/// what lets a later run tell "the same bytes are already there" from "different
+/// bytes are already there" — an existence probe alone cannot, and ETag is not a
+/// usable substitute because it stops being a content MD5 for multipart uploads.
+/// Pass `None` for callers that don't track a BLAKE3 for the body.
 pub fn sign_s3_put_object(
     url: &str,
     body_sha256: &str,
@@ -216,6 +233,7 @@ pub fn sign_s3_put_object(
     region: &str,
     access_key: &str,
     secret_key: &str,
+    blake3_meta: Option<&str>,
 ) -> Result<HeaderMap> {
     let now = chrono::Utc::now();
     let date = now.format("%Y%m%d").to_string();
@@ -225,12 +243,22 @@ pub fn sign_s3_put_object(
     let host = parsed.host_str().context("no host in S3 object URL")?.to_string();
     let uri = parsed.path().to_string();
 
-    // Headers in lexicographic order (SigV4 requirement).
+    // Headers in lexicographic order (SigV4 requirement). `x-amz-meta-blake3`
+    // sorts after `x-amz-date` ("date" < "meta"), so it appends cleanly.
+    let meta_line = match blake3_meta {
+        Some(b3) => format!("x-amz-meta-blake3:{b3}\n"),
+        None => String::new(),
+    };
     let canonical_headers = format!(
         "content-length:{content_length}\ncontent-type:{content_type}\nhost:{host}\n\
-         x-amz-content-sha256:{body_sha256}\nx-amz-date:{datetime}\n"
+         x-amz-content-sha256:{body_sha256}\nx-amz-date:{datetime}\n{meta_line}"
     );
-    let signed_headers = "content-length;content-type;host;x-amz-content-sha256;x-amz-date";
+    let signed_headers = match blake3_meta {
+        Some(_) => {
+            "content-length;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-meta-blake3"
+        }
+        None => "content-length;content-type;host;x-amz-content-sha256;x-amz-date",
+    };
 
     let canonical_request =
         format!("PUT\n{uri}\n\n{canonical_headers}\n{signed_headers}\n{body_sha256}");
@@ -268,6 +296,9 @@ pub fn sign_s3_put_object(
     headers.insert("x-amz-content-sha256", body_sha256.parse()?);
     headers.insert("content-length", content_length.to_string().parse()?);
     headers.insert("content-type", content_type.parse()?);
+    if let Some(b3) = blake3_meta {
+        headers.insert("x-amz-meta-blake3", b3.parse()?);
+    }
     headers.insert("authorization", authorization.parse()?);
     Ok(headers)
 }
@@ -440,6 +471,62 @@ mod tests {
         assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AK/"));
         assert!(
             auth.contains("SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-date")
+        );
+    }
+
+    /// R546-B10. The metadata header must be BOTH sent and covered by the
+    /// signature. Sending it unsigned, or listing it in SignedHeaders without
+    /// including it in the canonical headers, produces a SignatureDoesNotMatch
+    /// 403 at runtime — which no local test would otherwise catch.
+    #[test]
+    fn put_object_signs_the_blake3_metadata_header() {
+        let b3 = "d".repeat(64);
+        let headers = sign_s3_put_object(
+            "https://acct.r2.cloudflarestorage.com/yah-dev/some/key.tar.gz",
+            &"0".repeat(64),
+            "application/octet-stream",
+            123,
+            "auto",
+            "AK",
+            "SK",
+            Some(&b3),
+        )
+        .unwrap();
+
+        assert_eq!(headers.get("x-amz-meta-blake3").unwrap().to_str().unwrap(), b3);
+        let auth = headers.get("authorization").unwrap().to_str().unwrap();
+        assert!(
+            auth.contains(
+                "SignedHeaders=content-length;content-type;host;x-amz-content-sha256;\
+                 x-amz-date;x-amz-meta-blake3"
+            ),
+            "metadata header must be inside SignedHeaders, got: {auth}"
+        );
+    }
+
+    /// Omitting the metadata must leave the previous signed-header set exactly
+    /// as it was — otherwise every existing caller starts 403ing.
+    #[test]
+    fn put_object_without_metadata_keeps_the_original_signed_header_set() {
+        let headers = sign_s3_put_object(
+            "https://acct.r2.cloudflarestorage.com/yah-dev/some/key.bin",
+            &"0".repeat(64),
+            "application/octet-stream",
+            7,
+            "auto",
+            "AK",
+            "SK",
+            None,
+        )
+        .unwrap();
+
+        assert!(!headers.contains_key("x-amz-meta-blake3"));
+        let auth = headers.get("authorization").unwrap().to_str().unwrap();
+        assert!(
+            auth.contains(
+                "SignedHeaders=content-length;content-type;host;x-amz-content-sha256;x-amz-date,"
+            ),
+            "unstamped PUT must keep the original signed-header set, got: {auth}"
         );
     }
 

@@ -650,6 +650,67 @@ impl LocalRuntime {
     }
 }
 
+// ── ContainerLauncher seam (R626-F2) ──────────────────────────────────────────
+
+/// The three container operations the pond bring-up sequences need, factored
+/// out of [`LocalRuntime`] so a caller can supply a different launcher.
+///
+/// The pond `ensure_*_running` functions are *choreography* — write the state
+/// dir, pull, run, wait for the port, wait for HTTP ready, apply post-start
+/// config (MinIO's bucket policy). None of that is docker-CLI-specific; only
+/// the three verbs below are. Splitting them lets yubaba route the same
+/// choreography through kamaji (so dockerd owns restart, R626) while the cloud
+/// tier keeps driving `LocalRuntime` directly and unchanged.
+///
+/// A launcher is expected to be **idempotent**: `run` against an existing
+/// container of the same name replaces it, and `stop_and_remove` on a missing
+/// container succeeds.
+#[async_trait::async_trait]
+pub trait ContainerLauncher: Send + Sync {
+    /// Pull `image` unless it is already present. `true` when a pull happened.
+    async fn ensure_image(&self, image: &str) -> Result<bool>;
+
+    /// Start a detached container per `spec`, replacing any prior container of
+    /// the same name.
+    async fn run(&self, spec: &ContainerRunSpec) -> Result<()>;
+
+    /// Stop with `grace`, then remove. No-op when the container is absent.
+    async fn stop_and_remove(&self, name: &str, grace: Duration) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl ContainerLauncher for LocalRuntime {
+    async fn ensure_image(&self, image: &str) -> Result<bool> {
+        LocalRuntime::ensure_image(self, image).await
+    }
+
+    async fn run(&self, spec: &ContainerRunSpec) -> Result<()> {
+        LocalRuntime::run(self, spec).await
+    }
+
+    async fn stop_and_remove(&self, name: &str, grace: Duration) -> Result<()> {
+        LocalRuntime::stop_and_remove(self, name, grace).await
+    }
+}
+
+/// Pond holds its runtimes as `Arc<…>` and the `ensure_*_running` functions are
+/// generic, so `&Arc<T>` needs its own impl — generic parameters don't
+/// auto-deref the way `&LocalRuntime` did.
+#[async_trait::async_trait]
+impl<T: ContainerLauncher + ?Sized> ContainerLauncher for std::sync::Arc<T> {
+    async fn ensure_image(&self, image: &str) -> Result<bool> {
+        (**self).ensure_image(image).await
+    }
+
+    async fn run(&self, spec: &ContainerRunSpec) -> Result<()> {
+        (**self).run(spec).await
+    }
+
+    async fn stop_and_remove(&self, name: &str, grace: Duration) -> Result<()> {
+        (**self).stop_and_remove(name, grace).await
+    }
+}
+
 /// Run-time spec for a single container managed by [`LocalRuntime::run`].
 #[derive(Debug, Clone)]
 pub struct ContainerRunSpec {

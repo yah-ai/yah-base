@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use workload_spec::WorkloadSpec;
 
-use crate::{ContainerRunSpec, LocalRuntime};
+use crate::{ContainerLauncher, ContainerRunSpec};
 
 /// Default port the SSR container binds inside its image. Bun/Node frameworks
 /// default to `3000`; the workload spec can override via
@@ -121,7 +121,7 @@ pub struct SsrRuntimeRunning {
 /// against an already-Running container of the same name replaces it
 /// (`LocalRuntime::run` is idempotent).
 pub async fn ensure_ssr_runtime_running(
-    runtime: &LocalRuntime,
+    runtime: &impl ContainerLauncher,
     spec: &SsrRuntimeSpec,
 ) -> Result<SsrRuntimeRunning> {
     runtime

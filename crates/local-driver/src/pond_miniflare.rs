@@ -36,7 +36,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::{ContainerRunSpec, LocalRuntime};
+use crate::{ContainerLauncher, ContainerRunSpec};
 
 /// Path inside the container the Worker bundle is bind-mounted to. Pinned
 /// here (and in the Dockerfile's `MF_SCRIPT` default) so callers don't
@@ -134,7 +134,7 @@ pub struct MiniflareRunning {
 /// Idempotent end-to-end: re-running against an already-Running container of
 /// the same name replaces it ([`LocalRuntime::run`] is idempotent).
 pub async fn ensure_miniflare_running(
-    runtime: &LocalRuntime,
+    runtime: &impl ContainerLauncher,
     spec: &MiniflareSpec,
 ) -> Result<MiniflareRunning> {
     std::fs::create_dir_all(&spec.state_dir)

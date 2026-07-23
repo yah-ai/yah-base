@@ -41,7 +41,8 @@ pub mod pond_warden;
 pub mod s3_sign;
 
 pub use local_runtime::{
-    canonical_label, canonical_name, pond_network_name, ContainerRunSpec, ContainerState,
+    canonical_label, canonical_name, pond_network_name, ContainerLauncher, ContainerRunSpec,
+    ContainerState,
     CustomDockerHostProvider, DetectedRuntime, LocalContainerSpec, LocalDockerRuntime,
     LocalRuntime, OwnedContainer, RuntimePref, RuntimeProvider, SocketRuntimeProvider, LABEL_KEY,
     NAME_PREFIX,

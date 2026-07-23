@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::s3_sign::{sign_s3_head_bucket, sign_s3_put_bucket, sign_s3_put_bucket_policy};
-use crate::{ContainerRunSpec, LocalRuntime};
+use crate::{ContainerLauncher, ContainerRunSpec};
 
 /// MinIO defaults to `us-east-1` for SigV4 region regardless of location.
 pub const MINIO_REGION: &str = "us-east-1";
@@ -134,7 +134,7 @@ pub struct MinioRunning {
 /// of the same name replaces it ([`LocalRuntime::run`] is idempotent), and
 /// the bucket-policy step is self-healing on re-runs.
 pub async fn ensure_minio_running(
-    runtime: &LocalRuntime,
+    runtime: &impl ContainerLauncher,
     spec: &MinioSpec,
 ) -> Result<MinioRunning> {
     std::fs::create_dir_all(&spec.data_dir)

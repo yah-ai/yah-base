@@ -42,6 +42,15 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Emitting side: walk a built app into a bundle tree + manifest. Pure
+/// `std::fs` + blake3 + toml, so it stays in the default (types-only) feature
+/// set — `mesofact-build` re-exports it, and the V8-less yah CLI can assemble a
+/// bundle without linking the build toolchain (R599-T5).
+mod assemble;
+pub use assemble::{
+    assemble_bundle, assemble_self_bundle, assemble_vanilla_bundle, collect_dir, BundleFile,
+};
+
 #[cfg(feature = "store")]
 mod store;
 #[cfg(feature = "store")]
@@ -76,7 +85,8 @@ pub enum BundleError {
         actual: String,
     },
 
-    /// Filesystem or object-store failure (only constructed under `store`).
+    /// Filesystem or object-store failure. Constructed by the assemble path
+    /// (always available) and by the `store` feature's publish/materialize.
     #[error("bundle io: {0}")]
     Io(String),
 

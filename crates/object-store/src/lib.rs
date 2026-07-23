@@ -14,8 +14,10 @@
 //! @yah:parent(R498)
 //! @yah:handoff("Lifted ObjectStore trait + InMemoryObjectStore from scryer::long_tier into new crates/yah/object-store/ crate (yah-object-store package, yah_object_store lib). Trait gained head() with default impl over get(), and delete() (idempotent). Generic Error enum (NotFound/Io/Auth/Backend) replaces the old LongTierError::ObjectStore(String) error path. scryer/long_tier.rs now does pub use yah_object_store::{Error as ObjectStoreError, InMemoryObjectStore, ObjectStore} — every existing call site keeps working unchanged. LongTierError gained #[from] ObjectStoreError variant. cargo check --workspace exit 0; 5/5 object-store unit tests pass. NOTE: scryer's full lib test target was already broken on main (pre-existing missing-.await calls in adapters/journald.rs, adapters/containerd_logs.rs, service.rs — touching 20+ sites) — those are NOT introduced by F1; isolated long_tier tests cannot be run until that gets cleaned up separately.")
 
+pub mod http_ro;
 pub mod r2;
 
+pub use http_ro::HttpReadOnlyObjectStore;
 pub use r2::{ObjectMeta, R2ObjectStore};
 
 use std::collections::HashMap;

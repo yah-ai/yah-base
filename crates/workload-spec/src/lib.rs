@@ -245,6 +245,29 @@
 //! @yah:gotcha("SEVERITY: this silently broke `yah cloud apply` for EVERY static-asset component, not just rusty-v8. Verified against the long-published whisper catalog via the repo's own examples/parse_whisper_toml.rs, which panics with the identical error — so the breakage is general and pre-existing, not caused by the R546 hash edits.")
 //! @yah:gotcha("ROOT CAUSE: `pub enum Workload` (oss/yah-base/crates/workload-spec/src/lib.rs ~L386) derives Deserialize with ONLY `#[serde(rename_all = \"kebab-case\")]` — there is NO `#[serde(tag = \"kind\")]`, despite its own doc comment stating 'the `kind` field on the wire is the serde discriminator'. Without the tag it is EXTERNALLY tagged, so serde wants a map with exactly ONE key (the variant name). Every real workload.toml is FLAT (`kind = \"static-asset\"` + `schema_version` + `[[asset]]` + `[aliases]`), i.e. a multi-key map -> `TomlError: wanted exactly 1 element, more than 1 element`, reported confusingly at line 1 col 1.")
 //! @yah:gotcha("WHY THE UNIT TEST DIDN'T CATCH IT: the passing test at lib.rs ~L2544 feeds the EXTERNALLY-tagged shape `[[static-asset.asset]]`, which no on-disk file actually uses. So the test asserts the broken encoding and the example (parse_whisper_toml.rs) asserting the REAL encoding was never run in CI. The test and the example disagree; the example is right.")
+//!
+//! @yah:ticket(R626-S3, "Where does desired-state live? Durable per-workload replica count that survives reconcile loops and camp restarts (0↔1 vs scale-to-N)")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:at(2026-07-23T17:47:24Z)
+//! @yah:kind(spike)
+//! @yah:phase(P3)
+//! @yah:parent(R626)
+//! @yah:handoff("DECIDED + LANDED. Desired state lives in the CAMP DAEMON, in a durable camp-local document at <camp>/.yah/state/desired-state.json, and NEVER crosses the kamaji or yubaba wire. The governing principle, written to survive the tier: desired state belongs to the DECLARER, not the supervisor — whoever re-asserts a deployment owns the record of whether it is wanted, because anything stored below the declarer is overwritten by the declarer's next re-assert. In the pond/dev tier the declarer is camp (ensure_pond_running -> reconcile_pond_deploys -> deploy_pond_mirrors, which runs at every camp start AND every pond.ensure_running RPC). In cloud the same rule points at the CloudConfig reconciler's raft store. Kamaji is never the holder in either tier.")
+//! @yah:handoff("REJECTIONS, with the reason each is not a near-miss. kamaji-local: kamaji is deliberately imperative (Deploy/Stop/List, crash-restart delegated to dockerd's policy per R626-F2) — it holds no desired set and runs no reconcile loop, so storing intent there means giving it a SECOND reconciler that can disagree with camp's, and it still loses to camp's POST /pond/deploy from above. yubaba raft: right answer at cloud scale, wrong scope here — the pond yubaba is a container camp starts, its PondRegistry is in-memory (a restart forgets everything), and a single-camp dev tier has no quorum to be consistent about. Git-tracked config: camp.toml/mirror.toml are the DECLARATION (what exists); a stop is per-machine operator intent (systemctl disable, not editing the unit file) and must not propagate to a teammate's checkout — hence .yah/state/ is gitignored, in both the camp's .gitignore and the scaffold_camp_skeleton template.")
+//! @yah:handoff("SHAPE: one knob, `replicas`, where 0 = stopped — deliberately the SAME axis as workload_spec::WorkloadSpec.replicas so scale-to-N later lifts a ceiling instead of adding a second concept beside a boolean. MAX_SUPPORTED_REPLICAS = 1 today and set_replicas REJECTS anything higher rather than persisting an intent no supervisor can honour (a clamp would silently record something the operator did not ask for). No record = replicas 1: a declared workload runs unless someone said otherwise. updated_at + reason ride along so a stale intent is legible and the UI can say when/why. Writes are tmp-then-rename; reads FAIL OPEN (missing/unreadable/corrupt/newer-schema all mean 'everything runs', corrupt file preserved as .corrupt-<epoch_ms>) — fail-closed would mass-stop a camp on one bad byte, and a resurrection is the recoverable failure.")
+//! @yah:handoff("LANDED: (1) app/yah/cli/src/desired_state.rs — DesiredStateDoc / WorkloadDesire / DesiredStateStore (load, desired_replicas, is_stopped, stopped_keys, set_replicas, stop, start, forget), 10 unit tests incl. survives-a-camp-restart, per-workload isolation, replicas>1 rejected AND not written, corrupt-file quarantine + fail-open, newer-schema fail-open, and an explicit 'a stop is not a failure' guard on the serialized document. (2) camp.rs: deploy_pond_mirrors and reconcile_pond_deploys now consult the store and skip stopped idents — this is THE enforcement point, since camp's re-assert is the only place 'stay stopped' can be honoured. Extracted pond_idents_needing_deploy(declared, registered, stopped) as a pure helper with 5 tests, because the stopped-subtraction is the load-bearing half: a stopped workload is absent from yubaba's registry ON PURPOSE and is indistinguishable from a failed deploy without the intent record. (3) .yah/.gitignore + app/yah/cli/templates/yah-gitignore-default gain /state. (4) .yah/docs/working/W287-desired-state-for-supervised-workloads.md carries the full rationale, the rejected options, the F4 build-on list, and the scale-to-N scoping.")
+//! @yah:handoff("DELIBERATE NON-GOAL: writing intent does NOT actuate. The durable record must land even when the stop call fails, or a failed stop comes back on the next reconcile. Actuation is R626-F4's job.")
+//! @yah:next("R626-F4 is unblocked and now has a concrete spec — see W287 §5. It needs three things this ticket deliberately did not build: (a) a per-ident teardown on yubaba (PondRegistry has only shutdown_all, which drains everything; /pond/deploy and /pond/state are the only pond routes), (b) camp RPC methods workload.stop / workload.start writing through DesiredStateStore, (c) desired-vs-actual reporting.")
+//! @yah:next("DO NOT add a Stopped variant to PondPhase (R626-F2's noted gap). PondPhase is yubaba's observation of REALITY; intent never crosses that wire by this decision. Camp is the one process holding both halves — render the pair instead: desired=stopped + actual=absent reads 'deliberately stopped'; desired=running + actual=absent reads 'down'.")
+//! @yah:next("Scale-to-N stays scoped, not committed (W287 §6). WorkloadSpec.replicas makes N look one constant away; it is not. kamaji native.rs:592 rejects replicas>1, and the docker backend names containers by mesh identity (one identity, one container). N needs a placement layer above the single-workload supervisor: per-replica naming (identity==container name is what makes teardown resolve), per-replica host ports (pond publishes fixed ones — two replicas collide), per-replica mesh identity (a load-balanced set is an xlb-net concern), and a placement decision that is yubaba's job on a fleet. Lifting MAX_SUPPORTED_REPLICAS is the entry point once that layer exists.")
+//! @yah:next("Wire DesiredStateStore::forget into the undeclare path so the document doesn't accumulate intent for mirrors that no longer exist.")
+//! @yah:verify("cargo test -p yah --lib desired_state — 15 pass (10 desired_state::tests + 5 camp::r626_s3_desired_state_gate_tests), 0 fail")
+//! @yah:verify("cargo check -p yah — clean (note: this camp's tree is shared and was transiently broken by peers' in-flight edits in oss/qed, yah-party, and yah-almanac during this run; none touched by this ticket)")
+//! @yah:verify("BEHAVIOUR BAR (the one that matters): DesiredStateStore::for_camp(root).stop(ident) followed by a FRESH store over the same root still reports is_stopped — that is exactly a camp restart — and pond_idents_needing_deploy then omits that ident from an EMPTY registry, which is exactly a restarted yubaba. Asserted in camp::r626_s3_desired_state_gate_tests::a_stop_survives_a_camp_restart_end_to_end.")
+//! @yah:gotcha("The store is camp-local and GITIGNORED on purpose. If a future ticket wants a stop to be shared/durable in the repo, that is a different decision (declaration vs intent) — re-open W287 §2 rather than moving the file into tracked territory.")
+//! @yah:gotcha("Reads fail OPEN. Never 'harden' this into fail-closed: an unreadable document would then stop an entire camp, and the failure would be silent (nothing starts) rather than visible (the workload comes back).")
+//!
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -394,6 +417,16 @@ impl NamespaceId {
 /// containerd wire format yubaba receives over RPC. A `kind = "container"`
 /// workload deserializes its remaining fields as a `WorkloadSpec`; other
 /// kinds carry their own per-reconciler payload shape.
+///
+/// **Never put `#[serde(skip_serializing_if = "Option::is_none")]` on a field
+/// of this enum or any type it reaches.** These types ride the kamaji-proto
+/// **postcard** wire, which is non-self-describing and positional:
+/// `skip_serializing_if` omits the field's byte on serialize while decode still
+/// expects to read it at that offset, so the byte stream misaligns and the
+/// round-trip fails. Use `#[serde(default)]` + `#[ts(optional = nullable)]`
+/// instead — that still gives TOML/JSON back-compat (missing field → `None`)
+/// while the field is always encoded. `MesofactStaticWorkload::ssr_runtime` and
+/// `::serve_bundle` are the reference shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
@@ -1994,6 +2027,18 @@ impl ImageRef {
     /// the same value re-exported for fixtures.
     pub const UNPINNED_DIGEST: &'static str =
         "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// Parse a full digest-pinned image reference —
+    /// `[registry/]repo[:tag]@sha256:<hex>` — into its parts.
+    ///
+    /// This is the public door onto the same parser the `ImageRef` string-form
+    /// `Deserialize` arm uses, so a config that spells an image as one string
+    /// (a qed `step.image`, a transform recipe) and a config that spells it as
+    /// a struct land on identical semantics. A bare tag is rejected: the whole
+    /// point of the string form is that it carries the digest.
+    pub fn parse_pinned(s: &str) -> Result<Self, String> {
+        compose_import::parse_pinned_image_ref(s)
+    }
 
     /// Format this reference as a Docker-compatible image string,
     /// `{registry}/{repository}:{tag}@{digest}`. Tag is included for human
