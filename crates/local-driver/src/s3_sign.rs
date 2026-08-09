@@ -22,6 +22,25 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// The `host` value to sign, which must be byte-identical to the `Host` header
+/// the HTTP client will actually send — SigV4 hashes it into the canonical
+/// request, so any divergence is a 403 `SignatureDoesNotMatch` that reads like
+/// a credentials problem.
+///
+/// `Url::host_str()` alone drops the port, and reqwest includes a NON-DEFAULT
+/// port in `Host`. For every https endpoint this crate has signed until now
+/// (Hetzner, R2) the port is implicit and the two agree, which is why this went
+/// unnoticed. It stops being true the moment anything signs against a local
+/// MinIO on `:9000` (R330-T32's pond-tier index writes). `Url::port()` returns
+/// `None` for a scheme's default port, so the https path is unchanged.
+fn canonical_host(parsed: &reqwest::Url) -> Result<String> {
+    let host = parsed.host_str().context("no host in S3 URL")?;
+    Ok(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
 /// AWS Sig V4 for any S3 verb that sends no body (PUT CreateBucket, HEAD,
 /// DELETE bucket). Callers supply the full `url`, S3 `region` string, and
 /// HMAC credentials.
@@ -37,7 +56,7 @@ pub fn sign_s3_empty_body(
     let datetime = now.format("%Y%m%dT%H%M%SZ").to_string();
 
     let parsed = reqwest::Url::parse(url).context("parsing S3 URL")?;
-    let host = parsed.host_str().context("no host in S3 URL")?.to_string();
+    let host = canonical_host(&parsed)?;
     let uri = parsed.path().to_string();
 
     let empty_hash = {
@@ -161,7 +180,7 @@ pub fn sign_s3_no_body(
     let datetime = now.format("%Y%m%dT%H%M%SZ").to_string();
 
     let parsed = reqwest::Url::parse(url).context("parsing S3 URL")?;
-    let host = parsed.host_str().context("no host in S3 URL")?.to_string();
+    let host = canonical_host(&parsed)?;
     let uri = parsed.path().to_string();
 
     let empty_hash = {
@@ -214,6 +233,37 @@ pub fn sign_s3_no_body(
     Ok(headers)
 }
 
+/// The per-object headers a `PUT` carries beyond the ones SigV4 always needs.
+///
+/// A struct rather than more positional arguments: [`sign_s3_put_object`] was
+/// already at eight, two of them `Option<&str>`, and a third adjacent optional
+/// string is the kind of parameter list where a swapped pair compiles and ships
+/// the wrong header.
+#[derive(Debug, Clone, Default)]
+pub struct S3PutOptions<'a> {
+    /// `Content-Type`. Empty is not valid S3 — pass the caller's default.
+    pub content_type: &'a str,
+    /// `x-amz-meta-blake3` (R546-B10) — see [`sign_s3_put_object`].
+    pub blake3_meta: Option<&'a str>,
+    /// `Cache-Control` (R703-B8). `None` leaves the header off entirely, which
+    /// is how every CLI-driven publish behaved before this existed: R2 then
+    /// serves the object with no directive at all, so a browser (and any future
+    /// edge-cache rule) is free to hold a mutable pointer — `latest.json`, a
+    /// release manifest — for as long as it likes. Versioned, content-addressed
+    /// keys want [`CACHE_CONTROL_IMMUTABLE`]; fixed-key pointers want
+    /// [`CACHE_CONTROL_NO_CACHE`].
+    pub cache_control: Option<&'a str>,
+}
+
+/// `Cache-Control` for immutable, versioned, content-addressed objects.
+/// Matches what `.github/workflows/release.yml` tags them with, so an object
+/// published by the CLI is indistinguishable from one published by CI.
+pub const CACHE_CONTROL_IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// `Cache-Control` for a mutable pointer at a fixed key — `latest.json`, a
+/// release manifest, an index. Also matches `release.yml`.
+pub const CACHE_CONTROL_NO_CACHE: &str = "no-cache, max-age=0";
+
 /// AWS Sig V4 for `PUT /<bucket>/<key>` with an object body.
 ///
 /// The caller pre-computes `body_sha256 = hex(sha256(body))` and passes
@@ -225,6 +275,9 @@ pub fn sign_s3_no_body(
 /// bytes are already there" — an existence probe alone cannot, and ETag is not a
 /// usable substitute because it stops being a content MD5 for multipart uploads.
 /// Pass `None` for callers that don't track a BLAKE3 for the body.
+///
+/// Reach for [`sign_s3_put_object_with`] when the object also needs a
+/// `Cache-Control`; this signs without one.
 pub fn sign_s3_put_object(
     url: &str,
     body_sha256: &str,
@@ -235,30 +288,79 @@ pub fn sign_s3_put_object(
     secret_key: &str,
     blake3_meta: Option<&str>,
 ) -> Result<HeaderMap> {
+    sign_s3_put_object_with(
+        url,
+        body_sha256,
+        content_length,
+        region,
+        access_key,
+        secret_key,
+        &S3PutOptions {
+            content_type,
+            blake3_meta,
+            cache_control: None,
+        },
+    )
+}
+
+/// [`sign_s3_put_object`] with the full per-object header set (R703-B8).
+pub fn sign_s3_put_object_with(
+    url: &str,
+    body_sha256: &str,
+    content_length: usize,
+    region: &str,
+    access_key: &str,
+    secret_key: &str,
+    opts: &S3PutOptions<'_>,
+) -> Result<HeaderMap> {
+    let S3PutOptions {
+        content_type,
+        blake3_meta,
+        cache_control,
+    } = *opts;
     let now = chrono::Utc::now();
     let date = now.format("%Y%m%d").to_string();
     let datetime = now.format("%Y%m%dT%H%M%SZ").to_string();
 
     let parsed = reqwest::Url::parse(url).context("parsing S3 object URL")?;
-    let host = parsed.host_str().context("no host in S3 object URL")?.to_string();
+    let host = canonical_host(&parsed)?;
     let uri = parsed.path().to_string();
 
-    // Headers in lexicographic order (SigV4 requirement). `x-amz-meta-blake3`
-    // sorts after `x-amz-date` ("date" < "meta"), so it appends cleanly.
-    let meta_line = match blake3_meta {
-        Some(b3) => format!("x-amz-meta-blake3:{b3}\n"),
-        None => String::new(),
-    };
-    let canonical_headers = format!(
-        "content-length:{content_length}\ncontent-type:{content_type}\nhost:{host}\n\
-         x-amz-content-sha256:{body_sha256}\nx-amz-date:{datetime}\n{meta_line}"
+    // SigV4 requires the canonical header block AND the SignedHeaders list to be
+    // in lexicographic order, and the two must agree exactly or the server
+    // computes a different signature and answers 403 SignatureDoesNotMatch.
+    // Build both from one ordered list rather than two hand-maintained string
+    // literals — the previous pair of literals was already one optional header
+    // away from being wrong, and `cache-control` is the awkward case: it sorts
+    // BEFORE `content-length`, so it prepends where `x-amz-meta-blake3` appends.
+    let mut signed: Vec<(&str, String)> = Vec::with_capacity(7);
+    if let Some(cc) = cache_control {
+        signed.push(("cache-control", cc.to_string()));
+    }
+    signed.push(("content-length", content_length.to_string()));
+    signed.push(("content-type", content_type.to_string()));
+    signed.push(("host", host.clone()));
+    signed.push(("x-amz-content-sha256", body_sha256.to_string()));
+    signed.push(("x-amz-date", datetime.clone()));
+    if let Some(b3) = blake3_meta {
+        signed.push(("x-amz-meta-blake3", b3.to_string()));
+    }
+    debug_assert!(
+        signed.windows(2).all(|w| w[0].0 < w[1].0),
+        "canonical headers must be lexicographically ordered: {:?}",
+        signed.iter().map(|(n, _)| *n).collect::<Vec<_>>()
     );
-    let signed_headers = match blake3_meta {
-        Some(_) => {
-            "content-length;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-meta-blake3"
-        }
-        None => "content-length;content-type;host;x-amz-content-sha256;x-amz-date",
-    };
+
+    let canonical_headers: String = signed
+        .iter()
+        .map(|(name, value)| format!("{name}:{value}\n"))
+        .collect();
+    let signed_headers = signed
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(";");
+    let signed_headers = signed_headers.as_str();
 
     let canonical_request =
         format!("PUT\n{uri}\n\n{canonical_headers}\n{signed_headers}\n{body_sha256}");
@@ -296,6 +398,9 @@ pub fn sign_s3_put_object(
     headers.insert("x-amz-content-sha256", body_sha256.parse()?);
     headers.insert("content-length", content_length.to_string().parse()?);
     headers.insert("content-type", content_type.parse()?);
+    if let Some(cc) = cache_control {
+        headers.insert("cache-control", cc.parse()?);
+    }
     if let Some(b3) = blake3_meta {
         headers.insert("x-amz-meta-blake3", b3.parse()?);
     }
@@ -321,7 +426,7 @@ pub fn sign_s3_put_bucket_policy(
     let datetime = now.format("%Y%m%dT%H%M%SZ").to_string();
 
     let parsed = reqwest::Url::parse(url).context("parsing S3 URL")?;
-    let host = parsed.host_str().context("no host in S3 URL")?.to_string();
+    let host = canonical_host(&parsed)?;
     let uri = parsed.path().to_string();
     let canonical_query = "policy=";
     let content_length = policy_json.len();
@@ -395,7 +500,7 @@ pub fn sign_s3_put_bucket_acl(
     let datetime = now.format("%Y%m%dT%H%M%SZ").to_string();
 
     let parsed = reqwest::Url::parse(url).context("parsing S3 URL")?;
-    let host = parsed.host_str().context("no host in S3 URL")?.to_string();
+    let host = canonical_host(&parsed)?;
     let uri = parsed.path().to_string();
     let canonical_query = "acl=";
 
@@ -454,6 +559,41 @@ pub fn sign_s3_put_bucket_acl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The signed `host` must equal the `Host` header reqwest sends, or the
+    /// server recomputes a different canonical request and answers 403
+    /// `SignatureDoesNotMatch` — which reads like bad credentials. reqwest
+    /// includes a non-default port in `Host`; `Url::host_str()` drops it.
+    #[test]
+    fn canonical_host_carries_a_nondefault_port() {
+        let u = reqwest::Url::parse("http://127.0.0.1:9000/yah-dev/yah/index.json").unwrap();
+        assert_eq!(canonical_host(&u).unwrap(), "127.0.0.1:9000");
+        // Default ports stay implicit, so every https endpoint signed before
+        // this existed (Hetzner, R2) signs byte-identically.
+        let u = reqwest::Url::parse("https://acct.r2.cloudflarestorage.com/yah-dev/k").unwrap();
+        assert_eq!(canonical_host(&u).unwrap(), "acct.r2.cloudflarestorage.com");
+        let u = reqwest::Url::parse("https://acct.r2.cloudflarestorage.com:443/yah-dev/k").unwrap();
+        assert_eq!(canonical_host(&u).unwrap(), "acct.r2.cloudflarestorage.com");
+    }
+
+    #[test]
+    fn signed_headers_include_the_port_for_a_local_endpoint() {
+        let headers = sign_s3_put_object(
+            "http://127.0.0.1:9000/yah-dev/yah/index.json",
+            &"0".repeat(64),
+            "application/json",
+            10,
+            "auto",
+            "AK",
+            "SK",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            headers.get("host").unwrap().to_str().unwrap(),
+            "127.0.0.1:9000"
+        );
+    }
 
     #[test]
     fn sign_produces_required_headers() {
@@ -528,6 +668,112 @@ mod tests {
             ),
             "unstamped PUT must keep the original signed-header set, got: {auth}"
         );
+    }
+
+    /// R703-B8. `cache-control` sorts BEFORE `content-length`, so unlike
+    /// `x-amz-meta-blake3` it must PREPEND to the canonical header block. Get
+    /// that backwards and SigV4 answers 403 SignatureDoesNotMatch — the same
+    /// failure mode as bad credentials, and only ever visible against live R2.
+    #[test]
+    fn put_object_signs_cache_control_ahead_of_content_length() {
+        let headers = sign_s3_put_object_with(
+            "https://acct.r2.cloudflarestorage.com/yah-dev/yah-desktop/latest.json",
+            &"0".repeat(64),
+            42,
+            "auto",
+            "AK",
+            "SK",
+            &S3PutOptions {
+                content_type: "application/json",
+                blake3_meta: None,
+                cache_control: Some(CACHE_CONTROL_NO_CACHE),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            headers.get("cache-control").unwrap().to_str().unwrap(),
+            "no-cache, max-age=0"
+        );
+        let auth = headers.get("authorization").unwrap().to_str().unwrap();
+        assert!(
+            auth.contains(
+                "SignedHeaders=cache-control;content-length;content-type;host;\
+                 x-amz-content-sha256;x-amz-date,"
+            ),
+            "cache-control must be signed, and first, got: {auth}"
+        );
+    }
+
+    /// Both optional headers at once — the ordering has to hold when one
+    /// prepends and the other appends.
+    #[test]
+    fn put_object_signs_cache_control_and_blake3_together_in_order() {
+        let b3 = "e".repeat(64);
+        let headers = sign_s3_put_object_with(
+            "https://acct.r2.cloudflarestorage.com/yah-dev/a/v1.2.3/yah.tar.gz",
+            &"0".repeat(64),
+            9,
+            "auto",
+            "AK",
+            "SK",
+            &S3PutOptions {
+                content_type: "application/octet-stream",
+                blake3_meta: Some(&b3),
+                cache_control: Some(CACHE_CONTROL_IMMUTABLE),
+            },
+        )
+        .unwrap();
+
+        let auth = headers.get("authorization").unwrap().to_str().unwrap();
+        assert!(
+            auth.contains(
+                "SignedHeaders=cache-control;content-length;content-type;host;\
+                 x-amz-content-sha256;x-amz-date;x-amz-meta-blake3,"
+            ),
+            "got: {auth}"
+        );
+        assert_eq!(
+            headers.get("cache-control").unwrap().to_str().unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    /// The wrapper must be byte-for-byte the old behaviour: same signature for
+    /// the same inputs, so no existing caller starts 403ing. Signing twice
+    /// within the same second is what makes this comparable at all — the date
+    /// stamp is the only other input that moves.
+    #[test]
+    fn the_options_form_and_the_legacy_form_sign_identically() {
+        let url = "https://acct.r2.cloudflarestorage.com/yah-dev/k.bin";
+        let legacy =
+            sign_s3_put_object(url, &"0".repeat(64), "text/plain", 3, "auto", "AK", "SK", None)
+                .unwrap();
+        let with_opts = sign_s3_put_object_with(
+            url,
+            &"0".repeat(64),
+            3,
+            "auto",
+            "AK",
+            "SK",
+            &S3PutOptions {
+                content_type: "text/plain",
+                blake3_meta: None,
+                cache_control: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!with_opts.contains_key("cache-control"));
+        // `x-amz-date` has second resolution; if the two calls straddled a
+        // second boundary the signatures legitimately differ, so compare the
+        // header SET, which is what a caller can actually break.
+        let names = |h: &HeaderMap| {
+            let mut v: Vec<String> = h.keys().map(|k| k.as_str().to_string()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&legacy), names(&with_opts));
     }
 
     #[test]

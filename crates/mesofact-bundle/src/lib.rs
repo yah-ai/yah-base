@@ -48,7 +48,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// bundle without linking the build toolchain (R599-T5).
 mod assemble;
 pub use assemble::{
-    assemble_bundle, assemble_self_bundle, assemble_vanilla_bundle, collect_dir, BundleFile,
+    assemble_bundle, assemble_self_bundle, assemble_self_bundle_with, assemble_vanilla_bundle,
+    collect_dir, BundleFile,
 };
 
 #[cfg(feature = "store")]

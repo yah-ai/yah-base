@@ -31,7 +31,7 @@
 //! @yah:verify("YAH_LOCAL_SIM_E2E=1 cargo test -p yubaba --test pond_reconciler_smoke  # LIVE re-verified 2026-06-28: docker kill MinIO → recover 11.2s; docker kill miniflare → recover 11.2s. Both reconcilers restart their slot; half-alive structurally impossible.")
 //! @yah:verify("Cold-start within S1 budget (cold ~1.2s / warm ~500ms) via YAH_LOCAL_SIM_E2E=1 cargo test -p cloud --release --test pond_smoke. Bundled in .yah/qed/pond-smoke.toml.")
 
-pub mod cloud_mesofact_runner;
+pub mod cloudflared_ingress;
 pub mod local_runtime;
 pub mod passway_ingress;
 pub mod pond_miniflare;

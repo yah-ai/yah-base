@@ -20,6 +20,12 @@ pub mod r2;
 pub use http_ro::HttpReadOnlyObjectStore;
 pub use r2::{ObjectMeta, R2ObjectStore};
 
+/// Re-exported so a caller choosing a directive for
+/// [`ObjectStore::put_cached`] never has to retype the string — two publishers
+/// spelling `no-cache, max-age=0` slightly differently is a difference no test
+/// catches and every CDN honours.
+pub use local_driver::s3_sign::{CACHE_CONTROL_IMMUTABLE, CACHE_CONTROL_NO_CACHE};
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -86,7 +92,32 @@ pub enum Precondition {
 /// a tokio context. (Scryer's long-tier rollover runs on a blocking thread.)
 pub trait ObjectStore: Send + Sync {
     /// Write `data` at `key`. Overwrites any existing object unconditionally.
+    ///
+    /// Sets no `Cache-Control`. For an object a browser or CDN will re-read —
+    /// anything at a fixed, mutable key — reach for
+    /// [`put_cached`](ObjectStore::put_cached) instead.
     fn put(&self, key: &str, data: Vec<u8>) -> Result<(), Error>;
+
+    /// Write `data` at `key` with an explicit `Cache-Control` (R703-B8).
+    ///
+    /// Every CLI-driven publish went through [`put`](ObjectStore::put), which
+    /// sets no cache directive at all — so `yah-desktop/latest.json`, the object
+    /// the Tauri updater polls forever, shipped with nothing telling a client
+    /// how long it may hold it. `.github/workflows/release.yml` has always
+    /// tagged the same objects correctly, which is why the CI-published
+    /// manifests answer `no-cache, max-age=0` and the CLI-published ones do not.
+    /// Use [`CACHE_CONTROL_IMMUTABLE`] for versioned, content-addressed keys and
+    /// [`CACHE_CONTROL_NO_CACHE`] for mutable pointers.
+    ///
+    /// The default impl **fails** rather than falling back to `put`, for the
+    /// same reason [`put_if`](ObjectStore::put_if) does: a backend that cannot
+    /// set the header must not report success as though it had. A caller that
+    /// only wants best-effort can call `put` explicitly and mean it.
+    fn put_cached(&self, _key: &str, _data: Vec<u8>, _cache_control: &str) -> Result<(), Error> {
+        Err(Error::Backend(
+            "cache-control on put (put_cached) not supported by this backend".into(),
+        ))
+    }
 
     /// Read bytes at `key`. Returns `None` when the key does not exist —
     /// `NotFound` is reserved for ambiguous cases (HEAD-then-GET race etc.).
@@ -149,6 +180,12 @@ fn etag_of(data: &[u8]) -> String {
 pub struct InMemoryObjectStore {
     /// key → (bytes, etag). The etag is recomputed on every write.
     objects: Mutex<HashMap<String, (Vec<u8>, String)>>,
+    /// key → `Cache-Control`, for the keys written through
+    /// [`ObjectStore::put_cached`] (R703-B8). Kept beside `objects` rather than
+    /// widening its tuple so the CAS paths stay untouched. Recorded at all so a
+    /// publish path can be *tested* for its cache directives — the bug this
+    /// exists for shipped precisely because nothing could assert on them.
+    cache_control: Mutex<HashMap<String, String>>,
 }
 
 impl Default for InMemoryObjectStore {
@@ -159,7 +196,10 @@ impl Default for InMemoryObjectStore {
 
 impl InMemoryObjectStore {
     pub fn new() -> Self {
-        Self { objects: Mutex::new(HashMap::new()) }
+        Self {
+            objects: Mutex::new(HashMap::new()),
+            cache_control: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Returns true when `key` exists (test helper — synchronous, no Result).
@@ -171,12 +211,31 @@ impl InMemoryObjectStore {
     pub fn keys(&self) -> Vec<String> {
         self.objects.lock().unwrap().keys().cloned().collect()
     }
+
+    /// `Cache-Control` the last write to `key` carried, or `None` if it was
+    /// written through plain [`ObjectStore::put`] (test helper).
+    pub fn cache_control(&self, key: &str) -> Option<String> {
+        self.cache_control.lock().unwrap().get(key).cloned()
+    }
 }
 
 impl ObjectStore for InMemoryObjectStore {
     fn put(&self, key: &str, data: Vec<u8>) -> Result<(), Error> {
         let etag = etag_of(&data);
         self.objects.lock().unwrap().insert(key.to_string(), (data, etag));
+        // An unqualified put clears any directive a prior write set: the object
+        // was replaced, and leaving the old header recorded would let a test
+        // pass on a `Cache-Control` the real store would no longer be sending.
+        self.cache_control.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    fn put_cached(&self, key: &str, data: Vec<u8>, cache_control: &str) -> Result<(), Error> {
+        self.put(key, data)?;
+        self.cache_control
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), cache_control.to_string());
         Ok(())
     }
 
@@ -241,6 +300,80 @@ mod tests {
     fn get_missing_returns_none() {
         let s = InMemoryObjectStore::new();
         assert!(s.get("absent").unwrap().is_none());
+    }
+
+    // ── Cache-Control on put (R703-B8) ──────────────────────────────────────
+
+    #[test]
+    fn put_cached_stores_the_bytes_and_the_directive() {
+        let s = InMemoryObjectStore::new();
+        s.put_cached("yah-desktop/latest.json", b"{}".to_vec(), CACHE_CONTROL_NO_CACHE)
+            .unwrap();
+        assert_eq!(
+            s.get("yah-desktop/latest.json").unwrap().as_deref(),
+            Some(&b"{}"[..])
+        );
+        assert_eq!(
+            s.cache_control("yah-desktop/latest.json").as_deref(),
+            Some("no-cache, max-age=0")
+        );
+    }
+
+    /// A plain `put` records no directive — that IS the bug this ticket names,
+    /// so it has to stay visible rather than be papered over with a default.
+    #[test]
+    fn a_plain_put_records_no_cache_control() {
+        let s = InMemoryObjectStore::new();
+        s.put("k", b"v".to_vec()).unwrap();
+        assert_eq!(s.cache_control("k"), None);
+    }
+
+    /// Overwriting a cached object with a plain `put` must not leave the old
+    /// directive behind: the real store would now be serving those bytes with
+    /// no header, and a test asserting otherwise would be asserting a fiction.
+    #[test]
+    fn a_plain_put_clears_a_previously_set_directive() {
+        let s = InMemoryObjectStore::new();
+        s.put_cached("k", b"a".to_vec(), CACHE_CONTROL_IMMUTABLE).unwrap();
+        assert!(s.cache_control("k").is_some());
+        s.put("k", b"b".to_vec()).unwrap();
+        assert_eq!(s.cache_control("k"), None);
+    }
+
+    /// The two directives are shared constants precisely so two publishers
+    /// cannot spell them differently — a difference no test catches and every
+    /// CDN honours. Pinned against what `.github/workflows/release.yml` sends.
+    #[test]
+    fn the_shared_directives_match_what_ci_publishes() {
+        assert_eq!(CACHE_CONTROL_IMMUTABLE, "public, max-age=31536000, immutable");
+        assert_eq!(CACHE_CONTROL_NO_CACHE, "no-cache, max-age=0");
+    }
+
+    /// A backend that cannot set the header must FAIL rather than silently
+    /// falling back to a directive-less `put` — reporting success for a write
+    /// that did not carry the header is the exact shape of the original bug.
+    #[test]
+    fn a_backend_without_cache_control_support_refuses_rather_than_lying() {
+        struct Bare;
+        impl ObjectStore for Bare {
+            fn put(&self, _k: &str, _d: Vec<u8>) -> Result<(), Error> {
+                Ok(())
+            }
+            fn get(&self, _k: &str) -> Result<Option<Vec<u8>>, Error> {
+                Ok(None)
+            }
+            fn delete(&self, _k: &str) -> Result<(), Error> {
+                Ok(())
+            }
+            fn list_prefix(&self, _p: &str) -> Result<Vec<String>, Error> {
+                Ok(vec![])
+            }
+        }
+        let err = Bare
+            .put_cached("k", b"v".to_vec(), CACHE_CONTROL_NO_CACHE)
+            .unwrap_err();
+        assert!(matches!(err, Error::Backend(_)), "got {err:?}");
+        assert!(err.to_string().contains("put_cached"), "{err}");
     }
 
     #[test]

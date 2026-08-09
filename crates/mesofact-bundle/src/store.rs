@@ -436,6 +436,38 @@ mod tests {
         assert!(dest.join(MANIFEST_FILENAME).exists());
     }
 
+    /// R703-T7 puts the first dot-directory entry into a bundle:
+    /// `app/dist/html/.well-known/yah-publish.json`, the publish beacon the
+    /// apex is checked against. `checked_rel` guards against `.` and `..`
+    /// *components*, and a leading-dot filename is neither — but if that were
+    /// ever tightened to a naive "no segment starts with a dot", publish would
+    /// reject the bundle and, worse, a node would refuse to materialize one it
+    /// had already accepted. Pin the round trip rather than the guard.
+    #[test]
+    fn a_dot_directory_entry_publishes_and_materializes() {
+        let store = InMemoryObjectStore::new();
+        let src = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let beacon = "app/dist/html/.well-known/yah-publish.json";
+
+        let manifest = write_bundle(
+            src.path(),
+            &[
+                ("app/dist/html/index.html", b"<html>home</html>"),
+                (beacon, br#"{"prefix":"bundle/yah-marketing","files":1}"#),
+            ],
+            BundleRuntime::SelfContained,
+        );
+        let report = publish_bundle(&store, src.path()).unwrap();
+        assert_eq!(report.uploaded.len(), 2);
+
+        let dest = materialize_bundle(&store, cache.path(), &manifest.digest()).unwrap();
+        assert_eq!(
+            fs::read(dest.join(beacon)).unwrap(),
+            br#"{"prefix":"bundle/yah-marketing","files":1}"#
+        );
+    }
+
     #[test]
     fn republish_dedupes_blobs_and_skips_manifest() {
         let store = InMemoryObjectStore::new();

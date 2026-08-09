@@ -236,8 +236,10 @@
 //! @yah:handoff("FIXED + PROVEN LIVE (2026-07-11). WorkloadSpec::for_forge memory_mb 256 -> 32768 (oss/yah-base/crates/workload-spec/src/lib.rs). CLI-only change (spec is client-built), no kamaji redeploy. RESULT: with B7 networking, the rusty-v8 build previously OOM'd (SIGKILL/signal 9) at the icu git-checkout under the 256MB cgroup cap; now it clones the full V8 tree AND proceeds past icu into cargo/gn compilation (Compiling icu_locale_data/icu_calendar_data...) with task RUNNING. Stopgap 32GB ceiling; proper per-step memory request from the pipeline is the follow-up in the ticket body.")
 //!
 //! @yah:ticket(R546-B7, "workload_spec::Workload envelope is externally tagged (missing serde tag=kind) — no flat on-disk workload.toml can parse through it, broke yah cloud apply for EVERY static-asset component")
-//! @yah:at(2026-07-20T23:52:55Z)
-//! @yah:status(open)
+//! @yah:phase(P1)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-08-03T00:44:43Z)
 //! @yah:parent(R546)
 //! @yah:next("DO NOT simply add `#[serde(tag = \"kind\")]` without checking postcard: `Workload` is also a postcard wire type on the kamaji RPC path (kamaji-proto/src/codec.rs matches on it; round_trip tests exist). postcard is non-self-describing and cannot decode internally-tagged enums, so naive tagging risks breaking the kamaji wire. Decide deliberately: (a) tag it and prove the postcard round-trips still pass, or (b) split the types — an on-disk `WorkloadManifest` with tag=kind, leaving `Workload` as the untagged wire type.")
 //! @yah:next("INTERIM FIX ALREADY LANDED (unblocks publishing): static_asset.rs::load_workload no longer routes through the envelope — it deserializes a small `KindProbe { kind }`, validates kind == \"static-asset\", then parses `StaticAssetWorkload` directly. Same approach seed_derivation_for_target already used successfully. This restored `yah cloud apply` and got the x86_64 rusty-v8 artifact published to the CDN (HTTP 200). The ENVELOPE itself is still broken for every other caller/kind.")
@@ -245,6 +247,17 @@
 //! @yah:gotcha("SEVERITY: this silently broke `yah cloud apply` for EVERY static-asset component, not just rusty-v8. Verified against the long-published whisper catalog via the repo's own examples/parse_whisper_toml.rs, which panics with the identical error — so the breakage is general and pre-existing, not caused by the R546 hash edits.")
 //! @yah:gotcha("ROOT CAUSE: `pub enum Workload` (oss/yah-base/crates/workload-spec/src/lib.rs ~L386) derives Deserialize with ONLY `#[serde(rename_all = \"kebab-case\")]` — there is NO `#[serde(tag = \"kind\")]`, despite its own doc comment stating 'the `kind` field on the wire is the serde discriminator'. Without the tag it is EXTERNALLY tagged, so serde wants a map with exactly ONE key (the variant name). Every real workload.toml is FLAT (`kind = \"static-asset\"` + `schema_version` + `[[asset]]` + `[aliases]`), i.e. a multi-key map -> `TomlError: wanted exactly 1 element, more than 1 element`, reported confusingly at line 1 col 1.")
 //! @yah:gotcha("WHY THE UNIT TEST DIDN'T CATCH IT: the passing test at lib.rs ~L2544 feeds the EXTERNALLY-tagged shape `[[static-asset.asset]]`, which no on-disk file actually uses. So the test asserts the broken encoding and the example (parse_whisper_toml.rs) asserting the REAL encoding was never run in CI. The test and the example disagree; the example is right.")
+//! @yah:handoff("DONE. Workload now carries TWO wire shapes behind hand-written Serialize/Deserialize that branch on is_human_readable() -- option (a) and (b) from the ticket's next-steps merged into one type instead of splitting it. TOML/JSON get the INTERNAL `kind` tag (the flat shape every on-disk file uses); postcard keeps the EXTERNAL variant-index encoding R590-B3 established for the kamaji UDS. Same idiom ImageRef already used for its string-vs-struct form, so there is now one precedent, not two mechanisms. Mirror enums (WorkloadTagged/WorkloadExternal + borrowing twins) carry the two encodings; their variant ORDER is load-bearing for postcard and is commented as such. schemars/ts-rs get tag=kind + rename_all via #[schemars(...)]/#[ts(...)] so the generated JSON schema and TS bindings describe the on-disk shape instead of the wire shape.")
+//! @yah:handoff("SECOND BLOCKER, fixed in the same pass: after the tagging fix only 2 of 8 on-disk workload.toml files still parsed. SchemaVersion is a unit-variant enum wanting the string \"V1\", but 6 files (every mesofact-static + container + cloudflare-worker component) are authored `schema_version = 1`, and R438-T6 had worked around it by hand-extracting raw toml::Value subtrees in read_mesofact_build. Gave SchemaVersion a liberal-read/canonical-write Deserialize (accepts 1, \"V1\", \"v1\"; always serializes \"V1\"), on the same is_human_readable branch so postcard is untouched. B7's stated goal is not met without it -- a fixed envelope that still rejects 6 of 8 files is not fixed.")
+//! @yah:handoff("FILES. (1) oss/yah-base/crates/workload-spec/src/lib.rs -- Workload dual-shape impls + mirror enums; the lib.rs ~L2544 test that asserted the broken `[[static-asset.asset]]` encoding rewritten to the flat form, plus a new test pinning BOTH halves (flat kind in JSON, postcard round-trip). (2) .../src/version.rs -- SchemaVersion custom Deserialize + 3 tests. (3) .../src/bin/export-ts.rs -- path was 3 parents up from CARGO_MANIFEST_DIR, but 75d8df7e moved the crate under oss/yah-base and added a level, so since that commit the bin silently wrote to oss/yah-base/packages/ and the committed TS stopped tracking the Rust types (last real update Jun 28). Now 4. (4) scripts/check-workload-spec-ts.sh -- `cargo run -p yah-workload-spec` fails from the camp root (crate is in the excluded oss/yah-base workspace); switched to --manifest-path. It was dead since the same commit. (5) packages/yah/workload-spec/index.ts + .yah/schema/workload.toml.schema.json regenerated (mirror.toml.schema.json also moved -- that is @Ashguard:dragon's W267 ingress field swept in by the shared regen, not mine).")
+//! @yah:handoff("FIXTURE SWEEP (flagged by @Ashguard:dove mid-turn -- my change, my sweep): 8 yah-cloud tests were red on hand-written externally-tagged TOML. Fixed reconciler/derive_cache_prune.rs (2 fixtures), reconciler/static_asset_prune.rs (4), validate.rs (1), tests/whisper_derive_e2e.rs (1), app/yah/cli/src/cloud.rs (alias-collision fixture + the_deploy_body_parses_as_a_workload_envelope_not_a_bare_spec, which asserted external tagging and now asserts a flat `kind`). NOT touched: yubaba/src/lib.rs bundle_deploy_tests -- @Ashguard:dove already rewrote that one in their own relay's module and asked me not to double-fix.")
+//! @yah:handoff("COMMENTS CORRECTED, not left lying: static_asset.rs::load_workload and asset_status.rs both carried R546-B7 comments asserting the envelope is externally tagged and unusable. Both now say the envelope works and the direct StaticAssetWorkload parse is a deliberate shortcut (load_workload keeps it to produce a precise wrong-kind error naming the kind found; asset_status keeps it because component.kind is already checked upstream).")
+//! @yah:verify("THE TICKET'S OWN REPRO NOW PASSES: `cargo run --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --example parse_whisper_toml` -> 'parsed as StaticAsset / assets: 2 / aliases: 3 / shape validation: ok / populated-shape verifier: ok'. It panicked before against the long-published whisper catalog.")
+//! @yah:verify("NEW CI GATE (the ticket's third next-step): xtask/tests/workload_envelope.rs walks the whole camp for workload.toml, parses every file whose kind is one of the four modelled variants through workload_spec::Workload, and hard-asserts no error contains 'wanted exactly 1 element' -- the exact external-tagging signature. It lives in xtask, not workload-spec, because that crate is in the standalone-exported oss/yah-base workspace and cannot reach app/ or .yah/. Runs under the check pipeline's existing cargo-test step. Carries a SHRINK-ONLY KNOWN_GAPS list: a file that starts parsing FAILS the test until its entry is deleted, and a stale entry (file moved/deleted) also fails, so the list cannot rot or grow silently.")
+//! @yah:verify("GREEN: yah-workload-spec --all-features (55 lib + round_trip/postcard + shape_fixtures, 10 targets, 0 failed); kamaji-proto 25/25 incl. deploy_container_round_trip and deploy_string_pinned_image_ref_survives_postcard_wire (the exact UDS path R590-B3 fixed -- proves the binary branch is byte-unchanged); yubaba --lib 339/339; yah-cloud 610 lib + whisper_derive_e2e 1/1; yah --lib cloud:: 108/108; xtask schema_drift 2/2 and workload_envelope 1/1.")
+//! @yah:verify("NOT MINE, seen while verifying: (a) reconciler::pond::tests::{ensure_sim_port_free_ok_when_unbound, port_has_listener_...} flake in a full-suite run and pass in isolation -- they bind real ports and race on a busy dev box. (b) 10 arch::ticket::tests failures in `cargo test -p yah --lib` from a peer's in-flight @yah: annotation-parser work; app/yah/cli/src/arch/ticket.rs has zero references to workload_spec, so nothing in this change can reach them. (c) MirrorConfig's new `ingress` field (@Ashguard:dragon, W267/R594) broke the yah-cloud and yah-cli test builds mid-session; it cleared on its own as they swept call sites -- I did not touch their files.")
+//! @yah:gotcha("VARIANT ORDER IS LOAD-BEARING. WorkloadExternal / WorkloadExternalRef in lib.rs must list variants in the SAME order as Workload -- postcard encodes an external tag as the variant INDEX, so reordering or inserting a variant anywhere but the end silently decodes kamaji UDS frames into the wrong variant. There is no type error for this. Commented at the definitions; the round_trip postcard tests catch a mismatch only if the payload types differ enough to fail decode.")
+//! @yah:gotcha("TWO GAPS DELIBERATELY NOT CLOSED, filed as R658 (umbrella) -> R658-B1 (MesofactStaticWorkload.routes is a required top-level field but all 4 real files AND the CLI scaffold write it inside [build], so TOML scopes it to build.routes) and R658-B2 (kind = \"container\" selects two incompatible schemas: Workload::Container(WorkloadSpec) vs ContainerReconciler's local docker build/run shape). Neither is the B7 tagging bug -- they were invisible until the envelope started being exercised. B2 needs an operator naming decision. Both are pinned in workload_envelope.rs's KNOWN_GAPS so they cannot be forgotten or silently widened.")
 //!
 //! @yah:ticket(R626-S3, "Where does desired-state live? Durable per-workload replica count that survives reconcile loops and camp restarts (0↔1 vs scale-to-N)")
 //! @yah:status(review)
@@ -268,6 +281,34 @@
 //! @yah:gotcha("The store is camp-local and GITIGNORED on purpose. If a future ticket wants a stop to be shared/durable in the repo, that is a different decision (declaration vs intent) — re-open W287 §2 rather than moving the file into tracked territory.")
 //! @yah:gotcha("Reads fail OPEN. Never 'harden' this into fail-closed: an unreadable document would then stop an entire camp, and the failure would be silent (nothing starts) rather than visible (the workload comes back).")
 //!
+//!
+//! @yah:relay(R658, "workload.toml envelope: two type-vs-reality mismatches R546-B7 uncovered but did not fix")
+//! @yah:at(2026-08-03T00:43:00Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R546)
+//!
+//! @yah:ticket(R658-B1, "MesofactStaticWorkload.routes is a required top-level field, but every real file and the CLI scaffold write it inside [build]")
+//! @yah:at(2026-08-03T00:43:04Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R658)
+//! @yah:next("REPRO: `cargo test -p xtask --test workload_envelope` with the file's KNOWN_GAPS entry deleted -> `missing field `routes``. Affects app/yah/web/marketing/workload.toml, external/scrabcake/site/workload.toml, .yah/infra/state/sources/scrabcake/site/site/workload.toml, oss/yubaba/crates/cloud/testdata/mesofact-in-container/workload.toml.")
+//! @yah:next("ROOT CAUSE: TOML scopes every key after a table header into that table. All four files write `routes = \"./mesofact.routes.ts\"` AFTER `[build]`, so it deserializes as `build.routes` -- but MesofactStaticWorkload declares `routes` as a required TOP-LEVEL field. BuildConfig ignores the unknown key, so it vanished silently.")
+//! @yah:next("THE SCAFFOLD AGREES WITH THE FILES, NOT THE TYPE: SITE_WORKLOAD_TOML in app/yah/cli/src/cloud.rs (~line 4977) emits `routes` inside [build] too, so every newly scaffolded site inherits the mismatch. Fix the type or fix the scaffold -- but they must agree, and whichever moves needs the other four files migrated with it.")
+//! @yah:next("WHY IT WENT UNNOTICED: nothing reads `routes` off the envelope. mesofact-static's reconciler never loads MesofactStaticWorkload whole (read_mesofact_build does raw toml::Value subtree extraction, R438-T6), and mesofact-build reads mesofact.routes.ts directly. The field is declared but dead.")
+//! @yah:next("AFTER FIXING: delete the four `missing field `routes`` entries from KNOWN_GAPS in xtask/tests/workload_envelope.rs -- that test FAILS on a stale entry, so it will tell you.")
+//!
+//! @yah:ticket(R658-B2, "kind = \"container\" means two incompatible shapes — Workload::Container(WorkloadSpec) vs ContainerReconciler's local docker build/run")
+//! @yah:at(2026-08-03T00:43:24Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R658)
+//! @yah:next("REPRO: `cargo test -p xtask --test workload_envelope` with the KNOWN_GAPS entry for crates/yah/cloud-admin/workload.toml deleted -> `missing field `image``.")
+//! @yah:next("THE COLLISION: workload_spec::Workload maps `kind = \"container\"` to WorkloadSpec -- an OCI spec with a required digest-pinned `image`, handed to yubaba over the kamaji wire. ContainerReconciler (oss/yubaba/crates/cloud/src/reconciler/container.rs, R602-T1) reads the SAME discriminator as a local-docker shape: `[build] dockerfile/context/image` + `[run] port/host_port/[run.env]`. crates/yah/cloud-admin/workload.toml is the second shape and cannot parse as the first.")
+//! @yah:next("SO ONE `kind` STRING SELECTS TWO INCOMPATIBLE SCHEMAS, and which one you get depends on which loader happens to read the file. Nothing detects the mismatch -- ContainerReconciler parses its own struct, so the envelope is never consulted for these files.")
+//! @yah:next("DECISION NEEDED (operator call, do not pick unilaterally): (a) rename the local-docker kind (e.g. `local-container`) and migrate crates/yah/cloud-admin/workload.toml + the ContainerReconciler dispatch, or (b) model the local-docker shape as a second Workload variant so the envelope covers both, or (c) declare the envelope non-authoritative for `container` and document it. (a) is the smallest and the only one that makes the discriminator honest.")
+//! @yah:next("AFTER FIXING: delete the `missing field `image`` entry from KNOWN_GAPS in xtask/tests/workload_envelope.rs.")
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -427,9 +468,30 @@ impl NamespaceId {
 /// instead — that still gives TOML/JSON back-compat (missing field → `None`)
 /// while the field is always encoded. `MesofactStaticWorkload::ssr_runtime` and
 /// `::serve_bundle` are the reference shape.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+/// **Two wire shapes, one type (R546-B7).** `Serialize`/`Deserialize` are
+/// hand-written and branch on [`is_human_readable`](serde::Deserializer::is_human_readable):
+///
+/// - **TOML/JSON (human-readable)** → *internally* tagged on `kind`, i.e. the
+///   flat shape every on-disk `workload.toml` actually uses
+///   (`kind = "static-asset"` beside `schema_version`, `[[asset]]`, `[aliases]`).
+/// - **postcard (binary)** → *externally* tagged, byte-identical to the derived
+///   representation R590-B3 established for the kamaji UDS.
+///
+/// Why not just `#[serde(tag = "kind")]`: internal tagging buffers through
+/// `deserialize_any`, which postcard (non-self-describing) refuses with
+/// `WontImplement` — that is exactly the failure R590-B3 fixed by flipping this
+/// enum to external tagging. But external tagging wants a single-key map, so
+/// every flat on-disk file then failed with `wanted exactly 1 element, more
+/// than 1 element` and `yah cloud apply` broke for every static-asset
+/// component. Branching on the format satisfies both, and mirrors what
+/// [`ImageRef`] already does for its string-vs-struct form.
+#[derive(Debug, Clone, PartialEq, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "kebab-case")]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(tag = "kind", rename_all = "kebab-case")
+)]
+#[ts(tag = "kind", rename_all = "kebab-case")]
 pub enum Workload {
     /// Static-site build that publishes an artifact directory to the
     /// service's `static` provider slot. Reconciled by the
@@ -465,6 +527,118 @@ pub enum Workload {
     /// Rollback is a pointer-flip via `mirror.toml [asset_aliases]`; bytes are
     /// append-only and never re-pushed on rollback. See W160.
     StaticAsset(StaticAssetWorkload),
+}
+
+impl Workload {
+    /// The `kind` discriminator this variant serializes as — the same string a
+    /// `workload.toml` writes and a `ServiceComponent.kind` names.
+    ///
+    /// Lives here rather than at a call site because this enum now has FIVE
+    /// places that enumerate its variants (itself plus the four tagging
+    /// mirrors below); a caller-local match would be a sixth, in another crate,
+    /// with nothing to force it to keep up.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Workload::MesofactStatic(_) => "mesofact-static",
+            Workload::Container(_) => "container",
+            Workload::Almanac(_) => "almanac",
+            Workload::StaticAsset(_) => "static-asset",
+        }
+    }
+}
+
+/// Internally-tagged mirror of [`Workload`] — the on-disk shape. Only ever
+/// reached on the human-readable branch, so its `deserialize_any` buffering is
+/// never asked of postcard.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum WorkloadTagged {
+    MesofactStatic(MesofactStaticWorkload),
+    Container(WorkloadSpec),
+    Almanac(AlmanacManifest),
+    StaticAsset(StaticAssetWorkload),
+}
+
+/// Borrowing twin of [`WorkloadTagged`] so `Serialize` need not clone the
+/// payload. Variant order must match [`Workload`].
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum WorkloadTaggedRef<'a> {
+    MesofactStatic(&'a MesofactStaticWorkload),
+    Container(&'a WorkloadSpec),
+    Almanac(&'a AlmanacManifest),
+    StaticAsset(&'a StaticAssetWorkload),
+}
+
+/// Externally-tagged mirror — the postcard wire shape R590-B3 established.
+/// postcard encodes an external tag as the *variant index*, so the variant
+/// ORDER here is load-bearing: it must match [`Workload`] exactly or the
+/// kamaji UDS silently decodes into the wrong variant.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum WorkloadExternal {
+    MesofactStatic(MesofactStaticWorkload),
+    Container(WorkloadSpec),
+    Almanac(AlmanacManifest),
+    StaticAsset(StaticAssetWorkload),
+}
+
+/// Borrowing twin of [`WorkloadExternal`]. Same order requirement.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum WorkloadExternalRef<'a> {
+    MesofactStatic(&'a MesofactStaticWorkload),
+    Container(&'a WorkloadSpec),
+    Almanac(&'a AlmanacManifest),
+    StaticAsset(&'a StaticAssetWorkload),
+}
+
+impl Serialize for Workload {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if s.is_human_readable() {
+            match self {
+                Workload::MesofactStatic(w) => WorkloadTaggedRef::MesofactStatic(w),
+                Workload::Container(w) => WorkloadTaggedRef::Container(w),
+                Workload::Almanac(w) => WorkloadTaggedRef::Almanac(w),
+                Workload::StaticAsset(w) => WorkloadTaggedRef::StaticAsset(w),
+            }
+            .serialize(s)
+        } else {
+            match self {
+                Workload::MesofactStatic(w) => WorkloadExternalRef::MesofactStatic(w),
+                Workload::Container(w) => WorkloadExternalRef::Container(w),
+                Workload::Almanac(w) => WorkloadExternalRef::Almanac(w),
+                Workload::StaticAsset(w) => WorkloadExternalRef::StaticAsset(w),
+            }
+            .serialize(s)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Workload {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if de.is_human_readable() {
+            Ok(match WorkloadTagged::deserialize(de)? {
+                WorkloadTagged::MesofactStatic(w) => Workload::MesofactStatic(w),
+                WorkloadTagged::Container(w) => Workload::Container(w),
+                WorkloadTagged::Almanac(w) => Workload::Almanac(w),
+                WorkloadTagged::StaticAsset(w) => Workload::StaticAsset(w),
+            })
+        } else {
+            Ok(match WorkloadExternal::deserialize(de)? {
+                WorkloadExternal::MesofactStatic(w) => Workload::MesofactStatic(w),
+                WorkloadExternal::Container(w) => Workload::Container(w),
+                WorkloadExternal::Almanac(w) => Workload::Almanac(w),
+                WorkloadExternal::StaticAsset(w) => Workload::StaticAsset(w),
+            })
+        }
+    }
 }
 
 /// `kind = "mesofact-static"` payload — static-site build colocated with the
@@ -524,6 +698,114 @@ pub struct MesofactStaticWorkload {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub serve_bundle: Option<MesofactServeBundle>,
+
+    /// Revalidate receiver for the almanac push model (R330-F12).
+    ///
+    /// `Some` → kamaji also forks `mesofact serve --revalidate <workload>`
+    /// alongside the bundle's static serve (or in place of it when
+    /// `serve_bundle` is `None`). The receiver is ephemeral-V8: each
+    /// `POST /revalidate` poke boots a V8 isolate, re-renders the route,
+    /// republishes to the CDN, then drops the isolate.
+    ///
+    /// Env vars are resolved at deploy time (R2 creds + mirror bearer) so
+    /// the node never sees keystore slot names.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub revalidate_receiver: Option<MesofactRevalidateReceiver>,
+}
+
+/// Revalidate receiver config (R330-F12) — tells kamaji to fork a second
+/// `mesofact serve --revalidate` process alongside the static bundle server.
+///
+/// The receiver is the almanac push endpoint: a lightweight resident axum
+/// server mounting `POST /revalidate` that boots V8 on each poke, re-renders
+/// the invalidated route, publishes to R2/CDN, then drops the isolate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct MesofactRevalidateReceiver {
+    /// Routes the receiver accepts pokes for (allowlist).
+    /// Empty vec → all routes in the workload's manifest are revalidatable.
+    #[serde(default)]
+    pub routes: Vec<String>,
+
+    /// Path to `mesofact.config.toml` carrying the `[publish]` block
+    /// (bucket / zone / env-named credentials). Relative to the workload
+    /// directory. Default: `"mesofact.config.toml"`.
+    #[serde(default = "default_publish_config_path")]
+    pub publish_config: String,
+
+    /// Env var name holding the bearer secret for this tenant, resolved
+    /// at deploy time and set as `MESOFACT_MIRROR_KEY` on the receiver
+    /// process. `None` → open receiver (no bearer check).
+    #[ts(optional = nullable)]
+    pub mirror_key_env: Option<String>,
+
+    /// Environment variables set on the revalidate process by kamaji.
+    /// Keys are the canonical env var names (`MESOFACT_S3_ACCESS_KEY_ID`,
+    /// `MESOFACT_S3_SECRET_ACCESS_KEY`, `CLOUDFLARE_API_TOKEN`,
+    /// `MESOFACT_MIRROR_KEY`). Values are resolved from the keystore at
+    /// deploy time — the node never sees slot names.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+
+    /// Feed-fetch tier (R330-F31) — the almanac feeds whose artifacts must be
+    /// refreshed **on the node** for a poke to have anything new to render.
+    ///
+    /// Empty → no fetcher; the receiver re-renders whatever data the bundle was
+    /// built with (correct for a site whose data only changes at build time,
+    /// silently stale for one whose data is a live feed). Non-empty → kamaji
+    /// forks a third resident process, `bins/<triple>/almanac-feed`, next to the
+    /// receiver.
+    #[serde(default)]
+    pub feeds: Vec<AlmanacFeed>,
+
+    /// Seconds between feed-fetch ticks. Ignored when `feeds` is empty.
+    ///
+    /// This is the site's freshness bound: a release lands, and the next tick
+    /// refreshes + pokes. `FeedRunner`'s change-suppression means an idle tick
+    /// costs one conditional fetch, so a short interval is affordable.
+    #[serde(default = "default_feed_interval_secs")]
+    pub feed_interval_secs: u64,
+
+    /// Workspace-relative path of the component whose build produced this
+    /// bundle, e.g. `app/yah/web/marketing` (R330-F31).
+    ///
+    /// Reconciles two roots for one file: a feed declares `emit.artifact`
+    /// workspace-relative (that is where it is authored), while the route
+    /// declares the same file project-relative (that is what the bundle
+    /// carries). The fetcher strips this prefix to get from one to the other.
+    /// `None` → the two already coincide.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub feed_project_prefix: Option<String>,
+}
+
+/// One almanac feed handed to the on-node fetcher (R330-F31).
+///
+/// The definition travels **by value**, not by path: the node has no copy of
+/// the camp's `.yah/almanac/` tree, and staging one into the content-addressed
+/// bundle would put a mutable-by-nature config inside an immutable artifact.
+/// The fetcher parses `config_toml` with the same `FeedConfig` type that reads
+/// the file at the source, so there is one schema and no drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct AlmanacFeed {
+    /// Feed name — the `.yah/almanac/<name>.toml` stem. Logs/diagnostics only;
+    /// `config_toml` is authoritative.
+    pub name: String,
+
+    /// Verbatim contents of the feed definition TOML.
+    pub config_toml: String,
+}
+
+fn default_publish_config_path() -> String {
+    "mesofact.config.toml".to_string()
+}
+
+/// Five minutes: fast enough that a release is live on yah.dev before anyone
+/// goes looking, slow enough to be invisible against a source API's rate limit.
+fn default_feed_interval_secs() -> u64 {
+    300
 }
 
 /// Serve-time reference to a published W272 bundle (R599-F4) — the
@@ -548,6 +830,23 @@ pub struct MesofactServeBundle {
     /// How kamaji supervises the served bundle. Default: keep-alive.
     #[serde(default)]
     pub lifecycle: BundleLifecycle,
+
+    /// Port the served bundle listens on (R599-F12). This is the bundle-tier
+    /// analogue of a container's `expose.mesh.ports`: the *declared* serving
+    /// port, which a proxy pairs with the workload's mesh IP to get a dialable
+    /// address.
+    ///
+    /// `None` → kamaji falls back to its node-wide default
+    /// (`KAMAJI_BUNDLE_PORT` / `DEFAULT_BUNDLE_PORT` = 8080), which is the
+    /// pre-R599-F12 behaviour and is only correct while a node hosts one
+    /// bundle. Declaring a port per workload is what lets one node host
+    /// several — that singleton default is the thing it removes.
+    ///
+    /// No `skip_serializing_if` — see `serve_bundle`'s note: the postcard wire
+    /// codec is positional, so an omitted byte shifts every later field.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub port: Option<u16>,
 }
 
 /// Lifecycle mode for a served bundle (W272 §3).
@@ -1347,6 +1646,110 @@ impl WorkloadSpec {
             .get(REQUIRES_TAINT_ANNOTATION)
             .map(String::as_str)
     }
+
+    /// Whether this workload must be run by kamaji's **native** (fork+exec)
+    /// backend on the node's own userland, rather than by a container backend
+    /// (R577-T1 / W254).
+    ///
+    /// Opt-in via `annotations["yah.exec"] == "native"` (see
+    /// [`NATIVE_EXEC_ANNOTATION`] / [`NATIVE_EXEC_VALUE`]) — the same
+    /// annotation-shaped, zero-blast-radius marker as
+    /// [`Self::wants_host_network`] and [`Self::requires_taint`], chosen over
+    /// a new plain field for the reason R572-F1 recorded: a field forces a
+    /// struct-literal edit at every existing construction site and an
+    /// exhaustive-match update in `kamaji-proto`'s codec, and this marker
+    /// needs neither.
+    ///
+    /// # Why an annotation and not a runtime enum on the wire
+    ///
+    /// The remote-execution wire already carries exactly one workload shape —
+    /// `Workload::Container(WorkloadSpec)` — and every layer between the
+    /// dispatcher and the node (yubaba admission, mesh assignment, log
+    /// ingest, produced-file retrieval, teardown) is written against it. A
+    /// Darwin build differs from a Linux build in *one* respect: there is no
+    /// container that can host it, because you cannot containerize the Darwin
+    /// kernel. Marking that one difference keeps the rest of the path shared
+    /// instead of growing a parallel `exec_native` RPC that would have to
+    /// re-implement all of it.
+    ///
+    /// `image` stays populated for a native workload and is **identity
+    /// metadata only** — nothing is pulled; the native backend resolves argv
+    /// from `entrypoint` + `command` (container semantics) and execs it on
+    /// the host.
+    pub fn wants_native_exec(&self) -> bool {
+        self.annotations
+            .get(NATIVE_EXEC_ANNOTATION)
+            .map(|v| v == NATIVE_EXEC_VALUE)
+            .unwrap_or(false)
+    }
+
+    /// Whether this workload builds its **own unprivileged container sandbox**
+    /// inside the one the backend gives it, and therefore needs the two
+    /// capabilities plus the `no_new_privs` relaxation that setting up a
+    /// user namespace requires (R636-B2).
+    ///
+    /// Opt-in via `annotations["yah.sandbox"] == "nested"` (see
+    /// [`NESTED_SANDBOX_ANNOTATION`] / [`NESTED_SANDBOX_VALUE`]) — the same
+    /// annotation-shaped, zero-blast-radius marker as
+    /// [`Self::wants_host_network`] and [`Self::wants_native_exec`].
+    ///
+    /// # What it actually grants, and why exactly that
+    ///
+    /// Rootless BuildKit (the only user today: remote `build-image` steps
+    /// dispatch `moby/buildkit:*-rootless`) boots through `rootlesskit`, which
+    /// must map a range of sub-uids into a fresh user namespace. It does that
+    /// by exec'ing the **setuid-root** helpers `newuidmap` / `newgidmap`, so
+    /// it needs `CAP_SETUID` + `CAP_SETGID` in the bounding set *and*
+    /// `noNewPrivileges = false` (with `no_new_privs` on, the kernel silently
+    /// strips the setuid bit and the helper fails with "Could not set caps").
+    ///
+    /// Each of those three was measured on us-west-002 to be **individually
+    /// necessary** — dropping any one of them puts `rootlesskit` back to
+    /// failing before the first layer:
+    ///
+    /// | grant | `rootlesskit` result |
+    /// |---|---|
+    /// | baseline (`CAP_NET_BIND_SERVICE` only, `nnp` on) | `fork/exec /usr/bin/newuidmap: operation not permitted` |
+    /// | `+CAP_SETUID` only, `nnp` off | `fork/exec /usr/bin/newgidmap: operation not permitted` |
+    /// | `+CAP_SETUID +CAP_SETGID`, `nnp` **on** | `newuidmap: Could not set caps` |
+    /// | `+CAP_SETUID +CAP_SETGID`, `nnp` off | starts; build runs to completion |
+    ///
+    /// It is deliberately *not* `CAP_SYS_ADMIN`: a non-rootless buildkitd
+    /// would need that instead, which is a far wider grant. Emptying
+    /// `/etc/subuid` to force `rootlesskit`'s single-mapping path does not
+    /// avoid the helpers either — it just fails earlier with "No subuid
+    /// ranges found".
+    ///
+    /// **The backend guards this.** Like host networking, it is honoured only
+    /// for `tier == "infra"` workloads; a non-infra workload that sets the
+    /// annotation is rejected at deploy. Every other workload keeps the
+    /// `CAP_NET_BIND_SERVICE`-only, `no_new_privs` baseline.
+    ///
+    /// # Mutually exclusive with [`Self::wants_native_exec`]
+    ///
+    /// This grant is defined in terms of an **OCI process spec** — a
+    /// capability set and a `noNewPrivileges` bit. A native (fork+exec)
+    /// workload has no OCI spec, so there is nothing to apply it to; kamaji
+    /// refuses a spec carrying both markers rather than accepting a request
+    /// for widened privileges and silently dropping it (R577-T1 owns that
+    /// refusal). The two are independent *annotations* — neither implies the
+    /// other, which is what
+    /// `nested_sandbox_marker_is_independent_of_the_other_markers` pins — but
+    /// they are not a legal *pair*.
+    ///
+    /// If a future runtime does have a sandbox worth widening (a MacVM under
+    /// W254, say), give it its own annotation rather than relaxing that
+    /// refusal. The grant this marker names is `CAP_SETUID` + `CAP_SETGID` +
+    /// `no_new_privs` off and nothing else; letting it mean a different
+    /// privilege set per backend would make "what does `yah.sandbox=nested`
+    /// grant?" unanswerable without knowing which backend received it, which
+    /// is precisely what a security-relevant marker must not be.
+    pub fn wants_nested_sandbox(&self) -> bool {
+        self.annotations
+            .get(NESTED_SANDBOX_ANNOTATION)
+            .map(|v| v == NESTED_SANDBOX_VALUE)
+            .unwrap_or(false)
+    }
 }
 
 /// Annotation key requesting a workload share the host network namespace.
@@ -1367,6 +1770,25 @@ pub const REQUIRES_TAINT_ANNOTATION: &str = "yah.placement.requires-taint";
 /// exist yet (R572-F3); this constant is the agreed-upon name both sides
 /// will use once it does.
 pub const PUBLIC_IP_TAINT: &str = "public-ip";
+
+/// Annotation key selecting kamaji's native (fork+exec) backend for a
+/// workload. See [`WorkloadSpec::wants_native_exec`].
+pub const NATIVE_EXEC_ANNOTATION: &str = "yah.exec";
+
+/// Annotation value (for [`NATIVE_EXEC_ANNOTATION`]) selecting native
+/// host execution. Any other value leaves the workload on a container
+/// backend.
+pub const NATIVE_EXEC_VALUE: &str = "native";
+
+/// Annotation key requesting the capabilities a workload needs to stand up an
+/// unprivileged container sandbox of its own.
+/// See [`WorkloadSpec::wants_nested_sandbox`].
+pub const NESTED_SANDBOX_ANNOTATION: &str = "yah.sandbox";
+
+/// Annotation value (for [`NESTED_SANDBOX_ANNOTATION`]) requesting the
+/// nested-sandbox grant (`CAP_SETUID` + `CAP_SETGID`, `no_new_privs` off).
+/// Any other value leaves the workload on the baseline sandbox.
+pub const NESTED_SANDBOX_VALUE: &str = "nested";
 
 // ── ImageRef ─────────────────────────────────────────────────────────────────
 
@@ -1684,6 +2106,89 @@ pub mod forge_produced {
     /// reap-durable.
     pub fn is_durable_path(path: &Path) -> bool {
         path.starts_with(CONTAINER_DIR)
+    }
+}
+
+// ── Forge host-state root (R636-B1) ───────────────────────────────────────────
+
+/// The one host directory tree a QED forge step's bind mounts may live under.
+///
+/// # Why this is a named root rather than a list of paths
+///
+/// runc refuses a bind whose source is missing, and the OCI mapper never
+/// mkdirs one — so *something* has to create each host dir before deploy.
+/// yubaba does, but only for paths it recognizes, and "recognizes" was
+/// originally a hardcoded match on the produced dir. Every new forge mount then
+/// re-learned the lesson the expensive way, on a real box, minutes into a
+/// build: R603-B6 for `produced/`, then R636-B1 for `build-out/`, each
+/// surfacing as the same opaque `failed to fulfil mount request: … no such file
+/// or directory` from deep inside containerd.
+///
+/// Naming the *root* makes the rule checkable instead of enumerable: yubaba
+/// creates any forge bind under [`HOST_ROOT`], and `yubaba.service` grants the
+/// root once via `StateDirectory=yah/qed`. A third mount needs no new code and
+/// no unit-file edit — it only has to live here.
+///
+/// The prefix bound is load-bearing in the other direction too: it is what
+/// keeps a workload spec from asking yubaba to mkdir an arbitrary host path.
+pub mod forge_state {
+    use std::path::Path;
+
+    /// Root of the forge's host-persistent state. Both
+    /// [`super::forge_produced::HOST_ROOT`] and [`BUILD_OUT_DIR`] are under it.
+    pub const HOST_ROOT: &str = "/var/lib/yah/qed";
+
+    /// Host directory a `build-image` step's OCI archive is written to, bound
+    /// at `/yah/build/out` in the BuildKit container. Shared (rather than
+    /// per-forge like `produced/`) because the archive is named after the image
+    /// tag, which is already unique per build.
+    pub const BUILD_OUT_DIR: &str = "/var/lib/yah/qed/build-out";
+
+    /// Whether yubaba may create `host_path` on behalf of a forge workload.
+    ///
+    /// Rejects anything outside [`HOST_ROOT`], and anything with a `..`
+    /// component — `/var/lib/yah/qed/../../../etc` starts with the root as a
+    /// string and is nowhere near it as a path.
+    pub fn is_forge_state_path(host_path: &Path) -> bool {
+        !host_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+            && host_path.starts_with(HOST_ROOT)
+    }
+}
+
+#[cfg(test)]
+mod forge_state_tests {
+    use super::forge_state::*;
+    use std::path::Path;
+
+    #[test]
+    fn both_known_forge_roots_are_under_the_state_root() {
+        assert!(is_forge_state_path(Path::new(
+            super::forge_produced::HOST_ROOT
+        )));
+        assert!(is_forge_state_path(Path::new(BUILD_OUT_DIR)));
+        assert!(is_forge_state_path(&super::forge_produced::host_dir(
+            "abc-123"
+        )));
+    }
+
+    /// A spec must not be able to steer yubaba's mkdir anywhere it likes —
+    /// neither by naming an unrelated absolute path nor by climbing out with
+    /// `..`, which a plain string prefix check would wave through.
+    #[test]
+    fn paths_outside_the_root_are_refused() {
+        for bad in [
+            "/var/lib/yah/yubaba",
+            "/etc/systemd/system",
+            "/var/lib/yah/qed/../../../etc",
+            "relative/path",
+        ] {
+            assert!(
+                !is_forge_state_path(Path::new(bad)),
+                "{bad} must not be creatable by a forge spec"
+            );
+        }
     }
 }
 
@@ -2581,17 +3086,20 @@ license = "mit"
         assert_eq!(img, back);
     }
 
+    /// R546-B7: assert the shape real files use. This test previously fed the
+    /// EXTERNALLY-tagged wrapping-table form (`[static-asset]` +
+    /// `[[static-asset.asset]]`), which no on-disk `workload.toml` has ever
+    /// used — so it stayed green while `yah cloud apply` was broken for every
+    /// static-asset component. The flat `kind = "..."` form below is what every
+    /// workload.toml in the workspace is written in.
     #[test]
     fn workload_envelope_dispatches_static_asset() {
-        // Externally-tagged: the `static-asset` variant is a wrapping table
-        // (R590-B3 flipped the Workload graph off internal `kind =` tags so the
-        // whole spec is postcard-decodable over the kamaji UDS).
         let src = format!(
             r#"
-[static-asset]
+kind = "static-asset"
 schema_version = "V1"
 
-[[static-asset.asset]]
+[[asset]]
 filename = "foo/bar.bin"
 source   = "sources/bar.bin"
 blake3   = "{HASH_64}"
@@ -2599,6 +3107,46 @@ blake3   = "{HASH_64}"
         );
         let w: Workload = toml::from_str(&src).expect("parse");
         assert!(matches!(w, Workload::StaticAsset(_)));
+    }
+
+    /// R546-B7: the format branch, both directions. Human-readable formats get
+    /// the flat `kind`-tagged shape; postcard keeps the externally-tagged
+    /// variant-index encoding the kamaji UDS depends on (R590-B3). Regressing
+    /// either side breaks a different half of the system, so pin both.
+    #[test]
+    fn workload_envelope_is_tagged_in_toml_and_external_in_postcard() {
+        let src = format!(
+            r#"
+kind = "static-asset"
+schema_version = "V1"
+
+[[asset]]
+filename = "foo/bar.bin"
+source   = "sources/bar.bin"
+blake3   = "{HASH_64}"
+"#
+        );
+        let w: Workload = toml::from_str(&src).expect("parse flat TOML");
+
+        // Human-readable round-trips stay flat — no wrapping table.
+        let json = serde_json::to_string(&w).expect("serialize json");
+        assert!(json.contains("\"kind\":\"static-asset\""), "got {json}");
+        assert!(
+            !json.contains("{\"static-asset\":"),
+            "human-readable output must not be externally tagged: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Workload>(&json).expect("re-parse json"),
+            w
+        );
+
+        // postcard is non-self-describing: it can only round-trip because the
+        // binary branch never asks for deserialize_any.
+        let bytes = postcard::to_allocvec(&w).expect("postcard encode");
+        assert_eq!(
+            postcard::from_bytes::<Workload>(&bytes).expect("postcard decode"),
+            w
+        );
     }
 
     // ── R572-F1: lifecycle archetype discriminator ─────────────────────────
@@ -2775,6 +3323,103 @@ blake3   = "{HASH_64}"
                 assert_eq!(spec, inner);
                 assert_eq!(spec.effective_archetype(), LifecycleArchetype::Appliance);
                 assert_eq!(spec.requires_taint(), Some(PUBLIC_IP_TAINT));
+            }
+            other => panic!("expected Workload::Container, got {other:?}"),
+        }
+    }
+
+    // ── Nested-sandbox grant (R636-B2) ──────────────────────────────────────
+
+    #[test]
+    fn nested_sandbox_marker_is_opt_in_and_reads_back() {
+        // The half that matters: no workload gets the grant by default, so
+        // adding the marker cannot widen anything already deployed.
+        let plain = archetype_test_spec("ordinary-build");
+        assert!(!plain.wants_nested_sandbox());
+
+        let mut buildkit = archetype_test_spec("build-image");
+        buildkit.annotations.insert(
+            NESTED_SANDBOX_ANNOTATION.to_string(),
+            NESTED_SANDBOX_VALUE.to_string(),
+        );
+        assert!(buildkit.wants_nested_sandbox());
+
+        // Fails closed on any other value, same strictness as
+        // `wants_host_network` — a typo must not hand out CAP_SETUID.
+        let mut typo = archetype_test_spec("typo");
+        typo.annotations
+            .insert(NESTED_SANDBOX_ANNOTATION.to_string(), "Nested".to_string());
+        assert!(!typo.wants_nested_sandbox());
+    }
+
+    /// The three markers are independent axes: asking for host networking or
+    /// native exec must not imply the capability grant, and vice versa.
+    #[test]
+    fn nested_sandbox_marker_is_independent_of_the_other_markers() {
+        let mut host_net = archetype_test_spec("host-net");
+        host_net.annotations.insert(
+            HOST_NETWORK_ANNOTATION.to_string(),
+            HOST_NETWORK_VALUE.to_string(),
+        );
+        assert!(host_net.wants_host_network());
+        assert!(!host_net.wants_nested_sandbox());
+
+        let mut nested = archetype_test_spec("nested");
+        nested.annotations.insert(
+            NESTED_SANDBOX_ANNOTATION.to_string(),
+            NESTED_SANDBOX_VALUE.to_string(),
+        );
+        assert!(nested.wants_nested_sandbox());
+        assert!(!nested.wants_host_network());
+        assert!(!nested.wants_native_exec());
+    }
+
+    // ── Native exec marker (R577-T1 / W254) ─────────────────────────────────
+
+    #[test]
+    fn native_exec_marker_is_opt_in_and_reads_back() {
+        // Default: every forge workload is a container workload. This is the
+        // half that matters most — the marker must not silently reroute the
+        // Linux offload leg proven live on us-west-002.
+        let plain = archetype_test_spec("linux-build");
+        assert!(!plain.wants_native_exec());
+
+        let mut native = archetype_test_spec("darwin-build");
+        native.annotations.insert(
+            NATIVE_EXEC_ANNOTATION.to_string(),
+            NATIVE_EXEC_VALUE.to_string(),
+        );
+        assert!(native.wants_native_exec());
+
+        // Any other value is not the opt-in — same strictness as
+        // `wants_host_network`, so a typo fails closed onto the container
+        // backend rather than escaping the sandbox.
+        let mut typo = archetype_test_spec("typo");
+        typo.annotations
+            .insert(NATIVE_EXEC_ANNOTATION.to_string(), "Native".to_string());
+        assert!(!typo.wants_native_exec());
+    }
+
+    #[test]
+    fn native_marked_spec_round_trips_through_json_as_a_container_workload() {
+        // The point of the annotation shape: a native workload is still a
+        // `Workload::Container` on the wire, so kamaji-proto's codec, yubaba
+        // admission and the mesh-assignment path need no new variant.
+        let mut inner = archetype_test_spec("darwin-build");
+        inner.annotations.insert(
+            NATIVE_EXEC_ANNOTATION.to_string(),
+            NATIVE_EXEC_VALUE.to_string(),
+        );
+        let workload = Workload::Container(inner.clone());
+
+        let json = serde_json::to_string(&workload).expect("serialize");
+        assert!(json.contains(NATIVE_EXEC_ANNOTATION));
+
+        let back: Workload = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            Workload::Container(spec) => {
+                assert_eq!(spec, inner);
+                assert!(spec.wants_native_exec());
             }
             other => panic!("expected Workload::Container, got {other:?}"),
         }

@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 
 use local_driver::s3_sign::{
     sign_s3_empty_body, sign_s3_get_with_query, sign_s3_no_body, sign_s3_put_object,
+    sign_s3_put_object_with, S3PutOptions,
 };
 
 use crate::{Error, ObjectStore, Precondition};
@@ -112,6 +113,9 @@ pub struct R2ObjectStore {
     bucket: String,
     access_key: String,
     secret_key: String,
+    /// Overrides the derived `https://<account_id>.r2.cloudflarestorage.com`.
+    /// See [`R2ObjectStore::with_endpoint`].
+    endpoint: Option<String>,
     client: Option<Client>,
 }
 
@@ -150,8 +154,32 @@ impl R2ObjectStore {
             bucket: bucket.into(),
             access_key: access_key.into(),
             secret_key: secret_key.into(),
+            endpoint: None,
             client: Some(client),
         })
+    }
+
+    /// Point this store at an S3-compatible endpoint other than R2 — in
+    /// practice, the pond tier's local MinIO (`http://127.0.0.1:9000`).
+    ///
+    /// Everything else about the store is already endpoint-agnostic: the bucket
+    /// lives in the URL path (path-style addressing, which MinIO also speaks)
+    /// and SigV4 is signed against whatever host the URL names.
+    ///
+    /// This exists because without it the pond rehearsal could not exercise the
+    /// *read* side of a publish at all. `publish_to_pond` uploads a directory
+    /// tree and offers no way to read an object back, so the one part of a
+    /// release that is a read-modify-write — the accumulating `index.json` that
+    /// https://yah.dev/releases renders from — was the one part a green local
+    /// rehearsal proved nothing about (R330-T32). A conditional-write loop that
+    /// has never run is a conditional-write loop you do not have.
+    ///
+    /// The region stays `"auto"`; MinIO accepts it.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        let endpoint = endpoint.into();
+        let trimmed = endpoint.trim_end_matches('/');
+        self.endpoint = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        self
     }
 
     fn client(&self) -> &Client {
@@ -187,7 +215,10 @@ impl R2ObjectStore {
     }
 
     fn endpoint(&self) -> String {
-        format!("https://{}.r2.cloudflarestorage.com", self.account_id)
+        match &self.endpoint {
+            Some(e) => e.clone(),
+            None => format!("https://{}.r2.cloudflarestorage.com", self.account_id),
+        }
     }
 
     fn object_url(&self, key: &str) -> String {
@@ -197,32 +228,38 @@ impl R2ObjectStore {
     fn bucket_url(&self) -> String {
         format!("{}/{}", self.endpoint(), self.bucket)
     }
-}
 
-/// Convert a reqwest error into our generic [`Error`].
-fn io_err(ctx: &str, e: impl std::fmt::Display) -> Error {
-    Error::Io(format!("{ctx}: {e}"))
-}
-
-impl ObjectStore for R2ObjectStore {
-    fn put(&self, key: &str, data: Vec<u8>) -> Result<(), Error> {
+    /// The one PUT path, with `Cache-Control` optional (R703-B8).
+    ///
+    /// `put` and `put_cached` differ only in that header, so they share this
+    /// rather than each carrying their own signing + status handling — the
+    /// shape where one of two copies quietly stops matching the other.
+    fn put_inner(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        cache_control: Option<&str>,
+    ) -> Result<(), Error> {
         let url = self.object_url(key);
         let body_sha256 = {
             let mut h = Sha256::new();
             h.update(&data);
             hex::encode(h.finalize())
         };
-        let headers = sign_s3_put_object(
+        let headers = sign_s3_put_object_with(
             &url,
             &body_sha256,
-            content_type_for_key(key),
             data.len(),
             R2_REGION,
             &self.access_key,
             &self.secret_key,
-            // Generic object-store put — the BLAKE3 stamp is a static-asset
-            // catalog concern, not a property of every object (R546-B10).
-            None,
+            &S3PutOptions {
+                content_type: content_type_for_key(key),
+                // Generic object-store put — the BLAKE3 stamp is a static-asset
+                // catalog concern, not a property of every object (R546-B10).
+                blake3_meta: None,
+                cache_control,
+            },
         )
         .map_err(|e| Error::Backend(format!("sign PUT {key}: {e}")))?;
 
@@ -234,6 +271,21 @@ impl ObjectStore for R2ObjectStore {
             .send()
             .map_err(|e| io_err(&format!("PUT {key}"), e))?;
         check_status(resp, "PUT", key)
+    }
+}
+
+/// Convert a reqwest error into our generic [`Error`].
+fn io_err(ctx: &str, e: impl std::fmt::Display) -> Error {
+    Error::Io(format!("{ctx}: {e}"))
+}
+
+impl ObjectStore for R2ObjectStore {
+    fn put(&self, key: &str, data: Vec<u8>) -> Result<(), Error> {
+        self.put_inner(key, data, None)
+    }
+
+    fn put_cached(&self, key: &str, data: Vec<u8>, cache_control: &str) -> Result<(), Error> {
+        self.put_inner(key, data, Some(cache_control))
     }
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
@@ -588,6 +640,136 @@ fn extract_first_tag(body: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_endpoint_redirects_every_url_and_leaves_r2_alone() {
+        let store = R2ObjectStore::new("acct", "yah-dev", "k", "s").unwrap();
+        assert_eq!(
+            store.object_url("yah/index.json"),
+            "https://acct.r2.cloudflarestorage.com/yah-dev/yah/index.json"
+        );
+
+        // Pond tier: same store, MinIO endpoint, path-style bucket preserved.
+        let pond = R2ObjectStore::new("pond", "yah-dev", "k", "s")
+            .unwrap()
+            .with_endpoint("http://127.0.0.1:9000");
+        assert_eq!(
+            pond.object_url("yah/index.json"),
+            "http://127.0.0.1:9000/yah-dev/yah/index.json"
+        );
+        assert_eq!(pond.bucket_url(), "http://127.0.0.1:9000/yah-dev");
+    }
+
+    #[test]
+    fn with_endpoint_normalizes_trailing_slash_and_ignores_empty() {
+        let s = R2ObjectStore::new("acct", "b", "k", "s")
+            .unwrap()
+            .with_endpoint("http://127.0.0.1:9000/");
+        assert_eq!(s.object_url("k1"), "http://127.0.0.1:9000/b/k1");
+        // An empty override is a config mistake, not an instruction to sign
+        // against the empty host — fall back to the derived R2 endpoint.
+        let s = R2ObjectStore::new("acct", "b", "k", "s")
+            .unwrap()
+            .with_endpoint("");
+        assert_eq!(
+            s.object_url("k1"),
+            "https://acct.r2.cloudflarestorage.com/b/k1"
+        );
+    }
+
+    /// Accept exactly one HTTP request on an ephemeral loopback port, answer
+    /// `200`, and hand the raw request head back. Enough of a server to prove
+    /// what went onto the wire, and no more — the point is the headers, and a
+    /// mock at the `reqwest` layer would only re-assert what the signer already
+    /// returned rather than what the client actually sent.
+    fn one_shot_http() -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let done = line == "\r\n";
+                head.push_str(&line);
+                if done {
+                    break;
+                }
+            }
+            // Drain the body, else the client sees the connection close
+            // mid-write and reports a broken pipe instead of our 200.
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("content-length: ")
+                        .or_else(|| l.strip_prefix("Content-Length: "))
+                })
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            reader.read_exact(&mut body).unwrap();
+            reader
+                .into_inner()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            head
+        });
+        (url, handle)
+    }
+
+    /// R703-B8, the end of the chain: the signer builds a `Cache-Control` and
+    /// `reqwest` has to actually put it on the socket. Every other test here
+    /// stops at the `HeaderMap`, which is one `.headers()` call away from being
+    /// a test that passes while R2 stores an object with no directive.
+    #[test]
+    fn put_cached_sends_the_cache_control_header_on_the_wire() {
+        let (endpoint, server) = one_shot_http();
+        let store = R2ObjectStore::new("acct", "yah-dev", "AK", "SK")
+            .unwrap()
+            .with_endpoint(endpoint);
+
+        store
+            .put_cached(
+                "yah-desktop/latest.json",
+                b"{\"version\":\"0.8.22\"}".to_vec(),
+                crate::CACHE_CONTROL_NO_CACHE,
+            )
+            .unwrap();
+
+        let head = server.join().unwrap().to_lowercase();
+        assert!(
+            head.starts_with("put /yah-dev/yah-desktop/latest.json "),
+            "{head}"
+        );
+        assert!(head.contains("cache-control: no-cache, max-age=0\r\n"), "{head}");
+        // Sent AND signed — an unsigned header R2 would reject the request over.
+        assert!(
+            head.contains("signedheaders=cache-control;content-length;content-type;host;"),
+            "{head}"
+        );
+    }
+
+    /// The other half: a plain `put` must still send no directive at all. If it
+    /// quietly gained a default, versioned release bytes would start carrying
+    /// whatever that default was.
+    #[test]
+    fn a_plain_put_sends_no_cache_control_header() {
+        let (endpoint, server) = one_shot_http();
+        let store = R2ObjectStore::new("acct", "yah-dev", "AK", "SK")
+            .unwrap()
+            .with_endpoint(endpoint);
+
+        store.put("some/blob.bin", b"bytes".to_vec()).unwrap();
+
+        let head = server.join().unwrap().to_lowercase();
+        assert!(!head.contains("cache-control"), "{head}");
+    }
 
     #[test]
     fn parse_list_v2_extracts_keys() {

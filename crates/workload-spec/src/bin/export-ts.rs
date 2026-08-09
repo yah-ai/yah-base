@@ -75,6 +75,10 @@ fn main() {
     emit!(MesofactStaticWorkload);
     emit!(MesofactServeBundle);
     emit!(BundleLifecycle);
+    // Referenced by MesofactStaticWorkload.revalidate_receiver — omitting it
+    // emitted a binding that names a type this file never declares.
+    emit!(AlmanacFeed);
+    emit!(MesofactRevalidateReceiver);
 
     emit!(AlmanacTarget);
     emit!(NotReadyPolicy);
@@ -91,17 +95,20 @@ fn main() {
 
     emit!(Workload);
 
-    // Anchor the output path to the workspace root via CARGO_MANIFEST_DIR so
-    // the bin produces the same file regardless of the cwd cargo is invoked
-    // from. The crate sits at crates/yah/workload-spec — three parents up is
-    // the workspace root.
+    // Anchor the output path to the yah camp root via CARGO_MANIFEST_DIR so the
+    // bin produces the same file regardless of the cwd cargo is invoked from.
+    // The crate sits at oss/yah-base/crates/workload-spec — FOUR parents up is
+    // the camp root (75d8df7e split yah-base out of yubaba and added the extra
+    // `oss/yah-base` level; the count stayed at three, so since that commit
+    // this bin silently wrote to oss/yah-base/packages/… and the committed
+    // bindings stopped tracking the Rust types. Found while regenerating for
+    // R546-B7).
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .expect("CARGO_MANIFEST_DIR has at least three parents");
-    let path = workspace_root.join("packages/yah/workload-spec/index.ts");
+    let camp_root = manifest_dir
+        .ancestors()
+        .nth(4)
+        .expect("CARGO_MANIFEST_DIR has at least four parents");
+    let path = camp_root.join("packages/yah/workload-spec/index.ts");
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create parent dirs");

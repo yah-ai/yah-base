@@ -27,6 +27,15 @@
 //! needs the host netns (the guarded `yah.network=host` escape hatch, honoured
 //! only for `tier="infra"`). The upstreams it forwards to are reached over the
 //! WireGuard mesh.
+//!
+//! Upstreams come from one of two sources, selected by
+//! [`PasswayIngressSpec::discover_from`] (R594-F8): a fixed list
+//! ([`PasswayIngressSpec::upstreams`] → `PASSWAY_UPSTREAMS`), or yubaba's
+//! service-record surface (`PASSWAY_UPSTREAM_SOURCE=yubaba`), which is what
+//! makes this appliance an ingress *provider* — the backend set follows
+//! placement instead of being typed in, the same way the rented
+//! `cloudflare-tunnel` arm's ingress rules are generated from deployed
+//! workloads rather than hand-written.
 
 use std::collections::HashMap;
 
@@ -94,9 +103,27 @@ pub struct PasswayIngressSpec {
 
     /// Upstream mesh endpoints (`host:port`) passway round-robins across.
     /// Reached over the WireGuard mesh; empty is valid (passway fail-ready-503s
-    /// until records populate).
+    /// until records populate). Ignored when [`Self::discover_from`] is set.
+    ///
+    /// R594-F10: entries are rendered into `PASSWAY_UPSTREAMS` verbatim, so an
+    /// appliance fronting several services writes them host-prefixed —
+    /// `"marketing.yah.dev=100.64.0.5:8080"` — and passway gives each hostname
+    /// its own health-checked set. No extra field is needed here for that;
+    /// mixing prefixed and unprefixed entries is what passway rejects at boot.
     #[serde(default)]
     pub upstreams: Vec<String>,
+
+    /// R594-F8: base URL of a yubaba to *discover* upstreams from, e.g.
+    /// `http://100.64.0.2:7443`. When set, passway polls that node's
+    /// `GET /service-records?ready=true` instead of reading a fixed list, and
+    /// [`Self::upstreams`] is not rendered at all.
+    ///
+    /// This is what makes the appliance an ingress **provider** rather than a
+    /// hand-configured proxy: the backend set follows placement, exactly as
+    /// the rented arm's tunnel ingress rules do. Leave it `None` for a
+    /// standalone edge fronting something yubaba doesn't place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discover_from: Option<String>,
 
     /// Speak TLS to upstreams. Default `false` — the mesh is already encrypted.
     #[serde(default)]
@@ -123,13 +150,12 @@ impl PasswayIngressSpec {
     /// `image` is the content-addressed passway image (operator-supplied, same
     /// as the mesofact-runner digest).
     pub fn into_container_workload(&self, image: ImageRef) -> Workload {
-        let env = vec![
+        let mut env = vec![
             literal_env("PASSWAY_LISTEN", self.listen.clone()),
             // Consume the shared mount instead of self-issuing — the whole point.
             literal_env("PASSWAY_TLS_MODE", "manual".into()),
             literal_env("PASSWAY_TLS_CERT", CERT_MOUNT_PATH.into()),
             literal_env("PASSWAY_TLS_KEY", KEY_MOUNT_PATH.into()),
-            literal_env("PASSWAY_UPSTREAMS", self.upstreams.join(",")),
             literal_env(
                 "PASSWAY_UPSTREAM_TLS",
                 if self.upstream_tls { "true" } else { "false" }.into(),
@@ -139,6 +165,22 @@ impl PasswayIngressSpec {
             literal_env("PASSWAY_PID_FILE", PID_FILE.into()),
             literal_env("PASSWAY_UPGRADE_SOCK", UPGRADE_SOCK.into()),
         ];
+
+        // Exactly one upstream source is rendered, never both: a leftover
+        // PASSWAY_UPSTREAMS beside a discovery URL reads as a fallback the
+        // proxy would silently prefer or ignore depending on which arm
+        // main.rs took, and either way the operator would be debugging an
+        // address list that isn't in play.
+        match &self.discover_from {
+            Some(base_url) => {
+                env.push(literal_env("PASSWAY_UPSTREAM_SOURCE", "yubaba".into()));
+                env.push(literal_env("PASSWAY_YUBABA_URL", base_url.clone()));
+            }
+            None => {
+                env.push(literal_env("PASSWAY_UPSTREAM_SOURCE", "static".into()));
+                env.push(literal_env("PASSWAY_UPSTREAMS", self.upstreams.join(",")));
+            }
+        }
 
         let secrets = vec![
             cluster_file_secret(cert_secret_name(&self.domain), CERT_MOUNT_PATH),
@@ -255,6 +297,7 @@ mod tests {
             listen: DEFAULT_LISTEN.into(),
             upstreams: vec!["yah-marketing.pdx:8080".into(), "yah-dashboard.pdx:8080".into()],
             upstream_tls: false,
+            discover_from: None,
             command: None,
         }
     }
@@ -332,11 +375,46 @@ mod tests {
     #[test]
     fn upstreams_join_into_one_env() {
         let spec = lower(&sample_spec());
+        assert_eq!(env_val(&spec, "PASSWAY_UPSTREAM_SOURCE"), Some("static"));
         assert_eq!(
             env_val(&spec, "PASSWAY_UPSTREAMS"),
             Some("yah-marketing.pdx:8080,yah-dashboard.pdx:8080")
         );
         assert_eq!(env_val(&spec, "PASSWAY_UPSTREAM_TLS"), Some("false"));
+    }
+
+    #[test]
+    fn discover_from_selects_the_yubaba_upstream_source() {
+        let mut s = sample_spec();
+        s.discover_from = Some("http://100.64.0.2:7443".into());
+        let spec = lower(&s);
+
+        assert_eq!(env_val(&spec, "PASSWAY_UPSTREAM_SOURCE"), Some("yubaba"));
+        assert_eq!(
+            env_val(&spec, "PASSWAY_YUBABA_URL"),
+            Some("http://100.64.0.2:7443")
+        );
+    }
+
+    #[test]
+    fn discovery_mode_renders_no_static_upstream_list() {
+        // Both sources present would leave the operator debugging an address
+        // list the proxy never reads.
+        let mut s = sample_spec();
+        s.discover_from = Some("http://100.64.0.2:7443".into());
+        let spec = lower(&s);
+
+        assert_eq!(
+            env_val(&spec, "PASSWAY_UPSTREAMS"),
+            None,
+            "a discovery-mode ingress must not also carry a stale static list"
+        );
+    }
+
+    #[test]
+    fn static_mode_renders_no_discovery_url() {
+        let spec = lower(&sample_spec());
+        assert_eq!(env_val(&spec, "PASSWAY_YUBABA_URL"), None);
     }
 
     #[test]
@@ -392,6 +470,7 @@ mod tests {
         assert_eq!(spec.listen, DEFAULT_LISTEN);
         assert!(!spec.upstream_tls);
         assert!(spec.command.is_none());
+        assert!(spec.discover_from.is_none(), "static is the default source");
         assert_eq!(spec.upstreams, vec!["a.pdx:8080".to_string()]);
     }
 }
