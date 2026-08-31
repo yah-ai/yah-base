@@ -70,6 +70,14 @@ fn main() {
 
     emit!(WorkloadSpec);
 
+    // The two on-disk forms of `kind = "container"` (R783-F1 / W324). Leaves
+    // first: ContainerManifest is a union over WorkloadSpec and ContainerBuild.
+    emit!(ContainerMount);
+    emit!(ContainerRunConfig);
+    emit!(ContainerBuildStep);
+    emit!(ContainerBuild);
+    emit!(ContainerManifest);
+
     emit!(BuildConfig);
     emit!(BuildMode);
     emit!(MesofactStaticWorkload);

@@ -82,15 +82,29 @@ pub struct SsrRuntimeSpec {
     /// Timeout for the initial port + HTTP-ready probes.
     #[serde(with = "duration_secs_serde")]
     pub ready_timeout: Duration,
-    /// HTTP path used for readiness probing. Defaults to `/`. Some SSR
-    /// frameworks reserve `/` for catch-all rendering; override with a
-    /// dedicated health route if `/` returns non-2xx during normal operation.
+    /// HTTP path used for readiness probing. Set from the workload's
+    /// `healthcheck` when it declares an `HttpGet` probe; otherwise
+    /// [`default_ready_path`].
     #[serde(default = "default_ready_path")]
     pub ready_path: String,
 }
 
+/// `/readyz` — the Kubernetes-conventional readiness path, which the canonical
+/// `mesofact-serve` image serves (`oss/mesofact/crates/mesofact/src/health.rs`).
+///
+/// This used to be `/`, which for an SSR workload means "render the catch-all
+/// route", i.e. it proved the process was listening and nothing more. That is
+/// liveness, and admitting on it is how a pond mirror starts routing to a
+/// container whose isolate has not booted.
+///
+/// Safe for the foreign images this module stays agnostic about
+/// (`oven/bun:1`, a hand-rolled Node origin): [`wait_for_http_ready`] fails
+/// only on 5xx, so an image with no `/readyz` answers 404 and passes — exactly
+/// the "it accepted a connection" signal `/` gave. An image that *does* serve
+/// `/readyz` gets its 503s honored. Nothing regresses; mesofact gets correct.
+/// Declare a `healthcheck` on the workload to name a different path.
 fn default_ready_path() -> String {
-    "/".to_string()
+    "/readyz".to_string()
 }
 
 mod duration_secs_serde {
@@ -215,6 +229,13 @@ pub async fn ensure_ssr_runtime_running(
 /// - `volumes` → host-side bind mounts only (named volumes deferred)
 /// - `expose.mesh.ports[0]` → `container_port` (defaults to
 ///   [`DEFAULT_SSR_CONTAINER_PORT`])
+/// - `healthcheck` → `ready_path`, when it declares an `HttpGet` probe. Only
+///   the path is taken: the probe's port is the container's own, while this
+///   bring-up probes the host-mapped port, and the interval/threshold fields
+///   belong to a supervisor loop this one-shot wait has no analogue for. The
+///   other probe kinds (`Exec`, `TcpConnect`) name no path, so they fall
+///   through to [`default_ready_path`] — `wait_for_port` above already covers
+///   the TCP case.
 ///
 /// `host_port`, `container_name`, `container_label`, and `ready_timeout` are
 /// supplied by the caller — they're tied to the pond mirror, not the workload
@@ -262,8 +283,16 @@ pub fn lower_workload_spec(
         container_name,
         container_label,
         ready_timeout,
-        ready_path: default_ready_path(),
+        ready_path: ready_path_for(ws),
     })
+}
+
+/// The workload's declared `HttpGet` health path, else [`default_ready_path`].
+fn ready_path_for(ws: &WorkloadSpec) -> String {
+    match ws.healthcheck.as_ref().map(|h| &h.probe) {
+        Some(workload_spec::HealthProbe::HttpGet { path, .. }) => path.clone(),
+        _ => default_ready_path(),
+    }
 }
 
 /// Compose `"{registry}/{repository}:{tag}"`, preferring `@digest` when set.
@@ -521,6 +550,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spec.container_port, DEFAULT_SSR_CONTAINER_PORT);
+    }
+
+    #[test]
+    fn lower_defaults_ready_path_to_readyz() {
+        // Was `/` — i.e. "render the catch-all route", which for an SSR
+        // workload proves only that the process is listening. `/readyz` is the
+        // path mesofact serves that means the isolate booted.
+        let ws = minimal_workload_spec();
+        let spec = lower_workload_spec(&ws, 14321, "n".into(), "l".into(), Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(spec.ready_path, "/readyz");
+    }
+
+    #[test]
+    fn lower_takes_ready_path_from_a_declared_http_healthcheck() {
+        let mut ws = minimal_workload_spec();
+        ws.healthcheck = Some(workload_spec::Healthcheck {
+            probe: workload_spec::HealthProbe::HttpGet {
+                // Deliberately not the container_port: this bring-up probes the
+                // host-mapped port, so only the path is taken.
+                path: "/custom/health".into(),
+                port: 9999,
+                expect_status: None,
+            },
+            interval: workload_spec::Millis(1_000),
+            timeout: workload_spec::Millis(1_000),
+            initial_delay: workload_spec::Millis(0),
+            failure_threshold: 3,
+        });
+        let spec = lower_workload_spec(&ws, 14321, "n".into(), "l".into(), Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(spec.ready_path, "/custom/health");
+        assert_eq!(spec.host_port, 14321, "probe port stays the host mapping");
+    }
+
+    #[test]
+    fn lower_falls_back_for_pathless_probe_kinds() {
+        let mut ws = minimal_workload_spec();
+        ws.healthcheck = Some(workload_spec::Healthcheck {
+            probe: workload_spec::HealthProbe::TcpConnect { port: 3000 },
+            interval: workload_spec::Millis(1_000),
+            timeout: workload_spec::Millis(1_000),
+            initial_delay: workload_spec::Millis(0),
+            failure_threshold: 3,
+        });
+        let spec = lower_workload_spec(&ws, 14321, "n".into(), "l".into(), Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(spec.ready_path, "/readyz");
     }
 
     #[test]

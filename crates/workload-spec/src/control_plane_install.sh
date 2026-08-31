@@ -1,0 +1,109 @@
+# shellcheck shell=bash
+# Canonical control-plane (yubaba + kamaji) roll: fetch → verify → anchor →
+# install → assert → restart.
+#
+# THIS FILE IS THE ONE COPY. Three callers consume these exact bytes:
+#   1. `build_install_script` (control_plane_install.rs) include_str!s it for the
+#      SSH transport (`rollout::apply::apply_over_ssh`).
+#   2. …and for the mesh transport (yubaba `POST /self-update`, run as root in a
+#      systemd-run transient unit).
+#   3. `scripts/roll-node.sh` reads it off disk and pipes it to `ssh … bash -s`.
+# Every caller prepends a prologue setting the four variables below and nothing
+# else. Adding a fourth copy of this logic is how the fleet drifts — don't.
+#
+# Required from the caller's prologue:
+#   URL   release tarball URL, from a SIGNED release manifest
+#   SHA   that tarball's sha256, from the SAME manifest
+#   VER   the version being installed (labels the log line)
+#   SUDO  "sudo" when the executing user is not root, empty when it is
+#
+# Never touches durable state: no /var/lib/yah-cloud/identity.json (wiping the
+# ed25519 host identity forces a re-TOFU and breaks hostkey-drift detection —
+# the R589 gotcha), no raft log dir. A roll moves /usr/local/bin bytes + unit
+# files, nothing else. `script_never_touches_durable_state` is the guard.
+set -euo pipefail
+: "${URL:?URL must be set from a signed release manifest}"
+: "${SHA:?SHA must be set from the same signed release manifest}"
+: "${VER:?VER must be set}"
+SUDO="${SUDO-}"
+STAMP="$(date -u +%Y%m%d)"
+WORK="$(mktemp -d /tmp/yah-roll.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+cd "$WORK"
+
+echo "== fetch + verify (sha256 from signed manifest) =="
+curl -fsSL -o pair.tar.gz "$URL"
+printf '%s  pair.tar.gz\n' "$SHA" | sha256sum -c -
+mkdir x && tar -xzf pair.tar.gz -C x
+D="$(find x -maxdepth 1 -type d -name 'yubaba-*' | head -1)"
+[ -n "$D" ] || { echo 'tarball layout unexpected: no yubaba-* dir' >&2; exit 1; }
+
+echo "== rollback anchors (.rollback-$STAMP) =="
+# The convention these boxes already carry: /usr/local/bin/kamaji.rollback-YYYYMMDD,
+# the shape both the passway roll and the 2026-07-21 kamaji roll left behind.
+# Written BEFORE anything is replaced, so the anchor is the build that was live
+# going in.
+#
+# Never overwritten within the same UTC day, and that is the load-bearing part:
+# on a second run the anchor must still hold the build that was live before the
+# FIRST roll of the day. Re-anchoring would quietly overwrite the escape hatch
+# with the very binary you are trying to escape from.
+#
+# A missing target is not an error — a first install on a fresh box has nothing
+# to anchor. The unit files are anchored alongside the binaries under the same
+# stamp: rolling the binaries back while leaving new units in place is not a
+# rollback, and the tarball ships all five together.
+anchor() { # path
+  [ -e "$1" ] || return 0
+  if [ ! -e "$1.rollback-$STAMP" ]; then
+    $SUDO cp -p "$1" "$1.rollback-$STAMP"
+    echo "  anchored $1.rollback-$STAMP"
+  else
+    echo "  kept existing $1.rollback-$STAMP (pre-roll build for today)"
+  fi
+}
+anchor /usr/local/bin/yubaba
+anchor /usr/local/bin/kamaji
+anchor /etc/systemd/system/yubaba.slice
+anchor /etc/systemd/system/kamaji.service
+anchor /etc/systemd/system/yubaba.service
+
+echo "== install (atomic, yubaba + kamaji as one pair) =="
+# Stage next to the target on the SAME filesystem, then rename. A rename within
+# a filesystem is atomic, so a half-written binary/unit is never observable.
+install_atomic() { # src mode dest
+  $SUDO install -m"$2" "$1" "$3.roll-new.$$"
+  $SUDO mv -f "$3.roll-new.$$" "$3"
+}
+install_atomic "$D/yubaba"         0755 /usr/local/bin/yubaba
+install_atomic "$D/kamaji"         0755 /usr/local/bin/kamaji
+install_atomic "$D/yubaba.slice"   0644 /etc/systemd/system/yubaba.slice
+install_atomic "$D/kamaji.service" 0644 /etc/systemd/system/kamaji.service
+install_atomic "$D/yubaba.service" 0644 /etc/systemd/system/yubaba.service
+
+echo "== assert by CONTENT, not by version string =="
+# `--version` prints the workspace version baked in at build time, which says
+# nothing about whether the bytes on disk are the ones you just shipped:
+# us-east-001 reported kamaji 0.8.22 while carrying none of the 0.8.22 tree's
+# code (R746-T3). Hash the installed file against the file extracted from the
+# tarball whose sha256 the signed manifest already vouched for, and the chain
+# manifest → tarball → extracted → installed closes with no version string in
+# it anywhere.
+assert_installed_bytes() { # extracted installed
+  local want got
+  want="$(sha256sum "$1" | awk '{print $1}')"
+  got="$(sha256sum "$2" | awk '{print $1}')"
+  if [ "$want" != "$got" ]; then
+    echo "content assertion FAILED for $2: tarball has $want, installed file has $got" >&2
+    exit 1
+  fi
+  echo "  $2 sha256=$got"
+}
+assert_installed_bytes "$D/yubaba" /usr/local/bin/yubaba
+assert_installed_bytes "$D/kamaji" /usr/local/bin/kamaji
+
+echo "== restart supervision tree (kamaji then yubaba, W154 order) =="
+$SUDO systemctl daemon-reload
+$SUDO systemctl restart kamaji.service
+$SUDO systemctl restart yubaba.service
+echo "installed target=$VER yubaba=$(/usr/local/bin/yubaba --version 2>/dev/null) kamaji=$(/usr/local/bin/kamaji --version 2>/dev/null)"

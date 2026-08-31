@@ -27,13 +27,16 @@ members = [
     "crates/workload-spec",
     "crates/keys",
     "crates/object-store",
+    # R736-F1 (W250): the global tenant->cell pointer record + its read/CAS
+    # helpers, layered on object-store's put_if rather than living inside it.
+    "crates/tenant-pointer",
     "crates/local-driver",
     "crates/mesofact-bundle",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.22"
+version = "0.8.29"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

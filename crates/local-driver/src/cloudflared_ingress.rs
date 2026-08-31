@@ -224,7 +224,7 @@ impl CloudflaredIngressSpec {
             annotations,
         };
 
-        Workload::Container(spec)
+        Workload::container(spec)
     }
 }
 
@@ -271,10 +271,10 @@ mod tests {
     }
 
     fn lower(spec: &CloudflaredIngressSpec) -> WorkloadSpec {
-        match spec.into_container_workload(sample_image()) {
-            Workload::Container(s) => s,
-            other => panic!("expected Container, got {other:?}"),
-        }
+        let w = spec.into_container_workload(sample_image());
+        w.container_spec()
+            .unwrap_or_else(|| panic!("expected Container, got {w:?}"))
+            .clone()
     }
 
     #[test]

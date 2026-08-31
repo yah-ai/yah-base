@@ -16,7 +16,7 @@ path = "src/lib.rs"
 [dependencies]
 # WorkloadSpec — LocalDockerRuntime implements workload_spec::WorkloadRuntime
 # to plug the docker-CLI driver into the yubaba seam (R256-F10).
-workload-spec = { package = "yah-workload-spec", path = "../workload-spec", version = "0.8.22" }
+workload-spec = { package = "yah-workload-spec", path = "../workload-spec", version = "0.8.29" }
 
 anyhow = "1.0"
 async-trait = "0.1"

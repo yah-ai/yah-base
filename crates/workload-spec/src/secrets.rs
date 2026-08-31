@@ -111,16 +111,56 @@ pub struct SecretConsumer {
     pub tenant: TenantId,
     /// [`WorkloadSpec::namespace`] — the routing/naming axis (W206).
     pub namespace: NamespaceId,
+    /// The signed recipe this run was admitted as, when it carried a grant that
+    /// **verified** (R555-F5). `None` for every ordinary service workload, and
+    /// for any spec whose grant did not verify — see [`RecipeIdentity`].
+    #[serde(default)]
+    pub recipe: Option<RecipeIdentity>,
+}
+
+/// Who a remote run proved itself to be, cryptographically.
+///
+/// A forge workload's [`WorkloadSpec::name`] is a fresh `forge-<uuid>` per run,
+/// so it can never appear in an allow-list written in advance — which left
+/// [`SecretAccess::AllowAny`] as the only rule under which a dispatched recipe
+/// could read a cluster secret at all. That is precisely the ambient grant W235
+/// §(c) says must not be how a remote build gets the R2 and cosign keys.
+///
+/// This is the durable identity underneath the ephemeral one: the recipe name
+/// out of a verified admission grant, plus the key that vouched for it. Both
+/// halves matter — the name alone would let anyone holding *any* trusted key
+/// mint a grant claiming to be `rusty-v8-musl`.
+///
+/// Construct only from
+/// [`admission::admit_grant`](crate::admission::admit_grant)'s return value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct RecipeIdentity {
+    /// `AdmissionGrant::recipe` from the verified grant.
+    pub recipe: String,
+    /// Hex Ed25519 public key that signed it, as pinned on the node.
+    pub key: String,
 }
 
 impl SecretConsumer {
     /// The consumer identity of `spec`.
+    ///
+    /// Carries no recipe identity: this constructor sees only the spec, and a
+    /// recipe identity is a claim about a signature. Add one with
+    /// [`SecretConsumer::admitted_as`] after verifying.
     pub fn of(spec: &WorkloadSpec) -> Self {
         Self {
             workload: spec.name.clone(),
             tenant: spec.tenant.clone(),
             namespace: spec.namespace.clone(),
+            recipe: None,
         }
+    }
+
+    /// Attach the recipe identity a verified admission grant established.
+    pub fn admitted_as(mut self, recipe: RecipeIdentity) -> Self {
+        self.recipe = Some(recipe);
+        self
     }
 
     /// A consumer in the singleton tenant/namespace — the shape every spec on a
@@ -130,6 +170,7 @@ impl SecretConsumer {
             workload: name.into(),
             tenant: TenantId::singleton(),
             namespace: NamespaceId::singleton(),
+            recipe: None,
         }
     }
 }
@@ -197,6 +238,45 @@ pub enum SecretAccess {
     /// Only workloads matching one of these entries. An empty list admits
     /// nobody — see the type-level note on fail-closed defaulting.
     Workloads(Vec<WorkloadMatch>),
+
+    /// Only runs of one of these **signed recipes** (R555-F5 / W235 §(c)).
+    ///
+    /// The rule a dispatched build needs: its workload name is a per-run
+    /// `forge-<uuid>` that no allow-list can name in advance, so
+    /// [`SecretAccess::Workloads`] cannot express "the rusty-v8-musl build may
+    /// read the R2 write key" and [`SecretAccess::AllowAny`] over-answers it by
+    /// handing that key to anything that can reach the node.
+    ///
+    /// Matching consumes a [`RecipeIdentity`] that only exists on the far side
+    /// of a verified Ed25519 grant, so this is *narrower* than the workload
+    /// rule, not a loophole in it: the requester has to be running argv the
+    /// recipe author signed, on a node that pins the author's key.
+    Recipes(Vec<RecipeMatch>),
+}
+
+/// One entry in a [`SecretAccess::Recipes`] allow-list.
+///
+/// Both fields are required and both are compared exactly. `key` is here
+/// because the recipe *name* is chosen by whoever writes the recipe: without
+/// it, any holder of any key the node trusts could sign a recipe called
+/// `rusty-v8-musl` and inherit its credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct RecipeMatch {
+    /// The admitted recipe name, as it appears in the signed grant.
+    pub recipe: String,
+    /// Hex Ed25519 public key that must have signed the grant.
+    pub key: String,
+}
+
+impl RecipeMatch {
+    /// Whether `consumer` presents a verified identity this entry admits.
+    pub fn admits(&self, consumer: &SecretConsumer) -> bool {
+        consumer
+            .recipe
+            .as_ref()
+            .is_some_and(|id| id.recipe == self.recipe && id.key == self.key)
+    }
 }
 
 impl Default for SecretAccess {
@@ -216,10 +296,29 @@ impl SecretAccess {
     }
 
     /// Whether `consumer` may be served the secret this rule guards.
+    /// Allow exactly the named recipes, each signed by the given hex key.
+    pub fn recipes<I, N, K>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (N, K)>,
+        N: Into<String>,
+        K: Into<String>,
+    {
+        Self::Recipes(
+            entries
+                .into_iter()
+                .map(|(recipe, key)| RecipeMatch {
+                    recipe: recipe.into(),
+                    key: key.into(),
+                })
+                .collect(),
+        )
+    }
+
     pub fn admits(&self, consumer: &SecretConsumer) -> bool {
         match self {
             Self::AllowAny => true,
             Self::Workloads(entries) => entries.iter().any(|e| e.admits(consumer)),
+            Self::Recipes(entries) => entries.iter().any(|e| e.admits(consumer)),
         }
     }
 
@@ -227,6 +326,14 @@ impl SecretAccess {
     pub fn summary(&self) -> String {
         match self {
             Self::AllowAny => "allow-any".to_string(),
+            Self::Recipes(entries) if entries.is_empty() => "deny-all (no rule)".to_string(),
+            Self::Recipes(entries) => entries
+                .iter()
+                // Keys are 64 hex chars; a truncated prefix is enough to tell
+                // two signing identities apart in a table without wrapping it.
+                .map(|e| format!("recipe {}@{}", e.recipe, &e.key[..e.key.len().min(8)]))
+                .collect::<Vec<_>>()
+                .join(", "),
             Self::Workloads(entries) if entries.is_empty() => "deny-all (no rule)".to_string(),
             Self::Workloads(entries) => entries
                 .iter()
@@ -358,6 +465,7 @@ mod tests {
             workload: "yah-cloud-admin".into(),
             tenant: TenantId("acme".into()),
             namespace: NamespaceId::singleton(),
+            recipe: None,
         };
         assert!(!rule.admits(&other_tenant));
     }
@@ -377,6 +485,104 @@ mod tests {
         let m: WorkloadMatch = serde_json::from_str(r#"{"workload":"api"}"#).unwrap();
         assert_eq!(m.tenant, TenantId::singleton());
         assert_eq!(m.namespace, NamespaceId::singleton());
+    }
+
+    // ── recipe rules (R555-F5) ───────────────────────────────────────────────
+
+    const KEY: &str = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0537bb43f2a8d9c";
+
+    fn forge_run(recipe: Option<&str>) -> SecretConsumer {
+        // What a dispatched build actually looks like: a per-run workload name
+        // no allow-list could have named in advance.
+        let c = SecretConsumer::workload("forge-0193a7c2-9f11-7e3a-9c1e-2b0f4d8e6a55");
+        match recipe {
+            Some(r) => c.admitted_as(RecipeIdentity {
+                recipe: r.into(),
+                key: KEY.into(),
+            }),
+            None => c,
+        }
+    }
+
+    #[test]
+    fn a_recipe_rule_admits_the_signed_recipe_whatever_the_run_is_called() {
+        let rule = SecretAccess::recipes([("rusty-v8-musl", KEY)]);
+        assert!(rule.admits(&forge_run(Some("rusty-v8-musl"))));
+        // A second run of the same recipe has a different workload name and is
+        // still admitted — that is the whole point of keying on the recipe.
+        let other_run = SecretConsumer::workload("forge-0193a7c2-ffff-7e3a-9c1e-2b0f4d8e6a55")
+            .admitted_as(RecipeIdentity {
+                recipe: "rusty-v8-musl".into(),
+                key: KEY.into(),
+            });
+        assert!(rule.admits(&other_run));
+    }
+
+    #[test]
+    fn a_recipe_rule_admits_nobody_without_a_verified_identity() {
+        // The fail-closed direction: an unsigned dispatch, or one whose grant
+        // did not verify, carries `recipe: None` and gets nothing.
+        let rule = SecretAccess::recipes([("rusty-v8-musl", KEY)]);
+        assert!(!rule.admits(&forge_run(None)));
+        assert!(!rule.admits(&SecretConsumer::workload("rusty-v8-musl")));
+    }
+
+    #[test]
+    fn a_recipe_rule_matches_on_the_signing_key_too() {
+        // Otherwise anyone holding any key the node pins could sign a recipe
+        // named `rusty-v8-musl` and inherit its credentials.
+        let rule = SecretAccess::recipes([("rusty-v8-musl", KEY)]);
+        let impostor = SecretConsumer::workload("forge-1").admitted_as(RecipeIdentity {
+            recipe: "rusty-v8-musl".into(),
+            key: "00".repeat(32),
+        });
+        assert!(!rule.admits(&impostor));
+        assert!(!rule.admits(&forge_run(Some("whisper-bundle-tar"))));
+    }
+
+    #[test]
+    fn the_two_rule_kinds_do_not_leak_into_each_other() {
+        // A workload rule is not satisfied by a recipe identity...
+        let by_workload = SecretAccess::workloads(["rusty-v8-musl"]);
+        assert!(!by_workload.admits(&forge_run(Some("rusty-v8-musl"))));
+        // ...and a recipe rule is not satisfied by a same-named workload.
+        let by_recipe = SecretAccess::recipes([("ingress", KEY)]);
+        assert!(!by_recipe.admits(&SecretConsumer::workload("ingress")));
+    }
+
+    #[test]
+    fn an_empty_recipe_list_admits_nobody_and_says_so() {
+        let rule = SecretAccess::Recipes(Vec::new());
+        assert!(!rule.admits(&forge_run(Some("rusty-v8-musl"))));
+        assert_eq!(rule.summary(), "deny-all (no rule)");
+    }
+
+    #[test]
+    fn a_recipe_rule_renders_recipe_and_key_prefix() {
+        let rule = SecretAccess::recipes([("rusty-v8-musl", KEY)]);
+        assert_eq!(rule.summary(), "recipe rusty-v8-musl@3d4017c3");
+    }
+
+    #[test]
+    fn a_recipe_rule_round_trips_through_the_stored_record() {
+        let rule = SecretAccess::recipes([("rusty-v8-musl", KEY)]);
+        let json = serde_json::to_string(&rule).unwrap();
+        assert_eq!(serde_json::from_str::<SecretAccess>(&json).unwrap(), rule);
+        // And the pre-R555-F5 record shape still deserializes unchanged.
+        let legacy: SecretAccess =
+            serde_json::from_str(r#"{"workloads":[{"workload":"ingress"}]}"#).unwrap();
+        assert!(legacy.admits(&SecretConsumer::workload("ingress")));
+    }
+
+    #[test]
+    fn a_consumer_serialized_before_this_field_existed_carries_no_recipe() {
+        // `recipe` is serde(default) on SecretConsumer, and the default is None
+        // — an absent field must not become a claim.
+        let c: SecretConsumer = serde_json::from_str(
+            r#"{"workload":"ingress","tenant":"default","namespace":"default"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.recipe, None);
     }
 
     #[test]

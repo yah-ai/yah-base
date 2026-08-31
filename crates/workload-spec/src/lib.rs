@@ -258,6 +258,7 @@
 //! @yah:verify("NOT MINE, seen while verifying: (a) reconciler::pond::tests::{ensure_sim_port_free_ok_when_unbound, port_has_listener_...} flake in a full-suite run and pass in isolation -- they bind real ports and race on a busy dev box. (b) 10 arch::ticket::tests failures in `cargo test -p yah --lib` from a peer's in-flight @yah: annotation-parser work; app/yah/cli/src/arch/ticket.rs has zero references to workload_spec, so nothing in this change can reach them. (c) MirrorConfig's new `ingress` field (@Ashguard:dragon, W267/R594) broke the yah-cloud and yah-cli test builds mid-session; it cleared on its own as they swept call sites -- I did not touch their files.")
 //! @yah:gotcha("VARIANT ORDER IS LOAD-BEARING. WorkloadExternal / WorkloadExternalRef in lib.rs must list variants in the SAME order as Workload -- postcard encodes an external tag as the variant INDEX, so reordering or inserting a variant anywhere but the end silently decodes kamaji UDS frames into the wrong variant. There is no type error for this. Commented at the definitions; the round_trip postcard tests catch a mismatch only if the payload types differ enough to fail decode.")
 //! @yah:gotcha("TWO GAPS DELIBERATELY NOT CLOSED, filed as R658 (umbrella) -> R658-B1 (MesofactStaticWorkload.routes is a required top-level field but all 4 real files AND the CLI scaffold write it inside [build], so TOML scopes it to build.routes) and R658-B2 (kind = \"container\" selects two incompatible schemas: Workload::Container(WorkloadSpec) vs ContainerReconciler's local docker build/run shape). Neither is the B7 tagging bug -- they were invisible until the envelope started being exercised. B2 needs an operator naming decision. Both are pinned in workload_envelope.rs's KNOWN_GAPS so they cannot be forgotten or silently widened.")
+//! @yah:gotcha("HALF-STALE as of 2026-08-18: the gotcha above says both R658 gaps are pinned in workload_envelope.rs KNOWN_GAPS. Only R658-B2 (`missing field image`) still is. R658-B1 is CLOSED - all four `missing field routes` entries were deleted, every manifest and the `yah cloud site init` scaffold now write routes ABOVE [build], and BuildConfig carries serde(deny_unknown_fields) so the misplacement is a parse error rather than a dropped key. See R658-B1.")
 //!
 //! @yah:ticket(R626-S3, "Where does desired-state live? Durable per-workload replica count that survives reconcile loops and camp restarts (0↔1 vs scale-to-N)")
 //! @yah:status(review)
@@ -289,8 +290,8 @@
 //! @yah:parent(R546)
 //!
 //! @yah:ticket(R658-B1, "MesofactStaticWorkload.routes is a required top-level field, but every real file and the CLI scaffold write it inside [build]")
-//! @yah:at(2026-08-03T00:43:04Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-08-19T02:08:02Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R658)
 //! @yah:next("REPRO: `cargo test -p xtask --test workload_envelope` with the file's KNOWN_GAPS entry deleted -> `missing field `routes``. Affects app/yah/web/marketing/workload.toml, external/scrabcake/site/workload.toml, .yah/infra/state/sources/scrabcake/site/site/workload.toml, oss/yubaba/crates/cloud/testdata/mesofact-in-container/workload.toml.")
@@ -298,17 +299,100 @@
 //! @yah:next("THE SCAFFOLD AGREES WITH THE FILES, NOT THE TYPE: SITE_WORKLOAD_TOML in app/yah/cli/src/cloud.rs (~line 4977) emits `routes` inside [build] too, so every newly scaffolded site inherits the mismatch. Fix the type or fix the scaffold -- but they must agree, and whichever moves needs the other four files migrated with it.")
 //! @yah:next("WHY IT WENT UNNOTICED: nothing reads `routes` off the envelope. mesofact-static's reconciler never loads MesofactStaticWorkload whole (read_mesofact_build does raw toml::Value subtree extraction, R438-T6), and mesofact-build reads mesofact.routes.ts directly. The field is declared but dead.")
 //! @yah:next("AFTER FIXING: delete the four `missing field `routes`` entries from KNOWN_GAPS in xtask/tests/workload_envelope.rs -- that test FAILS on a stale entry, so it will tell you.")
+//! @yah:next("SPREAD, found 2026-08-14 by R715-T2: two MORE files hit this and are NOT in KNOWN_GAPS, so `cargo test -p xtask --test workload_envelope` is RED on a clean tree for everyone. The two are app/yah/web/chat/workload.toml and oss/mesofact/examples/hello/workload.toml, both the same routes-after-[build] shape. Deliberately NOT pinned into KNOWN_GAPS - silently widening the pin is what this ticket exists to stop. Migrate them alongside the other four when the type-vs-scaffold decision lands.")
+//! @yah:handoff("DECIDED: the DATA moved to the type, not the type to the data. `routes` stays a TOP-LEVEL field of MesofactStaticWorkload; all eight on-disk manifests and the CLI scaffold now write it ABOVE [build]. Three reasons the reverse was wrong: (1) MesofactStaticWorkload is a postcard wire type over the kamaji UDS, so moving a field between structs is a wire break needing a lockstep kamaji+yubaba deploy; (2) the field's own doc says it is what the RECONCILER reads to enumerate routes, i.e. deploy-time not build-time, so [build] is the wrong home semantically; (3) the reconciler's own fixtures (mesofact_static.rs), three camp.rs fixtures and the struct literal at cloud.rs:5389 already agreed with the type - only the hand-authored TOML disagreed.")
+//! @yah:verify("cargo test -p xtask --test workload_envelope - GREEN (was RED on a clean tree for everyone). All four `missing field routes` KNOWN_GAPS entries DELETED, not widened; only R658-B2's `missing field image` remains.")
+//! @yah:handoff("ROOT-CAUSE GUARD, the part that makes this not recur: workload_spec::BuildConfig now carries #[serde(deny_unknown_fields)] (oss/yah-base/crates/workload-spec/src/lib.rs). Migrating the files alone would have left the trap armed - serde silently dropping a stray [build] key is WHY a declared-but-dead field survived months unnoticed. Now the misplacement is a parse error naming `routes`, which is the one thing the author needs to move. Inert for the postcard kamaji wire (non-self-describing, positional); only constrains TOML/JSON.")
+//! @yah:verify("cargo test --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --all-features - 121 lib (incl. 3 new R658-B1 tests) + 8 integration targets, 0 failed. New: mesofact_static_routes_parse_at_the_top_level, mesofact_static_routes_inside_build_is_rejected_by_name, unknown_build_keys_are_refused_rather_than_ignored.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib - 878 passed, 0 failed.")
+//! @yah:verify("cargo test -p yah --lib cloud:: - 120 passed, 0 failed, incl. the new site_init_tests::scaffold_workload_toml_parses_through_the_envelope_with_top_level_routes.")
+//! @yah:verify("cargo test -p xtask - all 12 targets green, incl. schema_drift and workload_envelope.")
+//! @yah:verify("./scripts/check-workload-spec-ts.sh - in sync (ts-rs ignores deny_unknown_fields, so no TS churn).")
+//! @yah:handoff("DISCOVERED WORK, wider than the ticket title - deny_unknown_fields immediately caught TWO live files the envelope test structurally CANNOT see. app/yah/web/analytics/workload.toml and app/yah/web/dashboard/workload.toml are kind = mesofact-spa, which is not in the test's MODELLED_KINDS, but mesofact-spa rides the SAME MesofactStaticReconciler (app/yah/cli/src/cloud.rs:5195) and therefore the same read_mesofact_build -> BuildConfig parse. Both had routes under [build]; without migrating them my own guard would have broken deploys for analytics.yah.dev and app.yah.dev. Both migrated. Swept every workload.toml in the camp for stray [build] keys: the only two remaining are crates/yah/cloud-admin (R658-B2's file) and app/yah/workers/yah-cr, and NEITHER goes through workload_spec::BuildConfig - both use reconciler-local raw toml::Value extraction (cloudflare_worker.rs:200), so both are unaffected.")
+//! @yah:handoff("ALSO FIXED IN THIS PASS (docs are canon; these were what a human copies): .yah/docs/guides/host-a-site-and-worker-on-yah.md:102 and .yah/docs/architecture/A031-yah-cloud-config-shape.md:438 both showed routes UNDER [build] - they would have re-seeded the bug into every hand-authored manifest. Also oss/yubaba/crates/cloud/src/config.rs:5890 (web_workload_round_trips fixture) and the bundle_assembly_tests fixture at app/yah/cli/src/cloud.rs.")
+//! @yah:handoff("UNRELATED LANDED BREAKAGE unblocked to verify at all: oss/yubaba/crates/cloud/src/reconciler/lowering_golden.rs:48 failed to compile with E0063 missing field `admission` - TransformRecipe gained admission: Option<RecipeAdmission> (oss/qed/crates/velveteen-exec/src/transforms.rs:70, landed in 8b35b0a9) and this golden was never updated. Whole yah-cloud test binary would not build. Added `admission: None` (correct: the golden is an unsigned local recipe and pins the LOWERING shape, which the signature does not participate in). Both files were committed-clean, not a peer's in-flight edit - checked git status before touching.")
+//! @yah:gotcha("UNCOMMITTED REGEN - .yah/schema/workload.toml.schema.json is REGENERATED in the working tree (cargo run -p xtask -- emit-schemas) and must be committed WITH this change. deny_unknown_fields makes schemars emit additionalProperties: false on BuildConfig. scripts/check-schema-drift.sh compares generated output against the git INDEX, so it stays RED until the regen is committed - that is the script working as designed, not drift. Only workload.toml.schema.json moved; no peer's schema was swept in (git diff --stat -- .yah/schema/ = 1 file).")
+//! @yah:assumes("deny_unknown_fields on BuildConfig trades forward-compat for loudness: a manifest carrying a [build] key an older binary does not know is now a hard parse error, not an ignored key. Deliberate and argued in the type's doc comment. Blast radius outside this monorepo is any site scaffolded by an older `yah cloud site init` - the template shipped routes under [build] for its whole life, so such a site now fails to parse until routes is moved above the header. The only tenant in the tree (scrabcake) was migrated; an external one would need the same one-line move.")
+//! @yah:gotcha("NOW FULLY STALE as of 2026-08-19: the HALF-STALE note above says R658-B2's `missing field image` is the one KNOWN_GAPS entry left. R783-F1/F2 closed that too, so KNOWN_GAPS in xtask/tests/workload_envelope.rs is EMPTY - every modelled on-disk workload.toml parses through the envelope. An entry reappearing means a real file stopped parsing.")
 //!
-//! @yah:ticket(R658-B2, "kind = \"container\" means two incompatible shapes — Workload::Container(WorkloadSpec) vs ContainerReconciler's local docker build/run")
-//! @yah:at(2026-08-03T00:43:24Z)
-//! @yah:status(open)
+//!
+//! @yah:ticket(R743-T4, "workload-spec: 7 test binaries to 1")
+//! @yah:at(2026-08-11T01:18:24Z)
+//! @yah:status(review)
+//! @yah:phase(P2)
+//! @yah:parent(R743)
+//! @yah:next("tests/main.rs mod'ing all 7 siblings + autotests = false and [[test]] name = \"main\" in oss/yah-base/crates/workload-spec/Cargo.toml.")
+//! @yah:next("tests/compose/ and tests/fixtures/ are data/module dirs, not targets — they are unaffected. Confirm the [[bin]] named export-ts in Cargo.toml is untouched by autotests = false (it is a bin, not a test, but read it before editing).")
+//! @yah:verify("cargo test -p yah-workload-spec -- --list count unchanged; three green runs. One commit — oss subtree.")
+//! @yah:tier(Cleric)
+//! @yah:handoff("LANDED: tests/main.rs mods in the 7 former top-level integration-test files (compose_import, mesh_resolver, restart_policy, round_trip, secrets_invariant, semantic, shape_fixtures) as submodules; Cargo.toml gained `autotests = false` on [package] plus a single `[[test]] name = \"main\" path = \"tests/main.rs\"`. tests/compose/ and tests/fixtures/ untouched (data dirs); the export-ts [[bin]] untouched (autotests only scans tests/, not bins). Quick audit found nothing to fix: no std::env::set_var/remove_var, no set_current_dir, no TcpListener/bind/fixed ports in any of the 7 files, and only one inner `mod secrets` (in secrets_invariant.rs) which nests fine under its own file-module with no sibling collision — so no renames were needed.")
+//! @yah:verify("RUSTC_WRAPPER=\"\" cargo test -p yah-workload-spec -- --list (run inside oss/yah-base): BEFORE 8 targets (lib 146 + export-ts bin 0 + 7 integration files summing to 65: compose_import 5, mesh_resolver 8, restart_policy 5, round_trip 16, secrets_invariant 7, semantic 18, shape_fixtures 6) = 211 total. AFTER 4 targets (lib 146 + export-ts bin 0 + single `main` integration binary 65, all 65 test names now module-qualified e.g. round_trip::round_trip_full_spec + doctests 0) = 211 total, unchanged.")
+//! @yah:verify("RUSTC_WRAPPER=\"\" cargo test -p yah-workload-spec (inside oss/yah-base): ok. 146 passed lib + ok. 65 passed main + 0 doctests, 0 failed — run three times, all green, no pre-existing failures to record.")
+//!
+//! @yah:ticket(R783-F1, "ContainerManifest: split the on-disk container manifest from the wire WorkloadSpec, keeping postcard byte-identical")
+//! @yah:status(review)
+//! @yah:at(2026-08-19T07:11:49Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R783)
+//! @arch:see(.yah/docs/working/W324-workload-kind-is-not-a-runtime.md)
+//! @yah:next("THE SEAM: introduce `ContainerManifest = Reference(WorkloadSpec) | Recipe(ContainerBuild)` and change Workload::Container's payload to it. WorkloadExternal::Container KEEPS WorkloadSpec so the postcard kamaji wire is byte-identical - verify with the existing round_trip.rs postcard tests, which must pass UNCHANGED.")
+//! @yah:next("WHY a recipe cannot just be a WorkloadSpec (this is the whole design): ImageRef.digest is String, not Option<String> - R438-T3 tightened it deliberately and the string form REJECTS a bare tag at serde-deserialize (lib.rs:187, parser compose_import::parse_pinned_image_ref). The local form's image is `yah-local/yah-cloud-admin:dev`, a bare tag, because the digest does not exist until docker build has run. Preserve that invariant; do not weaken ImageRef to make this easier.")
+//! @yah:next("Encode the invariant in the signature: ContainerBuild::into_spec(self, digest: &str) -> WorkloadSpec. The lowering is only available AFTER a build produced a digest. Serializing a Recipe to postcard must be an Err, not a panic and not a silent empty digest.")
+//! @yah:next("Tier: Wizard - cross-workspace type split with a wire invariant to preserve; the postcard encoding is positional and a mistake decodes silently into the wrong variant.")
+//! @yah:verify("cargo test --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --all-features - round_trip.rs postcard tests must pass UNCHANGED (they are the wire-compat gate).")
+//! @yah:verify("cargo test -p xtask --test workload_envelope with the `missing field image` KNOWN_GAPS entry for crates/yah/cloud-admin/workload.toml DELETED - that file is the acceptance case.")
+//! @yah:verify("cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-proto codec - deploy_container_round_trip is the exact UDS path.")
+//! @yah:gotcha("VARIANT ORDER IS LOAD-BEARING on WorkloadExternal/WorkloadExternalRef - postcard encodes the external tag as the variant INDEX, so reordering or inserting anywhere but the end silently decodes kamaji UDS frames into the WRONG variant, with no type error. Commented at the definitions in lib.rs.")
+//! @yah:gotcha("BLAST RADIUS ~25 real construction/match sites across FOUR workspaces: oss/kamaji (incl. peer-owned kamaji-proto/src/codec.rs exhaustive matches), oss/yubaba, oss/qed, app/yah/cli, oss/yah-base. R594-F2 deliberately avoided exactly this churn by using an annotation instead of a field (lib.rs:225) - that was right for a marker, and is NOT right here, but read that note before assuming the churn is accidental.")
+//! @yah:gotcha("Consider a Workload::container(spec) constructor + ContainerManifest::as_spec() accessor to keep the ~25 sites one-line mechanical rather than restructured.")
+//! @yah:handoff("LANDED. `ContainerManifest = Reference(WorkloadSpec) | Recipe(ContainerBuild)` is now `Workload::Container`'s payload (oss/yah-base/crates/workload-spec/src/lib.rs). New public types: ContainerManifest, ContainerBuild, ContainerBuildStep, ContainerRunConfig, ContainerMount, plus `Workload::container(spec)` / `Workload::container_spec()` / `Workload::container_manifest()` so the ~25 call sites stayed one-line.")
+//! @yah:verify("cargo test --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --all-features - 127 lib + 8 integration targets, 0 failed. round_trip.rs: 16 pass.")
+//! @yah:verify("cargo test -p xtask - all 12 targets green incl. workload_envelope 1/1 with KNOWN_GAPS now EMPTY (R658-B2's `missing field image` entry deleted, not widened) and schema_drift 3/3.")
+//! @yah:verify("cargo test --manifest-path oss/kamaji/Cargo.toml --workspace - green incl. kamaji-proto codec 26/26 (deploy_container_round_trip, the exact UDS path) and kamaji-bin 213/213.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib 881 pass / -p yubaba --lib 492 pass; cargo test -p yah --lib cloud:: 120 pass.")
+//! @yah:handoff("THE WIRE CLAIM IS NOW A TEST, not an assertion. round_trip.rs::container_postcard_frame_is_the_variant_index_then_the_bare_spec asserts the frame is exactly [1] ++ postcard(WorkloadSpec) - a round-trip alone would still pass if both halves moved together. WorkloadExternal::Container keeps WorkloadSpec; Workload's binary Serialize maps Reference through unchanged and returns Err for Recipe (round_trip.rs::container_recipe_is_refused_by_postcard_rather_than_encoded).")
+//! @yah:handoff("DISCRIMINATOR: presence of a `[build]` table means Recipe; presence of top-level `image` means Reference; NEITHER is its own error naming both forms rather than a misleading `missing field image`. Hand-written Deserialize, not serde(untagged), specifically so a malformed reference still reports `missing field tier` instead of 'data did not match any variant'.")
+//! @yah:gotcha("UNCOMMITTED REGEN - both generated artifacts are regenerated in the working tree and must be committed WITH this change: .yah/schema/workload.toml.schema.json (cargo run -p xtask -- emit-schemas) and packages/yah/workload-spec/index.ts (cargo run --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --bin export-ts). Both scripts/check-schema-drift.sh and scripts/check-workload-spec-ts.sh exit 1 right now because they diff generated output against the git INDEX - that is the scripts working as designed, not drift. cargo test -p xtask schema_drift (which diffs against the working tree) is GREEN.")
+//! @yah:gotcha("SIGNATURE DEVIATION from the ticket text, deliberate: into_spec is `ContainerBuild::into_spec(self, digest: &str, tier: TierTag) -> Result<WorkloadSpec, String>`, not the infallible two-arg form the ticket sketched. Fallible because digest is a caller-supplied string and a malformed one must error rather than mint a spec that lies about being content-addressed - it routes through compose_import::parse_pinned_image_ref, the one home of the R438-T3 digest rule. tier is a parameter because admission control is cluster policy, not a manifest fact. Recorded in W324 under a new 'As shipped (R783-F1)' section.")
+//! @yah:assumes("ContainerBuild::into_spec has NO production caller yet - it is the documented lowering with unit-test coverage only. Its unset-image default is `yah-local/<manifest name>:dev`, which is NOT the same string ContainerReconciler's default_image_tag builds (`yah-local/<service>-<component>:dev`) because the manifest only knows its own name. If a future caller lowers a recipe whose [build].image was left unset and expects to find the image the reconciler built, those two defaults have to be reconciled first.")
+//! @yah:cleanup("LocalProcessReconciler still parses its own private ProcessComponent for the [process] table (oss/yubaba/crates/cloud/src/reconciler/local_process.rs:696). The envelope does not model [process] at all, so that tier is still a second parser over the same file - the exact shape R783-F2 just removed for the container tier. W324 section 1 names it as the third runtime behind kind = container; folding it in is the natural next step and is deliberately NOT in R783.")
+//!
+//! @yah:ticket(R838-B1, "xtask workload_envelope fails on both machines: the template deliberately omits [build] command while workload_spec Workload requires it as a non-Option String")
+//! @yah:status(review)
+//! @yah:at(2026-08-31T00:17:46Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R838)
+//! @yah:handoff("LANDED. workload_spec::BuildConfig.command is now Option<String> with #[serde(default)] (oss/yah-base/crates/workload-spec/src/lib.rs:1439). Absent means the project has no external bundler step, which is what mesofact new's scaffold template documents about itself. xtask workload_envelope now passes with KNOWN_GAPS still EMPTY, which was the goal state that test names for itself.")
+//! @yah:handoff("WHY THIS WAS NOT A DECISION AFTER ALL. The sibling ticket R658-B3 filed the same bug as DECISION REQUIRED because it read the deploy path as having no branch for a missing command. It has one, in two of the three readers, and it predates this change: app/yah/cli/src/cloud.rs:3368 read_workload_build has ALWAYS returned Option<String>; assemble_component_bundle_with_sidecars (cloud.rs:3492) needs the command only under --run-build and otherwise assembles from an existing out_dir; deploy_mesofact_bundle (cloud.rs:5841) refuses None with a message that already reads correctly, and cloud.rs:8387 a_missing_build_command_is_reported_not_skipped already tested that refusal. The only reader that made it mandatory was the type. So no in-process build branch had to be invented.")
+//! @yah:handoff("RECONCILER: lower_build_to_forge_spec now returns Option<ForgeSpec> (None when no command) and run_build logs a skip and returns Ok. That is the same outcome rebuild_static already produced for a workload with no workload.toml. Deliberately NOT sh -c with an empty string: that exits 0 having built nothing, so the reconciler would report success and publish stale out_dir bytes.")
+//! @yah:handoff("WIRE: BuildConfig rides the postcard kamaji wire inside Workload::MesofactStatic, so String -> Option<String> adds a leading tag byte. A pre-R838 node decoding a new frame fails loudly (a string length byte is not a valid Option tag) rather than reading a shifted field, which is why this is Option and not a serde(default) empty-String sentinel. NOT a cluster-epoch surface: xtask/src/cluster_epochs.rs hashes the yubaba raft modules and the openraft pin, not workload_spec; all 8 cluster_epoch_drift tests stayed green, so no epoch bump is owed.")
+//! @yah:handoff("CALL SITES (10, four workspaces, all mechanical): kamaji-proto/src/codec.rs:1077, kamaji-bin/src/server.rs x3, yubaba/src/lib.rs:9000, cloud/src/reconciler/lowering_golden.rs x2 (+3 .expect() on the now-Option lowering), cloud/src/reconciler/mesofact_static.rs (revalidate_static's render BuildConfig + 2 fixtures + 3 assertions), app/yah/cli/src/cloud.rs:5725.")
+//! @yah:handoff("GENERATED ARTIFACTS REGENERATED AND MUST BE COMMITTED WITH THIS: .yah/schema/workload.toml.schema.json (command dropped from required, type now [string,null]) and packages/yah/workload-spec/index.ts (command: string | null). Both scripts/check-workload-spec-ts.sh and scripts/check-schema-drift.sh exit 1 until the commit lands because they diff against the git INDEX; the working-tree equivalent, cargo test -p xtask schema_drift, is green. Same shape as the R783-F1 note above.")
+//! @yah:verify("cargo test -p xtask --tests --locked: 54 passed, 0 failed. Includes workload_envelope::every_on_disk_workload_toml_parses_through_the_envelope (was 0 passed / 1 failed with 'missing field command'), schema_drift 3/3, cluster_epoch_drift 8/8.")
+//! @yah:verify("cargo test --manifest-path oss/yah-base/Cargo.toml -p yah-workload-spec --all-features --locked: 146 lib + 68 integration, 0 failed. Three NEW tests in tests/round_trip.rs: mesofact_static_build_table_without_a_command_parses_as_none, an_unknown_build_key_is_still_refused_now_that_command_is_optional (deny_unknown_fields from R658-B1 did not loosen), mesofact_static_build_command_round_trips_through_postcard_both_ways.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib: 927 passed, 0 failed, 4 ignored. Three NEW tests in reconciler::mesofact_static::tests: read_mesofact_build_accepts_a_build_table_with_no_command, rebuild_static_skips_the_build_step_when_no_command_is_declared (asserts the CaptureExecutor got nothing), lowering_a_build_with_no_command_yields_no_forge_spec.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib: 553 passed, 0 failed.")
+//! @yah:verify("cargo test --manifest-path oss/kamaji/Cargo.toml --workspace: all green incl. kamaji-proto codec 26/26 (the UDS round-trip) and kamaji-bin 217/217.")
+//! @yah:verify("cargo check --all-targets --locked on the root workspace: clean (warnings only, all pre-existing).")
+//! @yah:verify("cargo test --locked --no-fail-fast on the root workspace: one failure, yah-log tests::init_noop_without_env, which is NOT this change and is already filed as R840-B1 (it reads process-global env and the camp build rail exports YAH_TASK_RUN + YAH_LOG_PIPE; it passes in CI and under env -u).")
+//! @yah:gotcha("DEAD GENERATED FILE FOUND, not touched: oss/packages/yah/workload-spec/index.ts is tracked, a month stale (last written 2026-07-29, has no ContainerManifest so it predates R783-F1), referenced by nothing, and gated by nothing. It is the fossil of the off-by-one that export-ts.rs:107 documents in its own comment: with ancestors().nth(3) the bin wrote to oss/packages/ instead of the camp root, and the stray output got committed. export-oss.sh exports oss/<name> subtrees, and oss/packages is not one, so it is not even on an export path. Deleting it is a one-line git rm but it is a tracked-file deletion outside this ticket, so it is named here rather than done.")
+//! @yah:gotcha("STALE CLAIM in a neighbouring annotation, disproved but left in place: oss/yubaba/crates/cloud/src/reconciler/mesofact_static.rs:165 (R438-T6) says read_mesofact_build must hand-extract toml::Value subtrees because 'schema_version = 1 (integer) ... the typed envelope rejects'. R546-B7 made SchemaVersion read the bare integer (oss/yah-base/crates/workload-spec/src/version.rs), and the workload_envelope run proves it: the only error reported for the scaffold template was 'missing field command', never schema_version. The subtree reader has other reasons to exist, but that one is gone.")
+//!
+//! @yah:ticket(R658-B3, "mesofact new scaffolds a workload.toml the deploy path cannot execute: BuildConfig.command is required but the template deliberately omits it")
+//! @yah:at(2026-08-30T08:33:45Z)
+//! @yah:status(open)
 //! @yah:parent(R658)
-//! @yah:next("REPRO: `cargo test -p xtask --test workload_envelope` with the KNOWN_GAPS entry for crates/yah/cloud-admin/workload.toml deleted -> `missing field `image``.")
-//! @yah:next("THE COLLISION: workload_spec::Workload maps `kind = \"container\"` to WorkloadSpec -- an OCI spec with a required digest-pinned `image`, handed to yubaba over the kamaji wire. ContainerReconciler (oss/yubaba/crates/cloud/src/reconciler/container.rs, R602-T1) reads the SAME discriminator as a local-docker shape: `[build] dockerfile/context/image` + `[run] port/host_port/[run.env]`. crates/yah/cloud-admin/workload.toml is the second shape and cannot parse as the first.")
-//! @yah:next("SO ONE `kind` STRING SELECTS TWO INCOMPATIBLE SCHEMAS, and which one you get depends on which loader happens to read the file. Nothing detects the mismatch -- ContainerReconciler parses its own struct, so the envelope is never consulted for these files.")
-//! @yah:next("DECISION NEEDED (operator call, do not pick unilaterally): (a) rename the local-docker kind (e.g. `local-container`) and migrate crates/yah/cloud-admin/workload.toml + the ContainerReconciler dispatch, or (b) model the local-docker shape as a second Workload variant so the envelope covers both, or (c) declare the envelope non-authoritative for `container` and document it. (a) is the smallest and the only one that makes the discriminator honest.")
-//! @yah:next("AFTER FIXING: delete the `missing field `image`` entry from KNOWN_GAPS in xtask/tests/workload_envelope.rs.")
+//! @yah:severity(high)
+//! @yah:next("DECISION REQUIRED, do not guess. oss/mesofact/crates/mesofact/src/cli/new/template/workload.toml (new in ef8bd656) declares kind = mesofact-static with no [build] command, and its own header comment says that is deliberate: 'Left unset, mesofact-dev runs the build pipeline in-process — no third binary, no package manager, no Node.' But BuildConfig.command is a required String (oss/yah-base/crates/workload-spec/src/lib.rs:1428), so the file does not parse through workload_spec::Workload.")
+//! @yah:next("The deploy path has no in-process branch. MesofactStaticReconciler uses build.command unconditionally — oss/yubaba/crates/cloud/src/reconciler/mesofact_static.rs:1143 builds vec![sh, -c, build.command.clone()], and 1173/1179/1185 log and execute it. So making command Option<String> is NOT a mechanical type change: it requires deciding what 'yah cloud bundle build' DOES for a manifest with no command. That is the actual open question.")
+//! @yah:next("Three options. (a) command becomes Option<String> and the reconciler gains an in-process build branch — matches the template's documented intent and the W225 s2 'no package manager, no Node' promise, but MesofactStaticWorkload is a postcard wire type over the kamaji UDS, so a shape change is a lockstep kamaji+yubaba deploy (see the R658-B1 handoff, which rejected moving a field for exactly this reason). (b) The template gains a command — contradicts its own comment and the no-Node promise. (c) Add a KNOWN_GAPS entry in xtask/tests/workload_envelope.rs — unblocks check today, records the gap honestly, decides nothing.")
+//! @yah:verify("cargo test -p xtask --test main --locked -- workload_envelope::every_on_disk_workload_toml_parses_through_the_envelope (currently: 0 passed, 1 failed, 'missing field command')")
+//! @yah:gotcha("BLOCKS THE RELEASE GATE. This fails cargo test -p xtask --tests, which is check.toml step 7 (xtask-tests), which release-check runs before oss-publish. It also very likely fails release-check's second sub-pipeline mesofact-new-smoke, whose stated promise is that 'mesofact new' produces a project that builds and serves with no package manager and no Node on PATH — the same scaffold.")
+//! @yah:gotcha("WHY THIS WAS INVISIBLE UNTIL NOW: check.toml's cargo-test step has no --no-fail-fast and died at yah-party, so steps 5-16 never ran this cycle. Separately, R605-S6 documents that xtask is a workspace member but NOT a default-member, so plain cargo test never reaches these tests at all, and workload_envelope was named there as one of eight test binaries that had been dark since being written. KNOWN_GAPS in xtask/tests/workload_envelope.rs is currently empty, so this file DID parse before ef8bd656 introduced the template — it is a regression, not a pre-existing gap.")
+//! @yah:tier(Warrior)
+//! @yah:next("Option (a) was taken. The open question that made this a decision was already answered by the code: yah cloud bundle build does NOT require a command. app/yah/cli/src/cloud.rs:3368 read_workload_build has always typed it Option<String>; assemble_component_bundle_with_sidecars needs it only under --run-build; deploy_mesofact_bundle refuses None by name at cloud.rs:5841. So no in-process build branch had to be invented: the reconciler skips the build step for None, exactly as it already did for a workload with no workload.toml at all.")
+//! @yah:next("TO CLOSE: re-run cargo test -p xtask --test main --locked -- workload_envelope:: (passes now) and archive. Nothing left to build here.")
+//! @yah:handoff("FIXED BY R838-B1 (same bug, filed twice; R838-B1 is the older ID). BuildConfig.command is now Option<String> in oss/yah-base/crates/workload-spec/src/lib.rs. cargo test -p xtask --tests is 54/54 green including workload_envelope, the gate that was failing.")
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -317,10 +401,12 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+pub mod admission;
 pub mod compose_import;
 pub mod control_plane_install;
 pub mod rollout;
 pub mod secrets;
+pub mod sovereign;
 pub mod validate;
 mod version;
 
@@ -456,8 +542,10 @@ impl NamespaceId {
 ///
 /// This is the **on-disk** envelope — distinct from [`WorkloadSpec`], the
 /// containerd wire format yubaba receives over RPC. A `kind = "container"`
-/// workload deserializes its remaining fields as a `WorkloadSpec`; other
-/// kinds carry their own per-reconciler payload shape.
+/// workload deserializes its remaining fields as a [`ContainerManifest`],
+/// which is *either* a digest-pinned `WorkloadSpec` or a local Dockerfile
+/// recipe (R783-F1 / W324); other kinds carry their own per-reconciler
+/// payload shape.
 ///
 /// **Never put `#[serde(skip_serializing_if = "Option::is_none")]` on a field
 /// of this enum or any type it reaches.** These types ride the kamaji-proto
@@ -498,8 +586,18 @@ pub enum Workload {
     /// `mesofact-static` reconciler — does not deploy to yubaba.
     MesofactStatic(MesofactStaticWorkload),
 
-    /// Containerd workload handed to yubaba over RPC. The inline fields
-    /// are the full [`WorkloadSpec`] minus the `kind` discriminator.
+    /// A container-shaped workload. **Two on-disk forms** (R783-F1 / W324),
+    /// see [`ContainerManifest`]: a digest-pinned [`WorkloadSpec`] reference
+    /// (the form that crosses the kamaji wire) or a local Dockerfile
+    /// [`ContainerBuild`] recipe (which cannot, because it names no digest
+    /// until it has been built).
+    ///
+    /// Construct the wire form with [`Workload::container`] and read it back
+    /// with [`Workload::container_spec`] — most callers only ever mean the
+    /// reference form and should not have to name the manifest enum.
+    ///
+    /// The reference form's inline fields are the full [`WorkloadSpec`] minus
+    /// the `kind` discriminator.
     ///
     /// This is also the shape of the W267 sovereign-public-ingress appliance
     /// (R594-F2): a container-kind workload with `archetype =
@@ -514,7 +612,7 @@ pub enum Workload {
     /// combination expresses "this is the public ingress appliance" without
     /// that blast radius. See [`WorkloadSpec::requires_taint`] and
     /// [`LifecycleArchetype::Appliance`].
-    Container(WorkloadSpec),
+    Container(ContainerManifest),
 
     /// Data-pipeline job with declared I/O and a readiness policy. The
     /// orchestrator checks all `inputs` are reachable before each run and
@@ -545,6 +643,42 @@ impl Workload {
             Workload::StaticAsset(_) => "static-asset",
         }
     }
+
+    /// Wrap a digest-pinned [`WorkloadSpec`] as a `kind = "container"`
+    /// workload — the form that crosses the kamaji wire.
+    ///
+    /// Every caller that synthesizes a container workload in code (ingress
+    /// appliances, forge runs, kamaji's own deploy path) means *this* form;
+    /// the [`ContainerManifest::Recipe`] arm only ever arrives by parsing a
+    /// `workload.toml` with a `[build]` table. Keeping the constructor here
+    /// means R783-F1 did not have to teach ~25 call sites the name of a
+    /// manifest enum they have no opinion about.
+    pub fn container(spec: WorkloadSpec) -> Self {
+        Workload::Container(ContainerManifest::Reference(spec))
+    }
+
+    /// The digest-pinned spec of a `kind = "container"` workload, if this is
+    /// a container workload in the reference form.
+    ///
+    /// `None` covers both "not a container" and "a container *recipe*, which
+    /// has no spec until it is built" — a consumer that speaks the wire
+    /// (kamaji, yubaba's deploy path) must treat both as inadmissible, so
+    /// collapsing them into one `None` is deliberate rather than lossy. Use
+    /// [`Workload::container_manifest`] when the two need distinguishing.
+    pub fn container_spec(&self) -> Option<&WorkloadSpec> {
+        match self {
+            Workload::Container(m) => m.as_spec(),
+            _ => None,
+        }
+    }
+
+    /// The container manifest, in whichever on-disk form it was written.
+    pub fn container_manifest(&self) -> Option<&ContainerManifest> {
+        match self {
+            Workload::Container(m) => Some(m),
+            _ => None,
+        }
+    }
 }
 
 /// Internally-tagged mirror of [`Workload`] — the on-disk shape. Only ever
@@ -554,7 +688,7 @@ impl Workload {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum WorkloadTagged {
     MesofactStatic(MesofactStaticWorkload),
-    Container(WorkloadSpec),
+    Container(ContainerManifest),
     Almanac(AlmanacManifest),
     StaticAsset(StaticAssetWorkload),
 }
@@ -565,7 +699,7 @@ enum WorkloadTagged {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum WorkloadTaggedRef<'a> {
     MesofactStatic(&'a MesofactStaticWorkload),
-    Container(&'a WorkloadSpec),
+    Container(&'a ContainerManifest),
     Almanac(&'a AlmanacManifest),
     StaticAsset(&'a StaticAssetWorkload),
 }
@@ -574,6 +708,12 @@ enum WorkloadTaggedRef<'a> {
 /// postcard encodes an external tag as the *variant index*, so the variant
 /// ORDER here is load-bearing: it must match [`Workload`] exactly or the
 /// kamaji UDS silently decodes into the wrong variant.
+///
+/// `Container` deliberately keeps [`WorkloadSpec`], **not**
+/// [`ContainerManifest`] (R783-F1 / W324): the wire carries only the
+/// digest-pinned reference form, so these bytes are unchanged by the on-disk
+/// split, and a [`ContainerManifest::Recipe`] is refused at serialize rather
+/// than encoded as a second variant nothing on the far side can execute.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum WorkloadExternal {
@@ -609,7 +749,16 @@ impl Serialize for Workload {
         } else {
             match self {
                 Workload::MesofactStatic(w) => WorkloadExternalRef::MesofactStatic(w),
-                Workload::Container(w) => WorkloadExternalRef::Container(w),
+                // The wire gate (W324 §5). A recipe names no digest, so there
+                // is nothing for kamaji to pull — refusing here makes "a build
+                // recipe cannot reach kamaji" a fact the type system holds,
+                // rather than a convention someone eventually forgets.
+                Workload::Container(ContainerManifest::Recipe(_)) => {
+                    return Err(serde::ser::Error::custom(RECIPE_IS_NOT_A_WIRE_SPEC))
+                }
+                Workload::Container(ContainerManifest::Reference(spec)) => {
+                    WorkloadExternalRef::Container(spec)
+                }
                 Workload::Almanac(w) => WorkloadExternalRef::Almanac(w),
                 Workload::StaticAsset(w) => WorkloadExternalRef::StaticAsset(w),
             }
@@ -633,12 +782,371 @@ impl<'de> Deserialize<'de> for Workload {
         } else {
             Ok(match WorkloadExternal::deserialize(de)? {
                 WorkloadExternal::MesofactStatic(w) => Workload::MesofactStatic(w),
-                WorkloadExternal::Container(w) => Workload::Container(w),
+                // Only the reference form exists on the wire, by construction
+                // of `WorkloadExternal` — see its doc comment.
+                WorkloadExternal::Container(w) => Workload::container(w),
                 WorkloadExternal::Almanac(w) => Workload::Almanac(w),
                 WorkloadExternal::StaticAsset(w) => Workload::StaticAsset(w),
             })
         }
     }
+}
+
+// ── Container manifest (R783-F1 / W324) ───────────────────────────────────────
+
+/// Error text used both by the postcard serializer gate and by
+/// [`ContainerManifest::into_spec`]'s doc, so the two cannot drift.
+const RECIPE_IS_NOT_A_WIRE_SPEC: &str = "a kind = \"container\" workload in the RECIPE form \
+     (a [build] table) cannot cross the kamaji wire: it names an image tag, not a digest, and \
+     the digest does not exist until `docker build` has run. Lower it with \
+     `ContainerBuild::into_spec(digest)` after the build, then send the resulting WorkloadSpec.";
+
+/// On-disk payload of `kind = "container"` — **two forms**, one wire type
+/// (W324 §5).
+///
+/// A [`WorkloadSpec`] asserts a content-addressed identity: its
+/// [`ImageRef::digest`] is a required `sha256:<hex>` and the string form
+/// rejects a bare tag at serde-deserialize (R438-T3). A local component built
+/// from a Dockerfile next to its `workload.toml` cannot satisfy that — its
+/// image is `yah-local/<name>:dev`, and the digest does not exist until the
+/// build has run. So a build *recipe* is not a degenerate spec with a missing
+/// field; it is a promise to produce one, and the two are different types.
+///
+/// The discriminator is the presence of a `[build]` table. `WorkloadSpec` has
+/// no `build` field and [`ContainerBuild`] requires one, so the two shapes are
+/// mutually exclusive — and picking the branch explicitly (rather than with
+/// `#[serde(untagged)]`) is what lets a malformed reference still report
+/// `missing field \`image\`` instead of "data did not match any variant".
+///
+/// Only [`Reference`](Self::Reference) crosses the postcard kamaji wire; see
+/// [`WorkloadExternal`]'s doc comment for why that keeps those bytes
+/// byte-identical to the pre-split encoding.
+#[derive(Debug, Clone, PartialEq, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(untagged))]
+#[ts(untagged)]
+pub enum ContainerManifest {
+    /// Digest-pinned image. Crosses the wire as-is.
+    Reference(WorkloadSpec),
+
+    /// Dockerfile recipe. **Local only** — see [`ContainerBuild`].
+    Recipe(ContainerBuild),
+}
+
+impl ContainerManifest {
+    /// The digest-pinned spec, or `None` for the recipe form.
+    pub fn as_spec(&self) -> Option<&WorkloadSpec> {
+        match self {
+            ContainerManifest::Reference(spec) => Some(spec),
+            ContainerManifest::Recipe(_) => None,
+        }
+    }
+
+    /// The build recipe, or `None` for the reference form.
+    pub fn as_recipe(&self) -> Option<&ContainerBuild> {
+        match self {
+            ContainerManifest::Recipe(b) => Some(b),
+            ContainerManifest::Reference(_) => None,
+        }
+    }
+
+    /// Consume the manifest, yielding the digest-pinned spec. `Err` carries
+    /// the recipe back so a caller that *can* build it still has it.
+    pub fn into_spec(self) -> Result<WorkloadSpec, ContainerBuild> {
+        match self {
+            ContainerManifest::Reference(spec) => Ok(spec),
+            ContainerManifest::Recipe(b) => Err(b),
+        }
+    }
+
+    /// `"reference"` or `"recipe"` — for error messages that need to name
+    /// which form was found without matching on the enum at the call site.
+    pub fn form(&self) -> &'static str {
+        match self {
+            ContainerManifest::Reference(_) => "reference",
+            ContainerManifest::Recipe(_) => "recipe",
+        }
+    }
+}
+
+impl Serialize for ContainerManifest {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            // Transparent in both directions: the on-disk container form is
+            // the payload's own fields flattened under `kind = "container"`,
+            // exactly as it was before the split.
+            ContainerManifest::Reference(spec) => spec.serialize(s),
+            ContainerManifest::Recipe(recipe) => {
+                if s.is_human_readable() {
+                    recipe.serialize(s)
+                } else {
+                    Err(serde::ser::Error::custom(RECIPE_IS_NOT_A_WIRE_SPEC))
+                }
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContainerManifest {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        // postcard and friends are non-self-describing, so there is no map to
+        // probe for `[build]` — and by construction the binary wire only ever
+        // carries the reference form anyway (`WorkloadExternal::Container`).
+        if !de.is_human_readable() {
+            return WorkloadSpec::deserialize(de).map(ContainerManifest::Reference);
+        }
+
+        // Buffer once, then branch explicitly. `serde_json::Value` is the
+        // buffer rather than `#[serde(untagged)]`'s private `Content` because
+        // untagged discards the inner error: `missing field \`image\`` — the
+        // one thing an author needs to see — becomes "data did not match any
+        // variant of untagged enum ContainerManifest".
+        let buffered = serde_json::Value::deserialize(de)?;
+
+        match (
+            buffered.get("build").is_some(),
+            buffered.get("image").is_some(),
+        ) {
+            (true, _) => ContainerBuild::deserialize(buffered)
+                .map(ContainerManifest::Recipe)
+                .map_err(|e| {
+                    D::Error::custom(format!(
+                        "kind = \"container\" with a [build] table is a local build recipe: {e}"
+                    ))
+                }),
+            (false, true) => WorkloadSpec::deserialize(buffered)
+                .map(ContainerManifest::Reference)
+                .map_err(|e| {
+                    D::Error::custom(format!(
+                        "kind = \"container\" without a [build] table is a digest-pinned image \
+                         reference: {e}"
+                    ))
+                }),
+            // Neither marker. Reporting `missing field \`image\`` here would
+            // send a recipe author off to add a field their form does not
+            // have, so name both forms instead — this is the one case where
+            // the file does not say which of the two it is trying to be.
+            (false, false) => Err(D::Error::custom(
+                "kind = \"container\" must declare either a digest-pinned `image` (the wire \
+                 form: a WorkloadSpec yubaba hands to kamaji) or a [build] table (a local \
+                 Dockerfile recipe built on the operator's box) — it declares neither",
+            )),
+        }
+    }
+}
+
+/// `kind = "container"` in the **recipe** form: a Dockerfile next to the
+/// component's `workload.toml`, built and run on the operator's box.
+///
+/// This is the shape `ContainerReconciler` drives (`docker build` from
+/// [`build`](Self::build), `docker run` with [`run`](Self::run)). It is
+/// deliberately *not* a `WorkloadSpec` — see [`ContainerManifest`] for why the
+/// digest invariant makes that impossible, and [`Self::into_spec`] for the one
+/// lowering that is allowed.
+///
+/// **Unknown keys are tolerated on purpose.** `crates/yah/cloud-admin/workload.toml`
+/// carries a `[process]` table read by `LocalProcessReconciler` on the dev
+/// mirror — one component file, three tier runtimes (W324 §1). Adding
+/// `deny_unknown_fields` here would make that file unparseable as a container
+/// manifest, which is the opposite of the point.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ContainerBuild {
+    /// Wire-format version. Always `V1` today.
+    pub schema_version: SchemaVersion,
+
+    /// Component name. Same field the reference form carries, so a manifest
+    /// identifies itself the same way whichever form it is written in.
+    pub name: String,
+
+    /// How the image is built. Its presence is what makes this a recipe.
+    pub build: ContainerBuildStep,
+
+    /// How the built image is run locally.
+    #[serde(default)]
+    pub run: ContainerRunConfig,
+}
+
+impl ContainerBuild {
+    /// Lower a recipe to the wire type, **once a build has produced a digest**.
+    ///
+    /// The signature is the invariant (W324 §5): there is no way to reach a
+    /// `WorkloadSpec` from a recipe without supplying the `sha256:<hex>` the
+    /// build emitted, so an unpinned container spec cannot be constructed by
+    /// accident.
+    ///
+    /// Fallible because `digest` is a caller-supplied string: a malformed one
+    /// must be an error, not a `WorkloadSpec` that lies about being
+    /// content-addressed. Everything the recipe does not declare
+    /// (`tier`, `resources`, `restart_policy`, …) takes the same defaults a
+    /// hand-written local container gets; `tier` is the caller's because
+    /// admission control is a cluster policy, not a manifest fact.
+    pub fn into_spec(self, digest: &str, tier: TierTag) -> Result<WorkloadSpec, String> {
+        let image_tag = self
+            .build
+            .image
+            .clone()
+            .unwrap_or_else(|| format!("yah-local/{}:dev", self.name));
+
+        // Route through the one parser that owns the digest rule (R438-T3) so
+        // the recipe path cannot grow a second, laxer definition of "pinned".
+        let image = compose_import::parse_pinned_image_ref(&format!("{image_tag}@{digest}"))
+            .map_err(|e| format!("lowering container recipe {:?}: {e}", self.name))?;
+
+        let ports = self.run.port.map(|p| vec![p]).unwrap_or_default();
+
+        Ok(WorkloadSpec {
+            schema_version: self.schema_version,
+            name: self.name.clone(),
+            image,
+            tier,
+            tenant: TenantId::singleton(),
+            namespace: NamespaceId::singleton(),
+            replicas: 1,
+            command: None,
+            entrypoint: None,
+            workdir: None,
+            user: None,
+            env: self
+                .run
+                .env
+                .into_iter()
+                .map(|(name, value)| EnvVar {
+                    name,
+                    value: EnvValue::Literal { value },
+                })
+                .collect(),
+            secrets: vec![],
+            volumes: self
+                .run
+                .mounts
+                .into_iter()
+                .map(|m| VolumeMount {
+                    source: VolumeSource::Bind {
+                        host_path: PathBuf::from(m.host),
+                    },
+                    target: m.container,
+                    read_only: m.read_only,
+                })
+                .collect(),
+            resources: ResourceLimits {
+                memory_mb: 1024,
+                cpu_millis: 1000,
+                ephemeral_storage_mb: 1024,
+            },
+            depends_on: vec![],
+            healthcheck: None,
+            restart_policy: RestartPolicy::Always,
+            archetype: Some(LifecycleArchetype::Server),
+            stop_policy: StopPolicy {
+                signal: 15,
+                grace_period: Millis::from_secs(10),
+            },
+            expose: ExposeSpec {
+                mesh: MeshExpose {
+                    identity: MeshIdent(self.name),
+                    ports,
+                    allow_from: vec![],
+                },
+                public: None,
+                operator: None,
+            },
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        })
+    }
+}
+
+/// The `[build]` table of a container recipe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ContainerBuildStep {
+    /// Dockerfile path, relative to the component directory.
+    #[serde(default = "default_dockerfile")]
+    pub dockerfile: PathBuf,
+
+    /// Build context, relative to the workspace root. `None` → the component
+    /// directory. Workspace crates set `"."` so their path-dependency sources
+    /// resolve.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub context: Option<PathBuf>,
+
+    /// Image tag to build and run. `None` → `yah-local/<name>:dev`.
+    ///
+    /// A **tag**, not an [`ImageRef`]: this names an image that does not exist
+    /// yet, so there is no digest to pin it by.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub image: Option<String>,
+}
+
+fn default_dockerfile() -> PathBuf {
+    PathBuf::from("Dockerfile")
+}
+
+impl Default for ContainerBuildStep {
+    fn default() -> Self {
+        Self {
+            dockerfile: default_dockerfile(),
+            context: None,
+            image: None,
+        }
+    }
+}
+
+/// The `[run]` table of a container recipe.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ContainerRunConfig {
+    /// Container port the process listens on.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub port: Option<u16>,
+
+    /// Host port to publish it on. `None` → same as [`port`](Self::port).
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub host_port: Option<u16>,
+
+    /// Environment passed into the container.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+
+    /// Bind mounts from the workspace into the container.
+    #[serde(default)]
+    pub mounts: Vec<ContainerMount>,
+}
+
+/// One `[[run.mounts]]` entry of a container recipe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ContainerMount {
+    /// Host path. Relative paths resolve against the workspace root — the
+    /// declaration lives in the repo, so it should read like a repo path and
+    /// stay valid on whichever machine the operator runs it from.
+    pub host: String,
+
+    /// Absolute path inside the container.
+    pub container: PathBuf,
+
+    /// Default `true`. A workspace mount is config the service *reads*; a
+    /// writable default would let a container mutate the operator's checkout
+    /// as a side effect of running, so opting into that has to be explicit.
+    #[serde(default = "default_true")]
+    pub read_only: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `kind = "mesofact-static"` payload — static-site build colocated with the
@@ -704,8 +1212,10 @@ pub struct MesofactStaticWorkload {
     /// `Some` → kamaji also forks `mesofact serve --revalidate <workload>`
     /// alongside the bundle's static serve (or in place of it when
     /// `serve_bundle` is `None`). The receiver is ephemeral-V8: each
-    /// `POST /revalidate` poke boots a V8 isolate, re-renders the route,
-    /// republishes to the CDN, then drops the isolate.
+    /// `POST /dawn` boots a V8 isolate, re-renders the route, republishes to
+    /// the CDN, then drops the isolate. (`/revalidate` is still served as a
+    /// transitional alias — yah R752-T10 renamed it so the render stage stops
+    /// sharing a path with almanac's feed-refetch stage, `POST /freshen`.)
     ///
     /// Env vars are resolved at deploy time (R2 creds + mirror bearer) so
     /// the node never sees keystore slot names.
@@ -718,8 +1228,9 @@ pub struct MesofactStaticWorkload {
 /// `mesofact serve --revalidate` process alongside the static bundle server.
 ///
 /// The receiver is the almanac push endpoint: a lightweight resident axum
-/// server mounting `POST /revalidate` that boots V8 on each poke, re-renders
-/// the invalidated route, publishes to R2/CDN, then drops the isolate.
+/// server mounting `POST /dawn` (plus the legacy `/revalidate` alias) that
+/// boots V8 on each poke, re-renders the invalidated route, publishes to
+/// R2/CDN, then drops the isolate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct MesofactRevalidateReceiver {
@@ -754,10 +1265,30 @@ pub struct MesofactRevalidateReceiver {
     /// Empty → no fetcher; the receiver re-renders whatever data the bundle was
     /// built with (correct for a site whose data only changes at build time,
     /// silently stale for one whose data is a live feed). Non-empty → kamaji
-    /// forks a third resident process, `bins/<triple>/almanac-feed`, next to the
-    /// receiver.
+    /// forks a third resident process, the `almanac-feed` fetcher, next to the
+    /// receiver — resolved from the bundle's `bins/<triple>/almanac-feed` when
+    /// it carries one, else from [`feed_runtime`](Self::feed_runtime).
     #[serde(default)]
     pub feeds: Vec<AlmanacFeed>,
+
+    /// Runtime ref the `almanac-feed` fetcher resolves from the node's shared
+    /// runtime-asset cache when the bundle carries no `bins/` (R746-T3), e.g.
+    /// `"almanac-feed/0.8.22"`.
+    ///
+    /// This is what lets a **vanilla** bundle have a feed tier at all. A
+    /// self-contained bundle stages the fetcher into `bins/` and stays closed
+    /// over it; a vanilla bundle carries no binaries by construction, so the
+    /// fetcher has to be a node-level asset for the same reason `serve` is —
+    /// otherwise a templates-only sync would still need a cross-built musl
+    /// binary sitting on the syncing machine's disk.
+    ///
+    /// `None` with `feeds` non-empty and no sidecar in the bundle is a deploy
+    /// failure, named at the node. It is not a silent skip: "the site serves
+    /// but its data is frozen" is the exact state R330-F31 exists to make
+    /// observable.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub feed_runtime: Option<String>,
 
     /// Seconds between feed-fetch ticks. Ignored when `feeds` is empty.
     ///
@@ -847,6 +1378,28 @@ pub struct MesofactServeBundle {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub port: Option<u16>,
+
+    /// Environment the serve process is forked with (R556-T12) — already
+    /// **resolved** values, `NAME → value`.
+    ///
+    /// This is what makes an SSR route that reads a private source deployable
+    /// at all: `mesofact serve` resolves a source's credentials from its own
+    /// process environment at request time, and before this field the static /
+    /// SSR serve process was forked with `env: vec![]` while only the
+    /// `revalidate_receiver` sub-slot carried any. A declared-authed SSR site
+    /// therefore deployed clean and failed *per request* on the node.
+    ///
+    /// Resolution happens deploy-side, exactly like
+    /// [`MesofactRevalidateReceiver::env`]: the mirror declares source URIs
+    /// (`vault:<slot>` / `env:<VAR>`), `yah cloud apply` resolves them against
+    /// the operator's vault, and the node receives values. Keystore slot names
+    /// never cross the wire.
+    ///
+    /// Appended **after** `port` — see `port`'s note: the postcard wire codec
+    /// is positional, so a new field goes last and never carries
+    /// `skip_serializing_if`.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// Lifecycle mode for a served bundle (W272 §3).
@@ -878,11 +1431,56 @@ impl Default for BundleLifecycle {
 
 /// Build step that produces the static artifact published by a
 /// `mesofact-static` workload.
+///
+/// **`deny_unknown_fields` is load-bearing (R658-B1).** TOML scopes every key
+/// written after a table header into that table, so a manifest that puts a
+/// top-level `MesofactStaticWorkload` field — `routes` was the one that
+/// actually happened — below `[build]` silently produces `build.routes`
+/// instead. Without this attribute serde discards the stray key, the
+/// top-level field falls back to its default (or fails with a `missing field`
+/// error pointing at the wrong place), and the manifest deploys with a
+/// declaration nobody honours. Every real `workload.toml` in the camp and the
+/// CLI's own `yah cloud site init` scaffold carried exactly that shape for
+/// months without a single reader noticing.
+///
+/// The cost is forward-compat: a manifest carrying a `[build]` key this binary
+/// doesn't know is a hard parse error, not an ignored key. That is deliberate.
+/// A build config is a small, slow-moving, load-bearing table — a key that
+/// silently does nothing is worse here than one that refuses to load, because
+/// the failure surfaces as a wrong artifact rather than an error.
+///
+/// Note `deny_unknown_fields` is inert for the postcard kamaji wire, which is
+/// non-self-describing and positional — this only constrains TOML/JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct BuildConfig {
     /// Shell command run from the manifest's directory, e.g. `"bun run build"`.
-    pub command: String,
+    ///
+    /// **Absent means "this project has no external bundler step" (R838-B1)**,
+    /// not "run nothing by accident". `mesofact new`'s scaffold deliberately
+    /// omits it — the in-process pipeline (`mesofact-dev` / `mesofact-build`)
+    /// produces `out_dir` with no third binary, no package manager and no Node
+    /// — so requiring it here made every scaffolded project's manifest fail to
+    /// load through this envelope. Setting it opts back out to a shell command,
+    /// which is what a project with its own bundler wants.
+    ///
+    /// Consumers were already written for this: `read_workload_build`
+    /// (app/yah/cli/src/cloud.rs) has always typed it `Option<String>` and
+    /// `yah cloud bundle build` only needs it under `--run-build`; the bundle
+    /// sync arm refuses `None` by name. `MesofactStaticReconciler::
+    /// rebuild_static` skips the build step for `None` — the same thing it
+    /// already did for a workload with no `workload.toml` at all.
+    ///
+    /// WIRE NOTE: this is `Option<String>` on the postcard kamaji wire, so it
+    /// costs a leading `0x00`/`0x01` tag byte that the bare `String` did not
+    /// have. A pre-R838 node decoding a new frame fails loudly (the string's
+    /// length byte is not a valid `Option` tag) rather than silently reading a
+    /// shifted field — which is why this is `Option` and not a `#[serde(default)]`
+    /// empty `String` sentinel. Not a `cluster_epochs` surface: those hash the
+    /// raft modules and the openraft pin, not `workload_spec`.
+    #[serde(default)]
+    pub command: Option<String>,
 
     /// Output directory (relative to the manifest) the reconciler uploads.
     pub out_dir: PathBuf,
@@ -890,7 +1488,9 @@ pub struct BuildConfig {
     /// Data-only re-render command (W225 §3 "revalidate"), run from the
     /// manifest's directory against the **already-built** `out_dir` — no
     /// bundler. `{route}` is substituted with the invalidated route pattern,
-    /// e.g. `"cargo run -p mesofact-build -- render . --route {route} --all"`.
+    /// e.g. `"../../../../scripts/mesofact-build.sh render . --route {route}
+    /// --all"` (R746-F9 — resolves a prebuilt binary rather than shelling to
+    /// cargo, which cannot even find the package from a site's own dir).
     /// Absent → a revalidate dispatch republishes `out_dir` as-is.
     #[serde(default)]
     pub render_command: Option<String>,
@@ -1327,12 +1927,22 @@ pub enum LifecycleArchetype {
 }
 
 impl LifecycleArchetype {
+    /// Every variant, in declaration order. Exists so a consumer can enumerate
+    /// the archetypes without hand-maintaining a parallel list — the taint
+    /// vocabulary in `cloud::config::taint_effect` is built from this, so
+    /// adding a fourth archetype extends the set of live repel keys for free.
+    pub const ALL: [LifecycleArchetype; 3] = [Self::Server, Self::Appliance, Self::Job];
+
     /// The repel-taint key for this archetype (R572-F5). A node carrying the
-    /// taint `"no-<key>"` repels workloads of this class unless they
-    /// explicitly tolerate it.
+    /// taint `"no-<key>"` **absolutely** rejects workloads of this class.
     ///
     /// Examples: `Server` → `"server"` (repelled by `"no-server"`);
     /// `Appliance` → `"appliance"` (repelled by `"no-appliance"`).
+    ///
+    /// W305/R742-T4: there is no toleration. Earlier prose here and in
+    /// `cloud::config` called this "repel-unless-tolerate"; the `unless` was
+    /// never built, and reading it as a preference is what made `no-appliance`
+    /// on the dev Pis look advisory when it was an unconditional block.
     pub fn taint_key(&self) -> &'static str {
         match self {
             Self::Server => "server",
@@ -1506,6 +2116,13 @@ impl WorkloadSpec {
     ) -> Self {
         let mut annotations = HashMap::new();
         annotations.insert("yah.forge".into(), "true".into());
+        // The placement floor, kept distinct from the cgroup ceiling below.
+        // Without this, admission reads the 32 GiB ceiling as the amount of
+        // RAM a node must have — see `memory_request_mb` for what that cost.
+        annotations.insert(
+            MEMORY_REQUEST_ANNOTATION.into(),
+            FORGE_MEMORY_REQUEST_MB.to_string(),
+        );
 
         WorkloadSpec {
             schema_version: SchemaVersion::V1,
@@ -1538,9 +2155,13 @@ impl WorkloadSpec {
                 // ceiling that fits the V8 build's >12 GB peak with headroom,
                 // protects the host from a runaway (vs truly unlimited), and is
                 // above physical RAM on smaller build-workers (⇒ effectively
-                // unlimited there). A per-step memory request threaded from the
-                // pipeline is the eventual right model (see R590-B10).
-                memory_mb: 32768,
+                // unlimited there).
+                //
+                // That last clause is only true while this stays a CEILING. It
+                // was also the placement floor until the annotation set above
+                // split the two, which made every build-worker under 32 GiB
+                // unschedulable — the story is on `memory_request_mb`.
+                memory_mb: FORGE_MEMORY_LIMIT_MB,
                 cpu_millis: 512,
                 ephemeral_storage_mb: 512,
             },
@@ -1627,12 +2248,17 @@ impl WorkloadSpec {
     /// every existing `WorkloadSpec { .. }` construction site the way a new
     /// plain field would (see R572-F1's handoff: ~26 sites for one field).
     ///
-    /// **This only declares the requirement — nothing matches it yet.** The
-    /// taint itself doesn't exist on the machine-TOML side until
-    /// [R572-F3](yah://arch/symbol/R572) adds a `taints` list there, and
-    /// nothing enforces repel-unless-tolerate placement until
-    /// [R572-F5](yah://arch/symbol/R572)'s scheduler lands. Until then this
-    /// is inert metadata a future scheduler can read.
+    /// Both halves have since landed: `MachineConfig.taints` (R572-F3) and the
+    /// scheduler's affinity check in `cloud::config::RequiredSpec::matches`
+    /// (R572-F5), which requires the key in the node's `taints` **or**
+    /// `mesh_tags`.
+    ///
+    /// A key named here is one of only two ways a node taint can influence
+    /// placement — the other is the `no-<archetype>` repulsion form. W305/
+    /// R742-T4 makes `yah cloud validate` reject any node taint that is
+    /// neither, so a new affinity key must be added to
+    /// `cloud::config::AFFINITY_TAINT_KEYS` alongside the workload that
+    /// requires it.
     ///
     /// The public-ingress appliance (W267) is the first user: a
     /// `kind = "container"` workload with `archetype =
@@ -1645,6 +2271,47 @@ impl WorkloadSpec {
         self.annotations
             .get(REQUIRES_TAINT_ANNOTATION)
             .map(String::as_str)
+    }
+
+    /// The memory (MiB) a scheduler must find on a node before placing this
+    /// workload — its **request**, as distinct from [`ResourceLimits::memory_mb`],
+    /// which is a **ceiling** the backend turns into a cgroup `memory.max`.
+    ///
+    /// Opt-in via `annotations["yah.placement.memory-request-mb"]` (see
+    /// [`MEMORY_REQUEST_ANNOTATION`]); absent or unparseable falls back to
+    /// `resources.memory_mb`, so every spec that does not set it is admitted
+    /// exactly as it was before this accessor existed.
+    ///
+    /// # Why the two numbers must not be the same one
+    ///
+    /// A limit answers "kill it past here"; a request answers "don't start it
+    /// somewhere smaller than here". Generous is the safe direction for the
+    /// first and the unschedulable direction for the second, so one field
+    /// serving both makes a deliberately-roomy ceiling into an admission floor.
+    ///
+    /// That is not hypothetical: [`WorkloadSpec::for_forge`] sets a 32 GiB
+    /// ceiling explicitly reasoned as "above physical RAM on smaller
+    /// build-workers ⇒ effectively unlimited there" (R590-B10), and
+    /// `CloudConfig::admit_workload` fed that same 32768 in as the R572-F5
+    /// capacity floor. Every build-worker under 32 GiB — the three 8 GiB Pi-5s
+    /// and the 16 GiB us-west-003 — became structurally unadmittable for *any*
+    /// offloaded qed step, leaving one 47 GiB node as the fleet's only legal
+    /// target for remote CI. This is R590-B10's own recorded follow-up
+    /// ("thread a per-step memory request … instead of a blanket forge
+    /// default"), reduced to the seam that closes the bug.
+    ///
+    /// An annotation rather than a new `ResourceLimits` field on purpose:
+    /// `WorkloadSpec` crosses a postcard wire that is positional and
+    /// carries no field names (R590-B3), so adding a field would break decode
+    /// on every fleet node still running an older kamaji. `annotations` is an
+    /// existing map — an extra key rides it safely, and admission already
+    /// reads placement inputs from exactly there
+    /// ([`Self::requires_taint`], the R594 node-selector).
+    pub fn memory_request_mb(&self) -> u32 {
+        self.annotations
+            .get(MEMORY_REQUEST_ANNOTATION)
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(self.resources.memory_mb)
     }
 
     /// Whether this workload must be run by kamaji's **native** (fork+exec)
@@ -1680,6 +2347,59 @@ impl WorkloadSpec {
         self.annotations
             .get(NATIVE_EXEC_ANNOTATION)
             .map(|v| v == NATIVE_EXEC_VALUE)
+            .unwrap_or(false)
+    }
+
+    /// Whether this workload must be run by kamaji's **microVM** backend —
+    /// booted in its own KVM guest with its own kernel, rather than sharing the
+    /// host kernel with every other workload on the node (R605-F8 / W325 §5).
+    ///
+    /// Opt-in via `annotations["yah.exec"] == "microvm"` (see
+    /// [`NATIVE_EXEC_ANNOTATION`] / [`MICROVM_EXEC_VALUE`]).
+    ///
+    /// # Why the *same* key as native exec, not a new one
+    ///
+    /// W325's Shape A calls this "a sibling branch on a new annotation value",
+    /// and the value — not the key — is the whole point. `yah.exec` names the
+    /// execution substrate, and a workload has exactly one:
+    ///
+    /// | `yah.exec` | substrate | kernel | isolation |
+    /// |---|---|---|---|
+    /// | *(absent)* | container backend | host's | namespaces + cgroup |
+    /// | `native` | fork+exec on the host | host's | **none** |
+    /// | `microvm` | KVM guest | **its own** | hardware |
+    ///
+    /// A second key (`yah.isolation = microvm`, say) would make
+    /// `yah.exec = native` + `yah.isolation = microvm` *expressible*, and
+    /// therefore something a dispatcher could emit and a backend would have to
+    /// refuse — exactly the refusal `validate_native_exec_spec` already has to
+    /// carry for the `yah.sandbox` pair, and for the same avoidable reason. A
+    /// map key holds one value, so on this key the three substrates are
+    /// mutually exclusive *by construction*: there is no spec on which both
+    /// this and [`Self::wants_native_exec`] return `true`, and
+    /// `exec_substrate_markers_are_mutually_exclusive_by_construction` pins
+    /// that.
+    ///
+    /// # What the marker does and does not promise
+    ///
+    /// Like every marker on this struct it is **inert metadata** — it declares
+    /// intent and nothing more. Whether a node can honour it is a node
+    /// capability question (`/dev/kvm`, a guest kernel, a rootfs; see W325 §4),
+    /// and a node whose kamaji has no microVM backend configured **refuses**
+    /// the deploy rather than falling back to a container. That refusal is
+    /// deliberate and mirrors R577-T1's: a caller asking for microVM isolation
+    /// is asking for the one property a container cannot provide, so silently
+    /// downgrading it would return success while delivering the thing the
+    /// caller specifically declined.
+    ///
+    /// `image` is identity metadata only, as it is for native exec — nothing is
+    /// pulled. The guest's root filesystem comes from the node's configured
+    /// rootfs image, and argv is resolved from `entrypoint` + `command` with
+    /// container semantics, so one spec shape drives all three substrates.
+    pub fn wants_microvm(&self) -> bool {
+        self.annotations
+            .get(NATIVE_EXEC_ANNOTATION)
+            .map(|v| v == MICROVM_EXEC_VALUE)
             .unwrap_or(false)
     }
 
@@ -1764,21 +2484,57 @@ pub const HOST_NETWORK_VALUE: &str = "host";
 /// carrying a specific taint. See [`WorkloadSpec::requires_taint`].
 pub const REQUIRES_TAINT_ANNOTATION: &str = "yah.placement.requires-taint";
 
+/// Annotation key carrying a workload's memory **request** in MiB — what a
+/// scheduler must find free on a node — separate from the `memory_mb`
+/// **ceiling** the backend enforces as a cgroup limit. See
+/// [`WorkloadSpec::memory_request_mb`].
+pub const MEMORY_REQUEST_ANNOTATION: &str = "yah.placement.memory-request-mb";
+
+/// The memory request [`WorkloadSpec::for_forge`] declares (MiB).
+///
+/// A forge run is a build, and a build's *ceiling* is deliberately roomy
+/// (`FORGE_MEMORY_LIMIT_MB`); this is the much smaller floor a node must have
+/// free to be a legal target for one. 2 GiB is what the heaviest forge shape
+/// in the tree already asks for by hand — `velveteen_exec::remote`'s buildkit
+/// image-build step overrides `resources.memory_mb` to exactly this — so it is
+/// a measured number rather than a guess, and it keeps the fleet's 8 GiB
+/// build-workers schedulable.
+pub const FORGE_MEMORY_REQUEST_MB: u32 = 2048;
+
+/// The cgroup memory ceiling [`WorkloadSpec::for_forge`] sets (MiB).
+///
+/// Bounded rather than unlimited so a runaway build cannot take the host
+/// down, and large enough for the V8 build's >12 GB peak (R590-B10). It is
+/// **not** a placement input — see [`FORGE_MEMORY_REQUEST_MB`].
+pub const FORGE_MEMORY_LIMIT_MB: u32 = 32768;
+
 /// Taint name (for [`REQUIRES_TAINT_ANNOTATION`]) identifying machines with
 /// a publicly-routable IP — the W267 sovereign-ingress placement
-/// requirement. The corresponding taint field on the machine TOML doesn't
-/// exist yet (R572-F3); this constant is the agreed-upon name both sides
-/// will use once it does.
+/// requirement. `MachineConfig.taints` (R572-F3) is the matching node-side
+/// field and `RequiredSpec::matches` (R572-F5) is the consumer, so this is a
+/// live key on both sides: a node may carry it, and the cloudflared/passway
+/// ingress specs require it.
 pub const PUBLIC_IP_TAINT: &str = "public-ip";
 
-/// Annotation key selecting kamaji's native (fork+exec) backend for a
-/// workload. See [`WorkloadSpec::wants_native_exec`].
+/// Annotation key selecting which **execution substrate** kamaji runs a
+/// workload on. Absent (or unrecognised) means a container backend; see
+/// [`NATIVE_EXEC_VALUE`] and [`MICROVM_EXEC_VALUE`] for the two opt-outs.
+///
+/// The name is historical — R577-T1 introduced it for native exec alone — but
+/// the key has always been the substrate selector, and R605-F8 added the
+/// second alternative rather than a second key. See
+/// [`WorkloadSpec::wants_microvm`] for why one key matters.
 pub const NATIVE_EXEC_ANNOTATION: &str = "yah.exec";
 
 /// Annotation value (for [`NATIVE_EXEC_ANNOTATION`]) selecting native
 /// host execution. Any other value leaves the workload on a container
 /// backend.
 pub const NATIVE_EXEC_VALUE: &str = "native";
+
+/// Annotation value (for [`NATIVE_EXEC_ANNOTATION`]) selecting a **microVM**:
+/// the workload boots in its own KVM guest rather than sharing the host
+/// kernel. See [`WorkloadSpec::wants_microvm`].
+pub const MICROVM_EXEC_VALUE: &str = "microvm";
 
 /// Annotation key requesting the capabilities a workload needs to stand up an
 /// unprivileged container sandbox of its own.
@@ -2157,6 +2913,133 @@ pub mod forge_state {
     }
 }
 
+// ── Materialized-secret path contract (R555-F5) ───────────────────────────────
+
+/// Where yubaba writes a `File`-target secret it has resolved, and how the host
+/// path is derived from the container path.
+///
+/// # Why the derivation lives here and not in yubaba
+///
+/// yubaba resolves a [`SecretMount`] and rewrites it into a read-only [`Bind`]
+/// volume before the spec reaches the backend, so the spec kamaji admits is not
+/// the spec the dispatcher signed: one mount has become one bind. Admission has
+/// to be able to recognise that rewrite — otherwise a signed recipe carrying a
+/// secret is refused by [`admission::AdmissionGrant::covers`]'s bind rule, which
+/// only knows about [`forge_state::HOST_ROOT`], with a message about a forge
+/// state root that has nothing to do with what happened.
+///
+/// Recognising it means recomputing the host path, which means the derivation
+/// has to be visible to both sides. It was private to yubaba's
+/// `deploy::secret_mount`; it lives here now, and yubaba calls in. `forge_state`
+/// is the same shape for the same reason.
+///
+/// [`Bind`]: VolumeSource::Bind
+pub mod secret_mount {
+    use std::path::{Path, PathBuf};
+
+    /// RAM-backed root for materialized secret files. `/run` is a tmpfs on
+    /// systemd nodes, so decrypted PEM never touches disk. Each workload gets a
+    /// `<root>/<ident>/` subdir, reaped on workload destroy.
+    pub const HOST_ROOT: &str = "/run/yah/secrets";
+
+    /// Collapse a value into a single safe path component: every char outside
+    /// `[A-Za-z0-9_-]` becomes `_` (dots included, so `.` / `..` can never
+    /// traverse). Empty input maps to `_`.
+    pub fn sanitize_component(s: &str) -> String {
+        let mapped: String = s
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if mapped.is_empty() {
+            "_".into()
+        } else {
+            mapped
+        }
+    }
+
+    /// Derive a collision-free host filename from a container target path: strip
+    /// the leading `/`, keep `.` for extensions, and replace path separators (and
+    /// any other non-`[A-Za-z0-9_.-]` char) with `_`. A target that reduces to
+    /// nothing or a dots-only name falls back to `secret`. The result is always a
+    /// single flat filename (no separators), so it cannot traverse out of the
+    /// per-workload dir.
+    pub fn host_file_name(target: &Path) -> String {
+        let raw = target.to_string_lossy();
+        let trimmed = raw.trim_start_matches('/');
+        let mapped: String = trimmed
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if mapped.is_empty() || mapped.chars().all(|c| c == '.') {
+            "secret".into()
+        } else {
+            mapped
+        }
+    }
+
+    /// The per-workload directory materialized secrets are written to.
+    pub fn workload_dir(root: &Path, ident: &str) -> PathBuf {
+        root.join(sanitize_component(ident))
+    }
+
+    /// The host path a `File`-target secret at container path `target` is
+    /// materialized to for workload `ident`.
+    ///
+    /// Deterministic in exactly those three inputs, which is what lets admission
+    /// recompute it from the spec alone and match a bind against it.
+    pub fn materialized_host_path(root: &Path, ident: &str, target: &Path) -> PathBuf {
+        workload_dir(root, ident).join(host_file_name(target))
+    }
+}
+
+#[cfg(test)]
+mod secret_mount_tests {
+    use super::secret_mount::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn the_host_path_is_a_pure_function_of_root_ident_and_target() {
+        let p = materialized_host_path(
+            Path::new(HOST_ROOT),
+            "forge.abc-123",
+            Path::new("/etc/yah/r2.json"),
+        );
+        assert_eq!(
+            p,
+            PathBuf::from("/run/yah/secrets/forge_abc-123/etc_yah_r2.json")
+        );
+    }
+
+    /// The two collapses exist to keep a hostile ident or target from steering
+    /// the write out of the per-workload dir. Pinned here because admission now
+    /// depends on them being total.
+    #[test]
+    fn neither_component_can_traverse() {
+        for ident in ["..", "../../etc", "a/b", ""] {
+            let dir = workload_dir(Path::new(HOST_ROOT), ident);
+            assert_eq!(dir.components().count(), 5, "{ident:?} escaped {dir:?}");
+            assert!(dir.starts_with(HOST_ROOT));
+        }
+        for target in ["/../../etc/shadow", "..", "/", "/a/../b"] {
+            let name = host_file_name(Path::new(target));
+            assert!(!name.contains('/'), "{target:?} kept a separator: {name}");
+            assert_ne!(name, "..");
+        }
+    }
+}
+
 #[cfg(test)]
 mod forge_state_tests {
     use super::forge_state::*;
@@ -2200,6 +3083,12 @@ mod forge_state_tests {
 pub struct ResourceLimits {
     /// Maximum RAM the container may allocate, in MiB. The container is OOM-
     /// killed if it exceeds this.
+    ///
+    /// A **ceiling**, not a request: setting it generously is the safe
+    /// direction here and the unschedulable direction for placement, so
+    /// schedulers must read [`WorkloadSpec::memory_request_mb`] instead of
+    /// this field. (`cpu_millis` below is the opposite — a request by
+    /// definition — which is why the two are not symmetric.)
     pub memory_mb: u32,
 
     /// CPU **request** in millicores (k8s convention): `1000` = one full core,
@@ -2626,6 +3515,267 @@ pub trait WorkloadRuntime: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── R658-B1 `routes` belongs at the top level, not inside [build] ─────────
+
+    /// The canonical `mesofact-static` manifest shape: `routes` above the
+    /// `[build]` header, where TOML keeps it top-level.
+    #[test]
+    fn mesofact_static_routes_parse_at_the_top_level() {
+        let src = r#"
+schema_version = 1
+kind = "mesofact-static"
+routes = "./mesofact.routes.ts"
+
+[build]
+command = "bun run build"
+out_dir = "dist"
+"#;
+        let Workload::MesofactStatic(site) =
+            toml::from_str::<Workload>(src).expect("canonical shape must parse")
+        else {
+            panic!("kind = \"mesofact-static\" must select MesofactStatic");
+        };
+        assert_eq!(site.routes, PathBuf::from("./mesofact.routes.ts"));
+        assert_eq!(site.build.out_dir, PathBuf::from("dist"));
+    }
+
+    /// The bug R658-B1 exists for: `routes` written *below* `[build]` is
+    /// `build.routes` as far as TOML is concerned. `BuildConfig` used to
+    /// discard the stray key, so this manifest parsed as far as the missing
+    /// top-level field and blamed the wrong line — or, once `routes` had a
+    /// default, would have deployed a site that enumerated no routes at all.
+    ///
+    /// `deny_unknown_fields` makes the misplacement itself the error, and the
+    /// message names `routes`, which is the one thing the author needs to move.
+    #[test]
+    fn mesofact_static_routes_inside_build_is_rejected_by_name() {
+        let src = r#"
+schema_version = 1
+kind = "mesofact-static"
+
+[build]
+command = "bun run build"
+out_dir = "dist"
+routes = "./mesofact.routes.ts"
+"#;
+        let err = toml::from_str::<Workload>(src)
+            .expect_err("`routes` under [build] must not parse silently")
+            .to_string();
+        assert!(
+            err.contains("routes"),
+            "the error must name the misplaced key so the fix is obvious; got: {err}"
+        );
+    }
+
+    /// Guard the general case, not just the one key that bit us: any unknown
+    /// `[build]` key is refused rather than dropped on the floor.
+    #[test]
+    fn unknown_build_keys_are_refused_rather_than_ignored() {
+        let src = r#"
+command = "bun run build"
+out_dir = "dist"
+outdir = "dist"
+"#;
+        let err = toml::from_str::<BuildConfig>(src)
+            .expect_err("a typo'd build key must not be silently ignored")
+            .to_string();
+        assert!(err.contains("outdir"), "got: {err}");
+
+        // …and the keys that ARE modelled still round-trip.
+        let ok: BuildConfig = toml::from_str(
+            r#"
+command = "bun run build"
+out_dir = "dist"
+render_command = "mesofact-build render . --route {route}"
+"#,
+        )
+        .expect("modelled keys must still parse");
+        assert_eq!(ok.render_command.as_deref(), Some("mesofact-build render . --route {route}"));
+    }
+
+    // ── R783-F1 / W324: container manifest vs wire spec ────────────────────────
+
+    /// The acceptance case. `crates/yah/cloud-admin/workload.toml` is the file
+    /// that could not parse through the envelope at all (R658-B2 pinned it in
+    /// `xtask/tests/workload_envelope.rs` as `missing field \`image\``): it is a
+    /// Dockerfile recipe, and the envelope only knew digest-pinned specs.
+    ///
+    /// The `[process]` table is deliberately present — that file is read by
+    /// `LocalProcessReconciler` on the dev mirror *and* `ContainerReconciler`
+    /// on pond, so the container form must tolerate the other tier's table
+    /// rather than reject the file (W324 §1).
+    #[test]
+    fn container_recipe_parses_including_the_other_tier_s_table() {
+        let src = r#"
+schema_version = 1
+name = "yah-cloud-admin"
+kind = "container"
+
+[build]
+dockerfile = "Dockerfile"
+context = "."
+image = "yah-local/yah-cloud-admin:dev"
+
+[run]
+port = 4325
+host_port = 4326
+
+[run.env]
+YAH_CLOUD_ADMIN_ADDR = "0.0.0.0:4325"
+
+[[run.mounts]]
+host = ".yah/infra"
+container = "/workspace/.yah/infra"
+
+[process]
+cargo_package = "yah-cloud-admin"
+port = 4325
+"#;
+        let workload = toml::from_str::<Workload>(src).expect("the recipe form must parse");
+        assert_eq!(workload.kind_str(), "container");
+
+        let recipe = workload
+            .container_manifest()
+            .and_then(ContainerManifest::as_recipe)
+            .expect("a [build] table selects the recipe form");
+        assert_eq!(recipe.name, "yah-cloud-admin");
+        assert_eq!(recipe.build.dockerfile, PathBuf::from("Dockerfile"));
+        assert_eq!(recipe.build.context, Some(PathBuf::from(".")));
+        assert_eq!(
+            recipe.build.image.as_deref(),
+            Some("yah-local/yah-cloud-admin:dev")
+        );
+        assert_eq!(recipe.run.port, Some(4325));
+        assert_eq!(recipe.run.host_port, Some(4326));
+        assert_eq!(
+            recipe.run.env.get("YAH_CLOUD_ADMIN_ADDR").map(String::as_str),
+            Some("0.0.0.0:4325")
+        );
+        assert_eq!(recipe.run.mounts.len(), 1);
+        assert!(recipe.run.mounts[0].read_only, "mounts default to read-only");
+
+        // The recipe has no spec — that is the whole point of the split.
+        assert!(workload.container_spec().is_none());
+    }
+
+    /// The other branch: no `[build]` table means the flat fields are a
+    /// digest-pinned `WorkloadSpec`, exactly as before the split.
+    #[test]
+    fn container_reference_still_parses_as_a_workload_spec() {
+        let spec = archetype_test_spec("noisetable-api");
+        let toml_src = toml::to_string(&Workload::container(spec.clone())).expect("serialize");
+        assert!(
+            toml_src.contains("kind = \"container\""),
+            "the on-disk form stays flat + internally tagged: {toml_src}"
+        );
+
+        let back = toml::from_str::<Workload>(&toml_src).expect("deserialize");
+        assert_eq!(back.container_spec(), Some(&spec));
+    }
+
+    /// Explicit-branch deserialize exists so this error survives. Under
+    /// `#[serde(untagged)]` it would read "data did not match any variant of
+    /// untagged enum ContainerManifest", which tells an author nothing.
+    #[test]
+    fn a_malformed_container_reference_still_names_the_missing_field() {
+        let src = r#"
+schema_version = 1
+kind = "container"
+name = "noisetable-api"
+image = "ghcr.io/noisetable/api:v1@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+replicas = 1
+"#;
+        let err = toml::from_str::<Workload>(src)
+            .expect_err("a reference missing a required field must not parse")
+            .to_string();
+        assert!(err.contains("missing field `tier`"), "got: {err}");
+    }
+
+    /// The one file that names neither marker. `missing field \`image\`` would
+    /// send a recipe author off to add a field their form does not have, so
+    /// the error names both forms instead.
+    #[test]
+    fn a_container_with_neither_image_nor_build_names_both_forms() {
+        let src = r#"
+schema_version = 1
+kind = "container"
+name = "yah-cloud-admin"
+
+[run]
+port = 4325
+"#;
+        let err = toml::from_str::<Workload>(src)
+            .expect_err("neither form is declared")
+            .to_string();
+        assert!(err.contains("image"), "got: {err}");
+        assert!(err.contains("[build]"), "got: {err}");
+    }
+
+    /// W324 §5's invariant, as a signature: there is no path from a recipe to
+    /// a `WorkloadSpec` that does not name a digest.
+    #[test]
+    fn a_recipe_lowers_only_once_a_build_has_produced_a_digest() {
+        let recipe = ContainerBuild {
+            schema_version: SchemaVersion::V1,
+            name: "yah-cloud-admin".into(),
+            build: ContainerBuildStep {
+                dockerfile: "Dockerfile".into(),
+                context: Some(".".into()),
+                image: Some("yah-local/yah-cloud-admin:dev".into()),
+            },
+            run: ContainerRunConfig {
+                port: Some(4325),
+                host_port: Some(4326),
+                env: BTreeMap::from([("A".to_string(), "b".to_string())]),
+                mounts: vec![ContainerMount {
+                    host: ".yah/infra".into(),
+                    container: "/workspace/.yah/infra".into(),
+                    read_only: true,
+                }],
+            },
+        };
+
+        let digest = testing::test_digest();
+        let spec = recipe
+            .clone()
+            .into_spec(&digest, TierTag("private".into()))
+            .expect("a well-formed digest lowers");
+        assert_eq!(spec.name, "yah-cloud-admin");
+        assert_eq!(spec.image.digest, digest);
+        assert_eq!(spec.image.repository, "yah-local/yah-cloud-admin");
+        assert_eq!(spec.image.tag, "dev");
+        assert_eq!(spec.expose.mesh.ports, vec![4325]);
+        assert_eq!(spec.env.len(), 1);
+        assert_eq!(spec.volumes.len(), 1);
+
+        // A bare tag is not a digest. Lowering must fail rather than mint a
+        // spec that lies about being content-addressed (R438-T3).
+        let err = recipe
+            .into_spec("dev", TierTag("private".into()))
+            .expect_err("an unpinned digest must not lower");
+        assert!(err.contains("sha256"), "got: {err}");
+    }
+
+    /// A recipe is a first-class on-disk value: it survives a write/read of
+    /// the manifest unchanged. The other half of the gate — that the same
+    /// value is *refused* by postcard — is in `tests/round_trip.rs`, which
+    /// also pins the reference form's byte layout.
+    #[test]
+    fn a_recipe_round_trips_on_disk_under_the_container_kind() {
+        let recipe = Workload::Container(ContainerManifest::Recipe(ContainerBuild {
+            schema_version: SchemaVersion::V1,
+            name: "yah-cloud-admin".into(),
+            build: ContainerBuildStep::default(),
+            run: ContainerRunConfig::default(),
+        }));
+        assert_eq!(recipe.kind_str(), "container");
+
+        let src = toml::to_string(&recipe).expect("a recipe serializes to disk");
+        assert!(src.contains("kind = \"container\""), "{src}");
+        let back: Workload = toml::from_str(&src).expect("and parses back");
+        assert_eq!(back, recipe);
+    }
 
     // ── R603-T5 durable forge produced convention ──────────────────────────────
 
@@ -3310,7 +4460,7 @@ blake3   = "{HASH_64}"
             REQUIRES_TAINT_ANNOTATION.to_string(),
             PUBLIC_IP_TAINT.to_string(),
         );
-        let workload = Workload::Container(inner.clone());
+        let workload = Workload::container(inner.clone());
 
         let json = serde_json::to_string(&workload).expect("serialize");
         assert!(json.contains("\"container\""));
@@ -3318,13 +4468,13 @@ blake3   = "{HASH_64}"
         assert!(json.contains(PUBLIC_IP_TAINT));
 
         let back: Workload = serde_json::from_str(&json).expect("deserialize");
-        match back {
-            Workload::Container(spec) => {
-                assert_eq!(spec, inner);
+        match back.container_spec() {
+            Some(spec) => {
+                assert_eq!(spec, &inner);
                 assert_eq!(spec.effective_archetype(), LifecycleArchetype::Appliance);
                 assert_eq!(spec.requires_taint(), Some(PUBLIC_IP_TAINT));
             }
-            other => panic!("expected Workload::Container, got {other:?}"),
+            None => panic!("expected a container reference workload, got {back:?}"),
         }
     }
 
@@ -3410,18 +4560,93 @@ blake3   = "{HASH_64}"
             NATIVE_EXEC_ANNOTATION.to_string(),
             NATIVE_EXEC_VALUE.to_string(),
         );
-        let workload = Workload::Container(inner.clone());
+        let workload = Workload::container(inner.clone());
 
         let json = serde_json::to_string(&workload).expect("serialize");
         assert!(json.contains(NATIVE_EXEC_ANNOTATION));
 
         let back: Workload = serde_json::from_str(&json).expect("deserialize");
-        match back {
-            Workload::Container(spec) => {
-                assert_eq!(spec, inner);
+        match back.container_spec() {
+            Some(spec) => {
+                assert_eq!(spec, &inner);
                 assert!(spec.wants_native_exec());
             }
-            other => panic!("expected Workload::Container, got {other:?}"),
+            None => panic!("expected a container reference workload, got {back:?}"),
+        }
+    }
+
+    // ── MicroVM marker (R605-F8 / W325 §5) ──────────────────────────────────
+
+    #[test]
+    fn microvm_marker_is_opt_in_and_reads_back() {
+        let plain = archetype_test_spec("linux-build");
+        assert!(!plain.wants_microvm());
+
+        let mut vm = archetype_test_spec("isolated-build");
+        vm.annotations.insert(
+            NATIVE_EXEC_ANNOTATION.to_string(),
+            MICROVM_EXEC_VALUE.to_string(),
+        );
+        assert!(vm.wants_microvm());
+
+        // Fails closed onto the container backend, like every other marker: a
+        // typo must not be read as "boot a VM", because the deploy that would
+        // then be refused for lack of a microVM backend is a *worse* failure
+        // than the container run the author actually spelled.
+        let mut typo = archetype_test_spec("typo");
+        typo.annotations
+            .insert(NATIVE_EXEC_ANNOTATION.to_string(), "MicroVM".to_string());
+        assert!(!typo.wants_microvm());
+        assert!(!typo.wants_native_exec());
+    }
+
+    #[test]
+    fn exec_substrate_markers_are_mutually_exclusive_by_construction() {
+        // This is the property that buys R605-F8 out of a refusal branch: the
+        // three substrates share one annotation key, so no spec can ask for two
+        // of them. Pinned because a later "let's give microVM its own key"
+        // refactor would silently re-open the incoherent-pair case that
+        // `yah.sandbox` + `yah.exec = native` still has to be refused for.
+        assert_eq!(
+            NATIVE_EXEC_ANNOTATION, NATIVE_EXEC_ANNOTATION,
+            "both substrate values must live on the same key"
+        );
+        assert_ne!(NATIVE_EXEC_VALUE, MICROVM_EXEC_VALUE);
+
+        for value in [NATIVE_EXEC_VALUE, MICROVM_EXEC_VALUE, "", "container"] {
+            let mut spec = archetype_test_spec("substrate");
+            spec.annotations
+                .insert(NATIVE_EXEC_ANNOTATION.to_string(), value.to_string());
+            assert!(
+                !(spec.wants_native_exec() && spec.wants_microvm()),
+                "yah.exec={value:?} selected two substrates at once"
+            );
+        }
+    }
+
+    #[test]
+    fn microvm_marked_spec_round_trips_through_json_as_a_container_workload() {
+        // Same zero-blast-radius claim as the native case: a microVM workload
+        // is still `Workload::Container` on the wire, so kamaji-proto's codec
+        // gains no variant and its positional postcard encoding does not move.
+        let mut inner = archetype_test_spec("isolated-build");
+        inner.annotations.insert(
+            NATIVE_EXEC_ANNOTATION.to_string(),
+            MICROVM_EXEC_VALUE.to_string(),
+        );
+        let workload = Workload::container(inner.clone());
+
+        let json = serde_json::to_string(&workload).expect("serialize");
+        assert!(json.contains(MICROVM_EXEC_VALUE));
+
+        let back: Workload = serde_json::from_str(&json).expect("deserialize");
+        match back.container_spec() {
+            Some(spec) => {
+                assert_eq!(spec, &inner);
+                assert!(spec.wants_microvm());
+                assert!(!spec.wants_native_exec());
+            }
+            None => panic!("expected a container reference workload, got {back:?}"),
         }
     }
 }

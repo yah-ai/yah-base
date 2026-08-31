@@ -13,6 +13,11 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "WorkloadSpec — typed wire format for yubaba workloads. Schema crate with zero deps on yubaba; yubaba depends on this, not the other way around."
+# R743-T4: cargo's default is one test binary per file under tests/ (7,
+# before this ticket). autotests = false turns that off; the single
+# [[test]] target below (tests/main.rs) mods all 7 in as submodules instead,
+# so `cargo test` links/compiles one integration-test binary, not seven.
+autotests = false
 
 [lib]
 name = "workload_spec"
@@ -32,6 +37,13 @@ json-schema = ["dep:schemars"]
 # so the nonce discipline can't drift between the two writers.
 seal = ["dep:aes-gcm", "dep:zeroize"]
 
+# R555-F4 (W235 §(c)): Ed25519 sign/verify for `admission::AdmissionGrant`.
+# Off by default for the same reason as `seal` — this is a schema crate, and
+# the grant *format* (encode/parse/covers, the whole security-relevant
+# comparison) is available without it. Only the two parties that touch a key
+# turn it on: kamaji (verify, on the node) and xtask (sign, at authoring time).
+admission-verify = ["dep:ed25519-dalek", "dep:hex"]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -42,6 +54,11 @@ ts-rs = { version = "12.0", features = ["serde-compat"] }
 schemars = { version = "0.8", optional = true }
 aes-gcm = { version = "0.10", features = ["zeroize"], optional = true }
 zeroize = { version = "1", optional = true }
+# Matches the `ed25519-dalek = "2"` pin `crates/yah/plugin` already signs
+# manifests under, so a camp does not link two major versions of the same
+# curve implementation.
+ed25519-dalek = { version = "2", optional = true }
+hex = { version = "0.4", optional = true }
 async-trait = "0.1"
 anyhow = "1.0"
 
@@ -58,3 +75,11 @@ postcard = { version = "1.1", features = ["use-std"] }
 [[bin]]
 name = "export-ts"
 path = "src/bin/export-ts.rs"
+
+# R743-T4: the sole integration-test target now that autotests = false above
+# has disabled the implicit one-binary-per-file scan of tests/. main.rs mods
+# in the 7 former top-level test files as submodules; tests/compose/ and
+# tests/fixtures/ stay data dirs, unaffected.
+[[test]]
+name = "main"
+path = "tests/main.rs"

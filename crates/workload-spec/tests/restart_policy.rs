@@ -84,3 +84,48 @@ fn for_forge_sets_conventional_fields() {
     );
     assert_eq!(spec.expose.mesh.ports, vec![8080]);
 }
+
+/// A forge run's cgroup ceiling is deliberately roomy; its placement request
+/// must stay small, or a scheduler reading the ceiling refuses every node
+/// smaller than it (the fleet's 8 GiB build-workers, in practice).
+#[test]
+fn for_forge_memory_request_is_a_floor_not_the_cgroup_ceiling() {
+    let spec = WorkloadSpec::for_forge("build-42", forge_image(), TierTag("infra".into()), vec![]);
+
+    assert_eq!(
+        spec.resources.memory_mb,
+        workload_spec::FORGE_MEMORY_LIMIT_MB
+    );
+    assert_eq!(
+        spec.memory_request_mb(),
+        workload_spec::FORGE_MEMORY_REQUEST_MB
+    );
+    assert!(
+        spec.memory_request_mb() < spec.resources.memory_mb,
+        "request must be strictly below the ceiling"
+    );
+    // The concrete regression: an 8 GiB build-worker must be a legal target.
+    assert!(
+        spec.memory_request_mb() <= 8192,
+        "a forge run must fit the fleet's 8 GiB Pi-5 build-workers"
+    );
+}
+
+/// Absent annotation ⇒ the request is the ceiling, i.e. exactly the pre-split
+/// behaviour. Every spec in the tree that never declares a request is admitted
+/// on the same number it always was.
+#[test]
+fn memory_request_falls_back_to_the_limit_when_undeclared() {
+    let mut spec = WorkloadSpec::for_forge("b", forge_image(), TierTag("infra".into()), vec![]);
+    spec.annotations
+        .remove(workload_spec::MEMORY_REQUEST_ANNOTATION);
+    assert_eq!(spec.memory_request_mb(), spec.resources.memory_mb);
+
+    // A garbage value falls back too rather than admitting on 0 — an
+    // unparseable request must not silently become "fits anywhere".
+    spec.annotations.insert(
+        workload_spec::MEMORY_REQUEST_ANNOTATION.into(),
+        "not-a-number".into(),
+    );
+    assert_eq!(spec.memory_request_mb(), spec.resources.memory_mb);
+}

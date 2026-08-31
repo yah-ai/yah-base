@@ -1,0 +1,30 @@
+[package]
+name = "yah-tenant-pointer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Global tenant->cell pointer (W250): a small per-tenant object {cell, generation} plus linearizable read / create / compare-and-swap helpers over ObjectStore::put_if."
+# R736-F1: no crates.io name is held for this yet and nothing PUBLISHED depends
+# on it (yah-object-store does not — the dependency points the other way), so
+# the crate stays out of the publish wave rather than adding a name-claim +
+# trusted-publisher chore to a record with one in-tree consumer. Flip this the
+# moment a published crate takes a dependency on it; the yah-base mirror
+# exports the directory either way, so a standalone `cargo test --workspace`
+# on the mirror keeps working while this is false.
+publish = false
+
+[lib]
+name = "yah_tenant_pointer"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# TOML, matching the house format for small mutable pointer objects
+# (`bundles/current/<name>.toml`, `runtimes/.../<triple>.toml` in
+# yah-mesofact-bundle). Human-readable matters here: this object is what an
+# operator reads when they need to know which cell owns a tenant.
+toml = "0.8"
+thiserror = "1"
+yah-object-store = { path = "../object-store", version = "0.8.29" }

@@ -257,7 +257,7 @@ impl PasswayIngressSpec {
             annotations,
         };
 
-        Workload::Container(spec)
+        Workload::container(spec)
     }
 }
 
@@ -303,10 +303,10 @@ mod tests {
     }
 
     fn lower(spec: &PasswayIngressSpec) -> WorkloadSpec {
-        let Workload::Container(s) = spec.into_container_workload(sample_image()) else {
-            panic!("expected a Container workload");
-        };
-        s
+        spec.into_container_workload(sample_image())
+            .container_spec()
+            .expect("expected a container reference workload")
+            .clone()
     }
 
     fn env_val<'a>(spec: &'a WorkloadSpec, name: &str) -> Option<&'a str> {

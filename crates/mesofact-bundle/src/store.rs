@@ -32,7 +32,7 @@ const MANIFEST_FILENAME: &str = "manifest.toml";
 
 /// Recency marker touched on every [`BundleCache::ensure`] — its mtime is the
 /// LRU key. A plain file keeps the whole thing std-only (no filetime crate).
-const ACCESS_MARKER: &str = ".accessed";
+pub(crate) const ACCESS_MARKER: &str = ".accessed";
 
 /// Outcome of a [`publish_bundle`] run.
 #[derive(Debug, Clone)]
@@ -109,27 +109,11 @@ pub fn publish_bundle(
     })
 }
 
-/// Materialize the bundle named by `digest` from `store` into
-/// `<cache_dir>/bundles/<digest>/`, returning that path.
-///
-/// Idempotent: an already-materialized tree (its `manifest.toml` present) is
-/// returned untouched. Otherwise the fetch runs into a `.staging-<digest>`
-/// sibling and is atomically `rename`d into place, so a crash mid-fetch never
-/// leaves a partial tree that the presence check would trust. Every blob and
-/// the manifest itself are verified against their recorded hashes.
-pub fn materialize_bundle(
-    store: &dyn ObjectStore,
-    cache_dir: &Path,
-    digest: &BundleHash,
-) -> Result<PathBuf, BundleError> {
-    let bundles_dir = cache_dir.join("bundles");
-    let dest = bundles_dir.join(digest.as_str());
-    let dest_manifest = dest.join(MANIFEST_FILENAME);
-    if dest_manifest.exists() {
-        return Ok(dest);
-    }
-
-    // Fetch + verify the manifest.
+/// Fetch and verify just the manifest object for `digest` — none of its
+/// blobs. The cheap read a reuse decision needs (R746-F5): finding out what a
+/// previous publish's `bins/<triple>/serve` hashed to costs one small object
+/// GET, not a full materialize.
+pub fn fetch_manifest(store: &dyn ObjectStore, digest: &BundleHash) -> Result<BundleManifest, BundleError> {
     let mkey = manifest_key(digest);
     let manifest_bytes = store
         .get(&mkey)
@@ -151,6 +135,30 @@ pub fn materialize_bundle(
             actual: actual_digest.to_string(),
         });
     }
+    Ok(manifest)
+}
+
+/// Materialize the bundle named by `digest` from `store` into
+/// `<cache_dir>/bundles/<digest>/`, returning that path.
+///
+/// Idempotent: an already-materialized tree (its `manifest.toml` present) is
+/// returned untouched. Otherwise the fetch runs into a `.staging-<digest>`
+/// sibling and is atomically `rename`d into place, so a crash mid-fetch never
+/// leaves a partial tree that the presence check would trust. Every blob and
+/// the manifest itself are verified against their recorded hashes.
+pub fn materialize_bundle(
+    store: &dyn ObjectStore,
+    cache_dir: &Path,
+    digest: &BundleHash,
+) -> Result<PathBuf, BundleError> {
+    let bundles_dir = cache_dir.join("bundles");
+    let dest = bundles_dir.join(digest.as_str());
+    let dest_manifest = dest.join(MANIFEST_FILENAME);
+    if dest_manifest.exists() {
+        return Ok(dest);
+    }
+
+    let manifest = fetch_manifest(store, digest)?;
 
     let staging = bundles_dir.join(format!(".staging-{}", digest.as_str()));
     if staging.exists() {
@@ -185,7 +193,10 @@ pub fn materialize_bundle(
     }
 
     // Manifest written last — its presence is the "tree is complete" marker.
+    // The canonical re-serialization (same bytes `publish_bundle` uploaded),
+    // not raw object bytes — `fetch_manifest` already parsed and validated it.
     let staged_manifest = staging.join(MANIFEST_FILENAME);
+    let manifest_text = manifest.to_toml_string()?;
     fs::write(&staged_manifest, manifest_text.as_bytes()).map_err(io_ctx(&staged_manifest))?;
 
     fs::create_dir_all(&bundles_dir).map_err(io_ctx(&bundles_dir))?;
@@ -323,17 +334,17 @@ fn checked_rel(path: &str) -> Result<PathBuf, BundleError> {
     Ok(p.to_path_buf())
 }
 
-fn store_err(e: yah_object_store::Error) -> BundleError {
+pub(crate) fn store_err(e: yah_object_store::Error) -> BundleError {
     BundleError::Io(e.to_string())
 }
 
-fn io_ctx(p: &Path) -> impl Fn(std::io::Error) -> BundleError + '_ {
+pub(crate) fn io_ctx(p: &Path) -> impl Fn(std::io::Error) -> BundleError + '_ {
     move |e| BundleError::Io(format!("{}: {e}", p.display()))
 }
 
 /// Touch the access marker inside a materialized bundle dir so its mtime tracks
 /// last use. Best-effort: a failure here only degrades LRU accuracy.
-fn touch_access(bundle_dir: &Path) -> Result<(), BundleError> {
+pub(crate) fn touch_access(bundle_dir: &Path) -> Result<(), BundleError> {
     let marker = bundle_dir.join(ACCESS_MARKER);
     // Writing truncates + updates mtime; the byte is irrelevant.
     fs::write(&marker, b"1").map_err(io_ctx(&marker))
@@ -396,6 +407,7 @@ mod tests {
         }
         let manifest = BundleManifest {
             schema_version: SCHEMA_VERSION,
+            requires_contract: crate::BUNDLE_CONTRACT_VERSION,
             name: "yah-marketing".to_string(),
             runtime,
             content,
@@ -456,7 +468,7 @@ mod tests {
                 ("app/dist/html/index.html", b"<html>home</html>"),
                 (beacon, br#"{"prefix":"bundle/yah-marketing","files":1}"#),
             ],
-            BundleRuntime::SelfContained,
+            BundleRuntime::self_contained(),
         );
         let report = publish_bundle(&store, src.path()).unwrap();
         assert_eq!(report.uploaded.len(), 2);
@@ -475,7 +487,7 @@ mod tests {
         write_bundle(
             src.path(),
             &[("app/index.html", b"same")],
-            BundleRuntime::SelfContained,
+            BundleRuntime::self_contained(),
         );
 
         let first = publish_bundle(&store, src.path()).unwrap();
@@ -490,12 +502,88 @@ mod tests {
         assert_eq!(first.digest, second.digest);
     }
 
+    /// R746-F5's whole point at the publish layer: a manifest can list a
+    /// `bins/<triple>/serve` entry whose local file was NEVER written (a
+    /// `ServeBinSource::Pinned` assembly) as long as the store already holds
+    /// that blob — publish must find it via `store.head` and never attempt to
+    /// read the (absent) local path.
+    #[test]
+    fn publish_skips_a_pinned_entry_with_no_local_file_when_the_blob_is_already_stored() {
+        let store = InMemoryObjectStore::new();
+        let src = TempDir::new().unwrap();
+        let pinned_bytes = b"a previously published serve binary";
+        let pinned_hash = BundleHash::of(pinned_bytes);
+        // Simulate: the earlier assembly's publish already put this blob.
+        store.put(&blob_key(&pinned_hash), pinned_bytes.to_vec()).unwrap();
+
+        // This assembly's tree carries app/index.html on disk, plus a
+        // manifest entry for bins/.../serve that names the pinned hash —
+        // with NO corresponding file under src.path().
+        let mut content = BTreeMap::new();
+        let app_bytes = b"<html>new template</html>";
+        std::fs::create_dir_all(src.path().join("app")).unwrap();
+        std::fs::write(src.path().join("app/index.html"), app_bytes).unwrap();
+        content.insert("app/index.html".to_string(), BundleHash::of(app_bytes));
+        content.insert(
+            "bins/x86_64-unknown-linux-musl/serve".to_string(),
+            pinned_hash.clone(),
+        );
+        let manifest = BundleManifest {
+            schema_version: SCHEMA_VERSION,
+            requires_contract: crate::BUNDLE_CONTRACT_VERSION,
+            name: "yah-marketing".to_string(),
+            runtime: BundleRuntime::SelfContained {
+                built_against: Some("fp-abc".to_string()),
+            },
+            content,
+        };
+        std::fs::write(
+            src.path().join(MANIFEST_FILENAME),
+            manifest.to_toml_string().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !src.path().join("bins").exists(),
+            "the pinned entry must have no local file at all"
+        );
+
+        let report = publish_bundle(&store, src.path()).unwrap();
+        // Only the template changed — the pinned binary blob was already
+        // there, so it's a dedupe skip, not an upload, and nothing tried to
+        // read the missing local bins/ path.
+        assert_eq!(report.uploaded, vec!["blobs/".to_string() + &BundleHash::of(app_bytes).to_string()]);
+        assert_eq!(report.skipped, vec![blob_key(&pinned_hash)]);
+    }
+
+    /// R746-F5: a reuse decision only needs the manifest, not the blobs — and
+    /// it must be checkable against a digest nothing has published, since
+    /// that's the "first-ever sync" case.
+    #[test]
+    fn fetch_manifest_reads_just_the_manifest_object() {
+        let store = InMemoryObjectStore::new();
+        let src = TempDir::new().unwrap();
+        let manifest = write_bundle(
+            src.path(),
+            &[("bins/x86_64-unknown-linux-musl/serve", b"ELF")],
+            BundleRuntime::SelfContained {
+                built_against: Some("fp-1".to_string()),
+            },
+        );
+        publish_bundle(&store, src.path()).unwrap();
+
+        let fetched = fetch_manifest(&store, &manifest.digest()).unwrap();
+        assert_eq!(fetched, manifest);
+
+        let missing = fetch_manifest(&store, &BundleHash::of(b"never published")).unwrap_err();
+        assert!(matches!(missing, BundleError::MissingBlob { .. }), "got {missing:?}");
+    }
+
     #[test]
     fn materialize_is_idempotent() {
         let store = InMemoryObjectStore::new();
         let src = TempDir::new().unwrap();
         let cache = TempDir::new().unwrap();
-        let m = write_bundle(src.path(), &[("app/x", b"y")], BundleRuntime::SelfContained);
+        let m = write_bundle(src.path(), &[("app/x", b"y")], BundleRuntime::self_contained());
         publish_bundle(&store, src.path()).unwrap();
 
         let a = materialize_bundle(&store, cache.path(), &m.digest()).unwrap();
@@ -507,7 +595,7 @@ mod tests {
     fn publish_rejects_hash_mismatch() {
         let store = InMemoryObjectStore::new();
         let src = TempDir::new().unwrap();
-        let mut m = write_bundle(src.path(), &[("app/x", b"real")], BundleRuntime::SelfContained);
+        let mut m = write_bundle(src.path(), &[("app/x", b"real")], BundleRuntime::self_contained());
         // Corrupt the on-disk file so it no longer matches the manifest hash.
         fs::write(src.path().join("app/x"), b"tampered").unwrap();
         // Rewrite manifest.toml keeping the OLD (now-wrong) hash.
@@ -523,7 +611,7 @@ mod tests {
         let store = InMemoryObjectStore::new();
         let src = TempDir::new().unwrap();
         let cache = TempDir::new().unwrap();
-        let m = write_bundle(src.path(), &[("app/x", b"y")], BundleRuntime::SelfContained);
+        let m = write_bundle(src.path(), &[("app/x", b"y")], BundleRuntime::self_contained());
         publish_bundle(&store, src.path()).unwrap();
         // Evict the blob from the store so materialize can't find it.
         store.delete(&blob_key(m.content.get("app/x").unwrap())).unwrap();
@@ -553,7 +641,7 @@ mod tests {
             let m = write_bundle(
                 src.path(),
                 &[("app/blob", vec![b'a' + i as u8; 1000].as_slice())],
-                BundleRuntime::SelfContained,
+                BundleRuntime::self_contained(),
             );
             publish_bundle(&store, src.path()).unwrap();
             digests.push(m.digest());
@@ -583,7 +671,7 @@ mod tests {
             let m = write_bundle(
                 src.path(),
                 &[("app/blob", vec![b'a' + i as u8; 1000].as_slice())],
-                BundleRuntime::SelfContained,
+                BundleRuntime::self_contained(),
             );
             publish_bundle(&store, src.path()).unwrap();
             digests.push(m.digest());

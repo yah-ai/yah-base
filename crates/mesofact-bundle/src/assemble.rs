@@ -50,6 +50,22 @@ fn io(context: impl AsRef<str>, e: std::io::Error) -> BundleError {
 /// `"app/dist/index.html"` or `"bins/x86_64-unknown-linux-musl/serve"`.
 pub type BundleFile = (String, PathBuf);
 
+/// Where one `serve_bins` entry comes from (R746-F5).
+#[derive(Debug, Clone)]
+pub enum ServeBinSource {
+    /// A binary on this machine's disk — copied into the bundle tree and
+    /// hashed like any other file.
+    Local(PathBuf),
+    /// A binary the store already holds, referenced by its BLAKE3 digest.
+    /// Nothing is read from local disk and nothing is copied into the bundle
+    /// tree; the manifest's `content` map simply names this hash, and
+    /// `publish_bundle` skips it because `store.head` already finds the blob
+    /// (the same append-only dedupe every other file gets). This is the
+    /// mechanism that makes a template-only re-release possible on a machine
+    /// that has never built the binary at all.
+    Pinned(BundleHash),
+}
+
 /// Recursively enumerate the regular files under `dir`, mapping each to a
 /// bundle path `"<prefix>/<relative-path>"`. Results are sorted for determinism.
 pub fn collect_dir(prefix: &str, dir: &Path) -> Result<Vec<BundleFile>, BundleError> {
@@ -118,10 +134,15 @@ pub fn assemble_bundle(
         content.insert(bundle_path.clone(), hash);
     }
 
+    // Every shape (vanilla, self-contained, hand-driven) funnels through here,
+    // so this is the single site that decides what contract a bundle assembled
+    // by this build requires — there is no per-shape override and no way for a
+    // caller to under-declare it (R746-F6).
     let manifest = BundleManifest {
         schema_version: SCHEMA_VERSION,
         name: name.to_string(),
         runtime,
+        requires_contract: crate::BUNDLE_CONTRACT_VERSION,
         content,
     };
     let toml = manifest.to_toml_string()?;
@@ -142,9 +163,12 @@ pub fn assemble_bundle(
 /// `mesofact serve` that should serve this bundle (e.g. the framework version
 /// the app was built against).
 ///
-/// NOTE: nothing currently stages `runtimes/<runtime>/<triple>/serve` on a node,
-/// so a vanilla bundle will fail serve-binary resolution at deploy time. Until
-/// that staging path exists, prefer [`assemble_self_bundle`].
+/// The node resolves that runtime from its shared runtime-asset tier
+/// ([`ensure_runtime_asset`](crate::ensure_runtime_asset), R746-F1), fetching
+/// and blake3-verifying it from the bundle store on a miss. The asset must have
+/// been published for the node's triple first (`yah cloud bundle
+/// publish-runtime`) — a bundle naming a runtime nothing published fails the
+/// deploy, loudly and without falling back to any other binary on the box.
 pub fn assemble_vanilla_bundle(
     dest: &Path,
     name: &str,
@@ -170,9 +194,11 @@ pub fn assemble_vanilla_bundle(
 /// plus `bins/<triple>/serve`, so the node serves it with the binary the bundle
 /// carries and resolves no runtime asset at all.
 ///
-/// This is the shape to reach for today. A vanilla bundle depends on a node-side
-/// runtime cache that nothing populates yet, whereas a self-contained bundle is
-/// closed over its own serve binary and works against a stock node.
+/// Reach for this when the app needs a serve binary that is not a stock build —
+/// a custom SSR runtime, an app-specific patch. It is closed over its own
+/// binary, so it works against a node that has never fetched a runtime asset,
+/// at the cost of shipping ~70MB per site per release. R746-F1 made vanilla the
+/// cheaper default for everything that runs the stock runtime.
 pub fn assemble_self_bundle(
     dest: &Path,
     name: &str,
@@ -180,9 +206,17 @@ pub fn assemble_self_bundle(
     out_dir: &Path,
     serve_bins: &[(String, PathBuf)],
 ) -> Result<BundleManifest, BundleError> {
-    assemble_self_bundle_with(dest, name, project_root, out_dir, serve_bins, &[])
+    let serve_bins: Vec<(String, ServeBinSource)> = serve_bins
+        .iter()
+        .map(|(triple, path)| (triple.clone(), ServeBinSource::Local(path.clone())))
+        .collect();
+    assemble_self_bundle_with(dest, name, project_root, out_dir, &serve_bins, &[], None)
 }
 
+/// (Was: "the shape to reach for today" — that stopped being true when R746-F1
+/// landed node-side runtime resolution. Both shapes serve; vanilla is the one
+/// that shares a ~70MB binary across every site on a node.)
+///
 /// [`assemble_self_bundle`] plus **sidecar binaries** — extra executables the
 /// node forks alongside `serve`, staged at `bins/<triple>/<name>` (R330-F31).
 ///
@@ -193,19 +227,37 @@ pub fn assemble_self_bundle(
 /// same property that makes `runtime = "self"` the shape to reach for.
 ///
 /// `sidecar_bins` entries are `(binary name, target triple, source path)`.
+///
+/// `serve_bins` entries are `(triple, source)` where source is either a local
+/// file to copy in ([`ServeBinSource::Local`]) or a digest already published
+/// to the store from a prior assembly ([`ServeBinSource::Pinned`], R746-F5) —
+/// see that variant's docs for why a pinned entry costs no local read and no
+/// re-upload.
+///
+/// `built_against` is the reuse contract recorded on the manifest
+/// ([`BundleRuntime::SelfContained::built_against`]): the fingerprint every
+/// `Local` binary in this call was built from. Pass `None` for a one-shot
+/// assembly with nothing to record (e.g. `yah cloud bundle build`); the
+/// resulting bundle still serves, it just can't be a reuse source later.
 pub fn assemble_self_bundle_with(
     dest: &Path,
     name: &str,
     project_root: &Path,
     out_dir: &Path,
-    serve_bins: &[(String, PathBuf)],
+    serve_bins: &[(String, ServeBinSource)],
     sidecar_bins: &[(String, String, PathBuf)],
+    built_against: Option<String>,
 ) -> Result<BundleManifest, BundleError> {
     let mut files = collect_dir("app/dist", out_dir)?;
     stage_app_config(project_root, &mut files);
     stage_data_inputs(project_root, out_dir, &mut files)?;
-    for (triple, bin) in serve_bins {
-        files.push((format!("bins/{triple}/serve"), bin.clone()));
+    let mut pinned: Vec<(String, BundleHash)> = Vec::new();
+    for (triple, source) in serve_bins {
+        let bundle_path = format!("bins/{triple}/serve");
+        match source {
+            ServeBinSource::Local(bin) => files.push((bundle_path, bin.clone())),
+            ServeBinSource::Pinned(hash) => pinned.push((bundle_path, hash.clone())),
+        }
     }
     for (bin_name, triple, bin) in sidecar_bins {
         // `serve` is the runtime's own reserved name — a sidecar claiming it
@@ -219,7 +271,25 @@ pub fn assemble_self_bundle_with(
         files.push((format!("bins/{triple}/{bin_name}"), bin.clone()));
     }
     files.sort();
-    assemble_bundle(dest, name, BundleRuntime::SelfContained, &files)
+    let mut manifest = assemble_bundle(
+        dest,
+        name,
+        BundleRuntime::SelfContained { built_against },
+        &files,
+    )?;
+    if !pinned.is_empty() {
+        for (path, hash) in pinned {
+            manifest.content.insert(path, hash);
+        }
+        // assemble_bundle already wrote manifest.toml without the pinned
+        // entries (they never went through its file loop) — rewrite it now
+        // that content carries them, since the manifest object on disk must
+        // match what publish_bundle reads.
+        let toml = manifest.to_toml_string()?;
+        fs::write(dest.join("manifest.toml"), toml)
+            .map_err(|e| io(format!("writing {}", dest.join("manifest.toml").display()), e))?;
+    }
+    Ok(manifest)
 }
 
 /// Stage the project-root config files a served bundle carries alongside its
@@ -567,13 +637,96 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(manifest.runtime, BundleRuntime::SelfContained));
+        assert!(matches!(manifest.runtime, BundleRuntime::SelfContained { built_against: None }));
         assert!(manifest
             .content
             .contains_key("bins/x86_64-unknown-linux-musl/serve"));
         assert!(manifest.content.contains_key("app/dist/index.html"));
         // The wire form is what kamaji matches on to skip runtime resolution.
         assert_eq!(manifest.runtime.as_wire(), "self");
+    }
+
+    /// R746-F5: a `Pinned` serve bin costs no local read — the source path
+    /// doesn't even need to exist — and the recorded hash lands verbatim in
+    /// the manifest, with `built_against` carrying the reuse contract.
+    #[test]
+    fn assemble_self_bundle_with_pins_a_serve_bin_by_digest() {
+        let project = TempDir::new().unwrap();
+        let out_dir = project.path().join("dist");
+        let dest = TempDir::new().unwrap();
+        write(&out_dir.join("index.html"), b"<html>");
+        let pinned_hash = BundleHash::of(b"a previously published serve binary");
+
+        let manifest = assemble_self_bundle_with(
+            dest.path(),
+            "yah-marketing",
+            project.path(),
+            &out_dir,
+            &[(
+                "x86_64-unknown-linux-musl".to_string(),
+                ServeBinSource::Pinned(pinned_hash.clone()),
+            )],
+            &[],
+            Some("fp-abc123".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.content.get("bins/x86_64-unknown-linux-musl/serve"),
+            Some(&pinned_hash)
+        );
+        // No bytes were ever copied in for a pinned entry.
+        assert!(!dest.path().join("bins/x86_64-unknown-linux-musl/serve").exists());
+        assert_eq!(
+            manifest.runtime,
+            BundleRuntime::SelfContained {
+                built_against: Some("fp-abc123".to_string())
+            }
+        );
+        // manifest.toml on disk carries the pinned entry too (it's rewritten
+        // after assemble_bundle's first pass, which never saw it).
+        let text = fs::read_to_string(dest.path().join("manifest.toml")).unwrap();
+        assert_eq!(BundleManifest::from_toml_str(&text).unwrap(), manifest);
+    }
+
+    /// A bundle can mix a pinned triple with a freshly built one — the common
+    /// case when only some triples' fingerprints still match.
+    #[test]
+    fn assemble_self_bundle_with_mixes_pinned_and_local_bins() {
+        let project = TempDir::new().unwrap();
+        let out_dir = project.path().join("dist");
+        let dest = TempDir::new().unwrap();
+        let local_bin = project.path().join("serve-aarch64");
+        write(&out_dir.join("index.html"), b"<html>");
+        write(&local_bin, b"\x7fELF-aarch64");
+        let pinned_hash = BundleHash::of(b"already published x86_64 serve");
+
+        let manifest = assemble_self_bundle_with(
+            dest.path(),
+            "yah-marketing",
+            project.path(),
+            &out_dir,
+            &[
+                (
+                    "x86_64-unknown-linux-musl".to_string(),
+                    ServeBinSource::Pinned(pinned_hash.clone()),
+                ),
+                (
+                    "aarch64-unknown-linux-musl".to_string(),
+                    ServeBinSource::Local(local_bin),
+                ),
+            ],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.content.get("bins/x86_64-unknown-linux-musl/serve"),
+            Some(&pinned_hash)
+        );
+        assert!(dest.path().join("bins/aarch64-unknown-linux-musl/serve").exists());
+        assert!(!dest.path().join("bins/x86_64-unknown-linux-musl/serve").exists());
     }
 
     /// R330-F31: a sidecar bin lands at `bins/<triple>/<name>` next to `serve`,
@@ -595,12 +748,16 @@ mod tests {
             "yah-marketing",
             project.path(),
             &out_dir,
-            &[("x86_64-unknown-linux-musl".to_string(), serve)],
+            &[(
+                "x86_64-unknown-linux-musl".to_string(),
+                ServeBinSource::Local(serve),
+            )],
             &[(
                 "almanac-feed".to_string(),
                 "x86_64-unknown-linux-musl".to_string(),
                 feed,
             )],
+            None,
         )
         .unwrap();
 
@@ -634,6 +791,7 @@ mod tests {
                 "x86_64-unknown-linux-musl".to_string(),
                 bin,
             )],
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("runtime's own"), "got {err}");
@@ -663,6 +821,7 @@ mod tests {
                 "x86_64-unknown-linux-musl".to_string(),
                 feed,
             )],
+            None,
         )
         .unwrap();
 
@@ -685,7 +844,7 @@ mod tests {
             "bins/x86_64-unknown-linux-musl/serve".to_string(),
             src.path().join("serve"),
         )];
-        assemble_bundle(dest.path(), "app", BundleRuntime::SelfContained, &files).unwrap();
+        assemble_bundle(dest.path(), "app", BundleRuntime::self_contained(), &files).unwrap();
 
         let mode = fs::metadata(dest.path().join("bins/x86_64-unknown-linux-musl/serve"))
             .unwrap()

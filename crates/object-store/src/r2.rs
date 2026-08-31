@@ -24,6 +24,8 @@
 //! @yah:next("Start with the SigV4 child: it is a correctness bug that fails closed but silently constrains every key namespace we can use. The bucket-delete child is additive and can follow.")
 //! @yah:gotcha("The SigV4 defect is why cr.yah.dev stores OCI digests as sha256/<hex> instead of the natural sha256:<hex>. That workaround is load-bearing in two files that must stay in lockstep (app/yah/cli/src/cr.rs digest_key, app/yah/workers/yah-cr/src/index.ts digestKey). If the signing bug is fixed, those can be simplified — but only together, and only with a migration for keys already written.")
 //! @arch:see(.yah/docs/working/W175-per-publisher-prefix.md)
+//! @yah:handoff("Both children fixed and in review. Along the way two further latent defects in the same shared object-store code were found and fixed in-pass, both invisible to every existing test: (1) ObjectStore::delete signed DELETE with sign_s3_empty_body and so 403'd against R2 from the day it landed — which also means `yah cloud service prune` (static_asset_prune.rs) has never reclaimed anything; (2) the ListObjectsV2 parser returned raw XML text, so a key holding & came back as &amp; — harmless before, because such keys couldn't be written, and a broken round-trip the moment B1 made them writable.")
+//! @yah:gotcha("2026-08-25: the SigV4 defect is FIXED (R630-B1, in review), so the sha256/<hex> constraint this gotcha describes is lifted — but the workaround was deliberately left in place. Simplifying digest_key / digestKey to the natural sha256:<hex> means rewriting every blob key already in yah-cr-cache: a live-data migration on a running registry, operator-gated, not a drive-by. The two files still must stay in lockstep.")
 
 use std::time::Duration;
 
@@ -34,8 +36,8 @@ use reqwest::StatusCode;
 use sha2::{Digest, Sha256};
 
 use local_driver::s3_sign::{
-    sign_s3_empty_body, sign_s3_get_with_query, sign_s3_no_body, sign_s3_put_object,
-    sign_s3_put_object_with, S3PutOptions,
+    sign_s3_get_with_query, sign_s3_no_body, sign_s3_put_object, sign_s3_put_object_with,
+    uri_encode_key, S3PutOptions,
 };
 
 use crate::{Error, ObjectStore, Precondition};
@@ -221,8 +223,14 @@ impl R2ObjectStore {
         }
     }
 
+    /// R630-B1: the key is AWS-`UriEncode`d here, at the one place a key becomes
+    /// a URL. Doing it here rather than in the signer is what makes the wire
+    /// path and the signed path the same bytes — see [`uri_encode_key`]. Before
+    /// this, a key holding `:` (an OCI digest `sha256:<hex>`, a timestamp) went
+    /// out raw, R2 canonicalized it per spec, and every request 403'd
+    /// `SignatureDoesNotMatch`.
     fn object_url(&self, key: &str) -> String {
-        format!("{}/{}/{}", self.endpoint(), self.bucket, key)
+        format!("{}/{}/{}", self.endpoint(), self.bucket, uri_encode_key(key))
     }
 
     fn bucket_url(&self) -> String {
@@ -280,6 +288,10 @@ fn io_err(ctx: &str, e: impl std::fmt::Display) -> Error {
 }
 
 impl ObjectStore for R2ObjectStore {
+    fn locate(&self, key: &str) -> String {
+        self.object_url(key)
+    }
+
     fn put(&self, key: &str, data: Vec<u8>) -> Result<(), Error> {
         self.put_inner(key, data, None)
     }
@@ -352,9 +364,17 @@ impl ObjectStore for R2ObjectStore {
 
     fn delete(&self, key: &str) -> Result<(), Error> {
         let url = self.object_url(key);
-        let headers = sign_s3_empty_body(
+        // R630-F2: DELETE is body-less, so it signs like GET/HEAD and NOT with
+        // `sign_s3_empty_body` — reqwest strips the `content-length: 0` that
+        // signer puts in the canonical headers, R2 recomputes a different
+        // signature, and every DELETE comes back 403 SignatureDoesNotMatch.
+        // This code had never been run against live R2 (the trait tests use the
+        // in-memory store), so `ObjectStore::delete` was 100% broken on R2 from
+        // the day it landed. Confirmed live 2026-08-25, before and after.
+        let headers = sign_s3_no_body(
             "DELETE",
             &url,
+            "",
             R2_REGION,
             &self.access_key,
             &self.secret_key,
@@ -584,8 +604,11 @@ fn status_err(verb: &str, key: &str, status: StatusCode, body: Option<String>) -
 /// inside the body. If R2 ever changes the element shape (it won't — it's
 /// S3-compat), the integration test catches it.
 fn parse_list_v2(body: &str) -> (Vec<String>, Option<String>) {
-    let keys = extract_all_tags(body, "Key");
-    let next = extract_first_tag(body, "NextContinuationToken");
+    let keys = extract_all_tags(body, "Key")
+        .iter()
+        .map(|k| decode_xml_entities(k))
+        .collect();
+    let next = extract_first_text(body, "NextContinuationToken");
     let truncated = extract_first_tag(body, "IsTruncated")
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -603,13 +626,13 @@ fn parse_list_v2_detailed(body: &str) -> (Vec<ObjectMeta>, Option<String>) {
     let entries = blocks
         .into_iter()
         .filter_map(|block| {
-            let key = extract_first_tag(&block, "Key")?;
+            let key = extract_first_text(&block, "Key")?;
             let size = extract_first_tag(&block, "Size")?.trim().parse::<u64>().ok()?;
-            let last_modified = extract_first_tag(&block, "LastModified")?;
+            let last_modified = extract_first_text(&block, "LastModified")?;
             Some(ObjectMeta { key, size, last_modified })
         })
         .collect();
-    let next = extract_first_tag(body, "NextContinuationToken");
+    let next = extract_first_text(body, "NextContinuationToken");
     let truncated = extract_first_tag(body, "IsTruncated")
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -635,6 +658,72 @@ fn extract_all_tags(body: &str, tag: &str) -> Vec<String> {
 
 fn extract_first_tag(body: &str, tag: &str) -> Option<String> {
     extract_all_tags(body, tag).into_iter().next()
+}
+
+/// Like [`extract_first_tag`] but for a LEAF element, whose text is XML-escaped.
+///
+/// Never use this on a container like `<Contents>` — decoding a block that
+/// still holds child tags would corrupt any `&amp;` that belongs to a nested
+/// value before the child tag is even extracted.
+fn extract_first_text(body: &str, tag: &str) -> Option<String> {
+    extract_first_tag(body, tag).map(|raw| decode_xml_entities(&raw))
+}
+
+/// Decode the XML 1.0 predefined entities plus numeric character references.
+///
+/// R630-B1 fallout: object keys go out on the wire percent-encoded but come
+/// back from `ListObjectsV2` as XML *text*, so a key holding `&` arrives as
+/// `&amp;` and one holding `<` as `&lt;`. Before the SigV4 fix those keys could
+/// not be written at all (they 403'd), so the raw-text read was never wrong in
+/// practice; now that they can be written, `list_prefix` would hand back a key
+/// that no subsequent `get`/`head`/`delete` can resolve. S3 also emits numeric
+/// references (`&#13;`) for control characters, which are legal in a key.
+///
+/// An unrecognized `&…` sequence is passed through verbatim rather than
+/// dropped — a literal `&` in a document that isn't escaping anything is not
+/// something to silently eat.
+fn decode_xml_entities(raw: &str) -> String {
+    if !raw.contains('&') {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        let Some(semi) = tail.find(';').filter(|&i| i <= 10) else {
+            out.push('&');
+            rest = &tail[1..];
+            continue;
+        };
+        let entity = &tail[1..semi];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity
+                .strip_prefix('#')
+                .and_then(|n| match n.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => n.parse::<u32>().ok(),
+                })
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &tail[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -755,6 +844,81 @@ mod tests {
         );
     }
 
+    /// R630-B1, the property the whole fix rests on: the bytes on the wire and
+    /// the bytes in the SigV4 canonical request are the SAME bytes. Every other
+    /// test here stops at a `String` or a `HeaderMap`; only this one can catch
+    /// reqwest re-encoding (or decoding) the path between `object_url` and the
+    /// socket, which would put the signature back out of sync with the request
+    /// and give exactly the 403 this ticket is about.
+    #[test]
+    fn a_colon_key_goes_on_the_wire_percent_encoded() {
+        let (endpoint, server) = one_shot_http();
+        let store = R2ObjectStore::new("acct", "yah-cr", "AK", "SK")
+            .unwrap()
+            .with_endpoint(endpoint);
+
+        store
+            .put("blobs/sha256:deadbeef", b"layer".to_vec())
+            .unwrap();
+
+        let head = server.join().unwrap();
+        let request_line = head.lines().next().unwrap();
+        assert_eq!(
+            request_line, "PUT /yah-cr/blobs/sha256%3Adeadbeef HTTP/1.1",
+            "full head: {head}"
+        );
+        // Uppercase hex specifically — R2 canonicalizes with uppercase, so a
+        // lowercase `%3a` on the wire signs differently from what it computes.
+        assert!(!request_line.contains("%3a"), "{request_line}");
+    }
+
+    /// And the regression half on the wire: an ordinary key must reach the
+    /// socket byte-identical to before the encoding was introduced.
+    #[test]
+    fn an_unreserved_key_reaches_the_wire_unchanged() {
+        let (endpoint, server) = one_shot_http();
+        let store = R2ObjectStore::new("acct", "yah-dev", "AK", "SK")
+            .unwrap()
+            .with_endpoint(endpoint);
+
+        store
+            .put("yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz", b"x".to_vec())
+            .unwrap();
+
+        let head = server.join().unwrap();
+        assert_eq!(
+            head.lines().next().unwrap(),
+            "PUT /yah-dev/yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz HTTP/1.1",
+            "full head: {head}"
+        );
+    }
+
+    /// R630-F2. `delete` signed with `sign_s3_empty_body` from the day it
+    /// landed, which puts `content-length: 0` inside the signature — and
+    /// reqwest strips that header off a body-less request, so R2 recomputed a
+    /// different canonical request and answered 403 for EVERY delete. The
+    /// in-memory `delete_is_idempotent` trait test passed throughout, because
+    /// it never touches this code. Assert against the socket instead.
+    #[test]
+    fn delete_signs_without_content_length_and_sends_none() {
+        let (endpoint, server) = one_shot_http();
+        let store = R2ObjectStore::new("acct", "yah-dev", "AK", "SK")
+            .unwrap()
+            .with_endpoint(endpoint);
+
+        store.delete("some/blob.bin").unwrap();
+
+        let head = server.join().unwrap().to_lowercase();
+        assert!(head.starts_with("delete /yah-dev/some/blob.bin "), "{head}");
+        assert!(
+            head.contains("signedheaders=host;x-amz-content-sha256;x-amz-date"),
+            "content-length must NOT be signed on a body-less DELETE: {head}"
+        );
+        // And the header genuinely isn't on the wire — which is the whole
+        // reason signing it was fatal.
+        assert!(!head.contains("content-length"), "{head}");
+    }
+
     /// The other half: a plain `put` must still send no directive at all. If it
     /// quietly gained a default, versioned release bytes would start carrying
     /// whatever that default was.
@@ -857,6 +1021,75 @@ mod tests {
             s.object_url("yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz"),
             "https://acct.r2.cloudflarestorage.com/b/yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz"
         );
+    }
+
+    /// R630-B1 fallout. A key holding `&` could not be written before the SigV4
+    /// fix (it 403'd like every other non-unreserved key), so the raw-XML read
+    /// was never observably wrong. Now that it CAN be written, a `list_prefix`
+    /// that hands back `a&amp;b` names an object no `get`/`head`/`delete` can
+    /// resolve — the round-trip would break at the far end instead of the near
+    /// one.
+    #[test]
+    fn list_keys_are_xml_decoded() {
+        let body = "<ListBucketResult>\
+            <Contents><Key>a&amp;b.json</Key><Size>1</Size><LastModified>t</LastModified></Contents>\
+            <Contents><Key>x&lt;y&gt;z</Key><Size>2</Size><LastModified>t</LastModified></Contents>\
+            <Contents><Key>q&quot;r&apos;s</Key><Size>3</Size><LastModified>t</LastModified></Contents>\
+            <Contents><Key>n&#13;m&#x41;</Key><Size>4</Size><LastModified>t</LastModified></Contents>\
+            <IsTruncated>false</IsTruncated></ListBucketResult>";
+        let (keys, next) = parse_list_v2(body);
+        assert_eq!(keys, vec!["a&b.json", "x<y>z", "q\"r's", "n\rmA"]);
+        assert!(next.is_none());
+        // The detailed form shares the decode, and its `<Contents>` block walk
+        // must still see the child tags — decoding the block first would break it.
+        let (entries, _) = parse_list_v2_detailed(body);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].key, "a&b.json");
+        assert_eq!(entries[0].size, 1);
+    }
+
+    /// A lone `&` that isn't opening an entity is passed through, not eaten.
+    #[test]
+    fn xml_decode_passes_through_a_non_entity_ampersand() {
+        assert_eq!(decode_xml_entities("a & b"), "a & b");
+        assert_eq!(decode_xml_entities("&notanentity;"), "&notanentity;");
+        assert_eq!(decode_xml_entities("plain/key.json"), "plain/key.json");
+        assert_eq!(decode_xml_entities("&amp;&amp;"), "&&");
+    }
+
+    /// R630-B1. The key becomes a URL exactly here, so this is the one place
+    /// the AWS encoding can be applied such that the wire path and the SigV4
+    /// canonical path agree. A `sha256:<hex>` OCI digest is the key shape that
+    /// forced the issue — cr.yah.dev writes `sha256/<hex>` today purely to dodge
+    /// it (see the R630 relay gotcha).
+    #[test]
+    fn object_url_encodes_a_colon_in_the_key() {
+        let s = R2ObjectStore::new("acct", "yah-cr", "AK", "SK").unwrap();
+        assert_eq!(
+            s.object_url("blobs/sha256:deadbeef"),
+            "https://acct.r2.cloudflarestorage.com/yah-cr/blobs/sha256%3Adeadbeef"
+        );
+        // `locate` shares the choke point, so a caller handed the URL for a
+        // direct fetch gets the encoded form too.
+        assert_eq!(s.locate("blobs/sha256:deadbeef"), s.object_url("blobs/sha256:deadbeef"));
+    }
+
+    /// Regression guard: today's keys must produce byte-identical URLs, or the
+    /// fix for the colon case silently 403s everything that already works.
+    #[test]
+    fn object_url_leaves_unreserved_keys_untouched() {
+        let s = R2ObjectStore::new("acct", "b", "AK", "SK").unwrap();
+        for key in [
+            "k",
+            "yah/index.json",
+            "yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz",
+            "releases/v1.2.3-rc.1/yah_1.2.3_aarch64.dmg",
+        ] {
+            assert_eq!(
+                s.object_url(key),
+                format!("https://acct.r2.cloudflarestorage.com/b/{key}")
+            );
+        }
     }
 
     #[test]

@@ -471,6 +471,13 @@ pub trait ValidationContext {
 
     /// True when `machine_id` has sufficient remaining capacity to host the
     /// given spec's resource requirements.
+    ///
+    /// Implementors: read memory via [`WorkloadSpec::memory_request_mb`], not
+    /// `spec.resources.memory_mb`. The latter is a cgroup ceiling, and using
+    /// it as a capacity floor is what made every build-worker smaller than
+    /// `for_forge`'s 32 GiB ceiling unschedulable in `admit_workload`. Only a
+    /// test implementation of this trait exists today, so the bug is not live
+    /// here — this note is to keep it from arriving with the first real one.
     fn capacity_for(&self, spec: &WorkloadSpec, machine_id: &MachineId) -> Result<bool, ContextError>;
 }
 

@@ -161,6 +161,20 @@ pub trait ObjectStore: Send + Sync {
     fn etag(&self, _key: &str) -> Result<Option<String>, Error> {
         Err(Error::Backend("etag not supported by this backend".into()))
     }
+
+    /// Where `key` lives, in a form an operator can act on — a URL for a remote
+    /// backend, an opaque descriptor otherwise (R746-F1).
+    ///
+    /// A `Result::Err` from a store already carries *what* failed; this carries
+    /// *where it looked*, which is the half a caller cannot reconstruct because
+    /// it holds only a `&dyn ObjectStore` and the origin is private to the impl.
+    /// A node reporting "no runtime asset for mesofact/0.8.20" is a shrug; one
+    /// reporting the URL it GET'd is a curl away from a diagnosis. The default
+    /// returns the bare key, so a backend that has no meaningful location (the
+    /// in-memory test double) says nothing untrue.
+    fn locate(&self, key: &str) -> String {
+        key.to_string()
+    }
 }
 
 /// ETag for an object's bytes. S3/R2 return the quoted hex MD5 of the body for

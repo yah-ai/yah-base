@@ -169,11 +169,59 @@ fn round_trip_full_spec_through_postcard() {
 /// too — this is byte-for-byte what yubaba sends kamaji over the UDS.
 #[test]
 fn workload_container_round_trips_through_postcard() {
-    let original = Workload::Container(full_spec());
+    let original = Workload::container(full_spec());
     let bytes = postcard::to_stdvec(&original).expect("postcard serialize");
     let decoded: Workload =
         postcard::from_bytes(&bytes).expect("postcard deserialize (R590-B3 regression)");
     assert_eq!(original, decoded, "Workload::Container did not survive postcard");
+}
+
+/// R783-F1 wire-compat gate: splitting `Workload::Container`'s payload into
+/// [`ContainerManifest`] must not move a single byte on the kamaji UDS.
+///
+/// A round-trip alone cannot prove that — it would still pass if both halves
+/// changed together. So assert the encoding directly: postcard writes an
+/// external tag as the varint variant index (`Container` is index 1) followed
+/// by the payload, so the frame must be exactly `[1] ++ postcard(WorkloadSpec)`
+/// — which is what it was before the manifest enum existed.
+#[test]
+fn container_postcard_frame_is_the_variant_index_then_the_bare_spec() {
+    let spec = full_spec();
+    let enveloped = postcard::to_stdvec(&Workload::container(spec.clone())).expect("envelope");
+    let bare = postcard::to_stdvec(&spec).expect("bare spec");
+
+    let mut expected = vec![1u8];
+    expected.extend_from_slice(&bare);
+    assert_eq!(
+        enveloped, expected,
+        "the container wire frame moved — kamaji decodes this positionally"
+    );
+}
+
+/// The other half of the split (W324 §5): a build recipe names an image tag,
+/// not a digest, so it must be *refused* on the way to kamaji rather than
+/// encoded as something the far side cannot pull.
+#[test]
+fn container_recipe_is_refused_by_postcard_rather_than_encoded() {
+    let recipe = Workload::Container(ContainerManifest::Recipe(ContainerBuild {
+        schema_version: SchemaVersion::V1,
+        name: "yah-cloud-admin".into(),
+        build: ContainerBuildStep {
+            dockerfile: "Dockerfile".into(),
+            context: Some(".".into()),
+            image: Some("yah-local/yah-cloud-admin:dev".into()),
+        },
+        run: ContainerRunConfig::default(),
+    }));
+
+    // postcard's `Error` discards the custom message, so the assertion is on
+    // the refusal itself; the human-readable half below is where the *reason*
+    // is legible.
+    postcard::to_stdvec(&recipe).expect_err("a recipe must not reach the wire");
+
+    let json = serde_json::to_string(&recipe).expect("a recipe is still valid on disk");
+    assert!(json.contains("\"kind\":\"container\""), "{json}");
+    assert!(json.contains("yah-local/yah-cloud-admin:dev"), "{json}");
 }
 
 /// The narrowest unit: the untagged Deserialize itself, exercised directly on
@@ -452,4 +500,77 @@ fn admits_peer_enforces_deny_by_default_across_tenants() {
         granted.admits_peer(&ss, &ss, &ns, &runner, &private),
         "a CrossTenant-only allow_from still admits all same-tenant peers"
     );
+}
+
+/// R838-B1: a `mesofact-static` manifest that declares `[build]` with an
+/// `out_dir` but no `command` must load.
+///
+/// This is the shape `mesofact new` scaffolds (its template's own header says
+/// the omission is deliberate: the in-process pipeline builds `out_dir` with
+/// no third binary, no package manager and no Node). While `BuildConfig.
+/// command` was a required `String`, every scaffolded project shipped a
+/// manifest the envelope could not read — which is what
+/// `xtask::workload_envelope` caught.
+#[test]
+fn mesofact_static_build_table_without_a_command_parses_as_none() {
+    let src = r#"
+schema_version = 1
+kind = "mesofact-static"
+routes = "./mesofact.routes.ts"
+
+[build]
+out_dir = "dist"
+"#;
+    let workload: Workload = toml::from_str(src).expect("scaffold manifest must load");
+    let Workload::MesofactStatic(ms) = workload else {
+        panic!("expected MesofactStatic");
+    };
+    assert_eq!(ms.build.command, None, "absent command is None, not empty");
+    assert_eq!(ms.build.out_dir, PathBuf::from("dist"));
+    assert_eq!(ms.routes, PathBuf::from("./mesofact.routes.ts"));
+}
+
+/// The `deny_unknown_fields` guard on `BuildConfig` (R658-B1) still bites —
+/// making `command` optional must not have made the table permissive.
+#[test]
+fn an_unknown_build_key_is_still_refused_now_that_command_is_optional() {
+    let src = r#"
+schema_version = 1
+kind = "mesofact-static"
+
+[build]
+out_dir = "dist"
+routes = "./mesofact.routes.ts"
+"#;
+    let err = toml::from_str::<Workload>(src).expect_err("build.routes must not be swallowed");
+    let msg = err.to_string();
+    assert!(msg.contains("routes"), "error must name the stray key; got: {msg}");
+}
+
+/// Both arms of the now-optional `command` survive the postcard kamaji wire.
+/// `Option<String>` writes a leading tag byte the bare `String` did not have,
+/// so this pins that both the present and absent forms decode back to
+/// themselves rather than one of them shifting into the next field.
+#[test]
+fn mesofact_static_build_command_round_trips_through_postcard_both_ways() {
+    let build = |command: Option<&str>| MesofactStaticWorkload {
+        schema_version: SchemaVersion::V1,
+        build: BuildConfig {
+            command: command.map(str::to_string),
+            out_dir: PathBuf::from("dist"),
+            render_command: None,
+        },
+        routes: PathBuf::from("./mesofact.routes.ts"),
+        build_mode: BuildMode::default(),
+        ssr_runtime: None,
+        serve_bundle: None,
+        revalidate_receiver: None,
+    };
+
+    for command in [None, Some("bun run build")] {
+        let original = Workload::MesofactStatic(build(command));
+        let bytes = postcard::to_allocvec(&original).expect("encode");
+        let decoded: Workload = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, original, "command = {command:?}");
+    }
 }

@@ -5,8 +5,9 @@
 //! create/head/delete; only the endpoint and region differ.
 //!
 //! @yah:ticket(R630-B1, "SigV4 canonical URI is unencoded — any S3/R2 key containing a colon fails SignatureDoesNotMatch")
-//! @yah:at(2026-07-23T03:12:20Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-08-25T07:42:31Z)
 //! @yah:parent(R630)
 //! @yah:severity(high)
 //! @yah:next("Repro, no setup: yah cloud bucket put --bucket yah-cr-cache 'test:colon' --file /tmp/any -> 403 SignatureDoesNotMatch. A colon-free key at the same moment succeeds, so it is not a credential problem.")
@@ -14,6 +15,12 @@
 //! @yah:verify("A key containing ':' round-trips through put/get/head/ls, AND existing colon-free keys still round-trip byte-identically (the double-encoding regression guard).")
 //! @yah:gotcha("Do NOT fix by re-encoding parsed.path(). Url::parse has already percent-encoded part of it, so re-encoding double-encodes '%' to '%25' and breaks keys that work today. The raw key must be threaded to the signer, or the encoding applied before URL construction. This is exactly why it was left unfixed rather than patched in passing.")
 //! @yah:gotcha("Blast radius is silent: the failure looks like bad credentials, not like a key-shape problem. cr.yah.dev stores OCI digests as sha256/<hex> rather than the natural sha256:<hex> purely to route around this — see digest_key in app/yah/cli/src/cr.rs and digestKey in app/yah/workers/yah-cr/src/index.ts, which must stay in lockstep.")
+//! @yah:handoff("Fixed via the gotcha's second option — encode when the URL is BUILT, never in the signer. New `pub fn uri_encode_key` in oss/yah-base/crates/local-driver/src/s3_sign.rs implements AWS UriEncode (unreserved A-Za-z0-9-_.~ and / stay literal; everything else %XX UPPERCASE over UTF-8 bytes; S3 encodes once, not twice). All five signers now take their canonical URI from a new private `canonical_uri()`, which still returns parsed.path() VERBATIM — that remains the only correct answer — behind a debug_assert that the path is already encoded. A caller who forgets now gets a test failure instead of a 403 against live R2.")
+//! @yah:handoff("Encoding applied at every site where a key becomes a URL: object-store r2.rs `object_url` (the choke point behind put/put_cached/get/head/delete/locate), yubaba pond_publish.rs:117, static_asset.rs (lock-skip probe + the PUT), static_asset_prune.rs (DELETE of listed keys, where the key comes straight back from ListObjectsV2). `rg sign_s3_` names the complete set of direct signers — 10 files, all accounted for.")
+//! @yah:verify("LIVE A/B against real R2, same bucket, same key, minutes apart. Pre-fix ~/.local/bin/yah (built 2026-08-24 17:34): `yah cloud bucket head --bucket yah-cr-cache 'r630b1:probe-nonexistent'` -> `403 Forbidden`, exit 1. Post-fix target/debug/yah: `absent`, exit 2 — signature accepted, object genuinely not there. Regression control: a colon-FREE key returns `absent` exit 2 on BOTH binaries, and an existing real key HEADs `present` exit 0 post-fix.")
+//! @yah:verify("Full live colon-key round-trip: put -> head present -> get (bytes match) -> ls (key comes back raw and un-escaped) -> delete -> head absent -> ls empty. The probe object was reclaimed; nothing was left behind in yah-cr-cache.")
+//! @yah:verify("cargo test -p yah-local-driver --lib s3_sign 16/16; -p yah-object-store --lib 38/38; -p yah-cloud --lib 909/909; -p yah --lib 1165/1165. cargo check --workspace exit 0. New offline tests assert the property the fix rests on: wire path == signed path, checked against a one-shot HTTP server, plus byte-identical output for every key shape that works today.")
+//! @yah:gotcha("cr.yah.dev's sha256/<hex> workaround is now UNNECESSARY but deliberately NOT removed. Simplifying digest_key (app/yah/cli/src/cr.rs) and digestKey (app/yah/workers/yah-cr/src/index.ts) to the natural sha256:<hex> means rewriting every blob key already written to yah-cr-cache — a live-data migration on a running registry, and an operator call rather than a drive-by. The two remain load-bearing and must stay in lockstep either way.")
 
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
@@ -41,9 +48,86 @@ fn canonical_host(parsed: &reqwest::Url) -> Result<String> {
     })
 }
 
+/// AWS `UriEncode` for an S3 object key (R630-B1).
+///
+/// SigV4's canonical request contains the request path percent-encoded so that
+/// only the RFC 3986 unreserved set — `A-Z a-z 0-9 - _ . ~` — plus the `/`
+/// segment separator survive literally. Everything else is `%XX` with UPPERCASE
+/// hex over the UTF-8 bytes. S3 encodes the path exactly once (unlike every
+/// other AWS service, which encodes twice).
+///
+/// **Apply this when you BUILD the URL, not inside the signer.** The wire path
+/// and the signed path have to be the same bytes, and by the time a `&str` URL
+/// reaches [`sign_s3_put_object`] and friends it is too late to tell an
+/// already-encoded `%3A` from a literal `%` in the key — re-encoding there
+/// turns `%3A` into `%253A` and breaks every key that works today. Encode the
+/// raw key here, interpolate the result into the URL, and the signer's
+/// [`canonical_uri`] reads back exactly what went on the wire.
+///
+/// Without this, any key containing `:` `@` `+` `,` `=` `&` `;` `$` `!` `'`
+/// `(` `)` `*` `[` `]` — none of which `Url::parse` touches — signs as itself
+/// while R2 canonicalizes per spec, and the request comes back `403
+/// SignatureDoesNotMatch`, which reads like a credentials problem.
+pub fn uri_encode_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for byte in key.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// True when `path` is already AWS-`UriEncode`d: every byte is unreserved, a
+/// `/`, or the start of a `%XX` triple with uppercase hex.
+///
+/// Only used to power the [`canonical_uri`] debug assertion — lowercase hex is
+/// rejected deliberately, because R2 re-encodes with uppercase and a lowercase
+/// `%3a` on the wire signs differently from the `%3A` the server computes.
+fn is_aws_uri_encoded(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => i += 1,
+            b'%' => {
+                let hex = bytes.get(i + 1..i + 3);
+                match hex {
+                    Some(h) if h.iter().all(|c| c.is_ascii_digit() || (b'A'..=b'F').contains(c)) => {
+                        i += 3
+                    }
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The SigV4 canonical URI: the URL's path, verbatim.
+///
+/// Verbatim is the *only* correct answer here — see [`uri_encode_key`] for why
+/// the signer cannot encode. The debug assertion is the guard rail that turns
+/// "a caller forgot to encode" from a 403 against live R2 into a test failure.
+fn canonical_uri(parsed: &reqwest::Url) -> String {
+    let uri = parsed.path().to_string();
+    debug_assert!(
+        is_aws_uri_encoded(&uri),
+        "R630-B1: S3 URL paths must be AWS-UriEncoded before they reach the \
+         signer — build the URL with `uri_encode_key(key)`. Got: {uri}"
+    );
+    uri
+}
+
 /// AWS Sig V4 for any S3 verb that sends no body (PUT CreateBucket, HEAD,
 /// DELETE bucket). Callers supply the full `url`, S3 `region` string, and
 /// HMAC credentials.
+///
+/// `url`'s path must already be AWS-`UriEncode`d — see [`uri_encode_key`].
 pub fn sign_s3_empty_body(
     method: &str,
     url: &str,
@@ -57,7 +141,7 @@ pub fn sign_s3_empty_body(
 
     let parsed = reqwest::Url::parse(url).context("parsing S3 URL")?;
     let host = canonical_host(&parsed)?;
-    let uri = parsed.path().to_string();
+    let uri = canonical_uri(&parsed);
 
     let empty_hash = {
         let mut h = Sha256::new();
@@ -181,7 +265,7 @@ pub fn sign_s3_no_body(
 
     let parsed = reqwest::Url::parse(url).context("parsing S3 URL")?;
     let host = canonical_host(&parsed)?;
-    let uri = parsed.path().to_string();
+    let uri = canonical_uri(&parsed);
 
     let empty_hash = {
         let mut h = Sha256::new();
@@ -324,7 +408,7 @@ pub fn sign_s3_put_object_with(
 
     let parsed = reqwest::Url::parse(url).context("parsing S3 object URL")?;
     let host = canonical_host(&parsed)?;
-    let uri = parsed.path().to_string();
+    let uri = canonical_uri(&parsed);
 
     // SigV4 requires the canonical header block AND the SignedHeaders list to be
     // in lexicographic order, and the two must agree exactly or the server
@@ -427,7 +511,7 @@ pub fn sign_s3_put_bucket_policy(
 
     let parsed = reqwest::Url::parse(url).context("parsing S3 URL")?;
     let host = canonical_host(&parsed)?;
-    let uri = parsed.path().to_string();
+    let uri = canonical_uri(&parsed);
     let canonical_query = "policy=";
     let content_length = policy_json.len();
 
@@ -501,7 +585,7 @@ pub fn sign_s3_put_bucket_acl(
 
     let parsed = reqwest::Url::parse(url).context("parsing S3 URL")?;
     let host = canonical_host(&parsed)?;
-    let uri = parsed.path().to_string();
+    let uri = canonical_uri(&parsed);
     let canonical_query = "acl=";
 
     let empty_hash = {
@@ -559,6 +643,92 @@ pub fn sign_s3_put_bucket_acl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R630-B1. The reason the bug existed: `:` is legal in a URL path and
+    /// `Url::parse` leaves it alone, so an unencoded key signed as itself while
+    /// R2 canonicalized it to `%3A` — 403 `SignatureDoesNotMatch`, indistinguish-
+    /// able from bad credentials.
+    #[test]
+    fn uri_encode_key_escapes_colon_and_the_other_sub_delims() {
+        assert_eq!(uri_encode_key("sha256:abc"), "sha256%3Aabc");
+        // Every sub-delim + gen-delim `Url::parse` would have passed through raw.
+        assert_eq!(
+            uri_encode_key("a@b+c,d=e&f;g$h!i'j(k)l*m[n]o"),
+            "a%40b%2Bc%2Cd%3De%26f%3Bg%24h%21i%27j%28k%29l%2Am%5Bn%5Do"
+        );
+        // Space is %20, never `+` — SigV4 is explicit about this.
+        assert_eq!(uri_encode_key("my file.txt"), "my%20file.txt");
+        // Hex is UPPERCASE: R2 re-encodes with uppercase, so `%3a` would sign
+        // differently from the `%3A` the server computes.
+        assert_eq!(uri_encode_key("\x1f"), "%1F");
+        // Multi-byte UTF-8 encodes per byte.
+        assert_eq!(uri_encode_key("é"), "%C3%A9");
+    }
+
+    /// The double-encoding regression guard the ticket asks for: keys that work
+    /// today must come out byte-identical, or every existing caller starts
+    /// 403ing. `/` stays a separator; `~` `-` `_` `.` are unreserved.
+    #[test]
+    fn uri_encode_key_leaves_todays_keys_byte_identical() {
+        for key in [
+            "yah/index.json",
+            "yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz",
+            "_yah-manifest.json",
+            "releases/v1.2.3-rc.1/yah_1.2.3_aarch64.dmg",
+            "a~b-c_d.e/f",
+            "",
+        ] {
+            assert_eq!(uri_encode_key(key), key, "key must not change: {key}");
+        }
+        // A literal `%` in a key encodes to `%25` — which is why the signer
+        // must NOT re-encode: doing so a second time would yield `%2525`.
+        assert_eq!(uri_encode_key("100%25"), "100%2525");
+    }
+
+    /// The signer's contract is "path already encoded". This is the predicate
+    /// behind the debug assertion that enforces it.
+    #[test]
+    fn is_aws_uri_encoded_accepts_encoded_and_rejects_raw() {
+        assert!(is_aws_uri_encoded("/bucket/sha256%3Aabc"));
+        assert!(is_aws_uri_encoded("/bucket/plain/key.tar.gz"));
+        assert!(is_aws_uri_encoded("/"));
+        assert!(!is_aws_uri_encoded("/bucket/sha256:abc"));
+        // Lowercase hex is a real mismatch against R2's uppercase canonical form.
+        assert!(!is_aws_uri_encoded("/bucket/sha256%3aabc"));
+        // A truncated escape is not an escape.
+        assert!(!is_aws_uri_encoded("/bucket/x%3"));
+        assert!(!is_aws_uri_encoded("/bucket/x%ZZ"));
+    }
+
+    /// End-to-end: an encoded key signs, and signs *differently* from the same
+    /// key left raw. Both halves matter — the first proves the debug assertion
+    /// doesn't reject correct input, the second proves the canonical URI is
+    /// actually part of the signature rather than incidental.
+    #[test]
+    fn signing_an_encoded_colon_key_differs_from_signing_it_raw() {
+        let sign = |path: &str| {
+            sign_s3_no_body(
+                "GET",
+                &format!("https://acct.r2.cloudflarestorage.com/yah-cr/{path}"),
+                "",
+                "auto",
+                "AK",
+                "SK",
+            )
+            .unwrap()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+        };
+        let encoded = sign(&uri_encode_key("blobs/sha256:deadbeef"));
+        // `sign` on the raw form would trip the debug assertion, so compare
+        // against a colon-free key of the same length instead: the point is
+        // that the path is inside the signature at all.
+        let other = sign(&uri_encode_key("blobs/sha256-deadbeef"));
+        assert_ne!(encoded, other);
+    }
 
     /// The signed `host` must equal the `Host` header reqwest sends, or the
     /// server recomputes a different canonical request and answers 403

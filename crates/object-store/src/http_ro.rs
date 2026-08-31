@@ -89,6 +89,10 @@ impl HttpReadOnlyObjectStore {
 }
 
 impl ObjectStore for HttpReadOnlyObjectStore {
+    fn locate(&self, key: &str) -> String {
+        self.url(key)
+    }
+
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
         let url = self.url(key);
         let resp = self
