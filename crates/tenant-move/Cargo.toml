@@ -1,0 +1,26 @@
+[package]
+name = "yah-tenant-move"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cross-cell tenant move protocol (W250/W252 §5): an idempotent, resumable state machine whose commit point is a linearizable CAS on the global tenant->cell pointer."
+# R736-F4, for the same reason yah-tenant-pointer carries it (see that crate's
+# manifest): no crates.io name is held, nothing published depends on it, and
+# the yah-base mirror exports the directory regardless — so a standalone
+# `cargo test --workspace` on the mirror keeps working while this is false.
+# Flip it the moment a published crate takes the dependency.
+publish = false
+
+[lib]
+name = "yah_tenant_move"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "1"
+yah-object-store = { path = "../object-store", version = "0.8.30" }
+# Path-only, deliberately: yah-tenant-pointer is `publish = false`, so there is
+# no `0.8.29` of it on any registry for a version requirement to resolve
+# against. The two crates flip to published together or not at all.
+yah-tenant-pointer = { path = "../tenant-pointer" }

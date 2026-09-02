@@ -379,8 +379,9 @@
 //! @yah:gotcha("STALE CLAIM in a neighbouring annotation, disproved but left in place: oss/yubaba/crates/cloud/src/reconciler/mesofact_static.rs:165 (R438-T6) says read_mesofact_build must hand-extract toml::Value subtrees because 'schema_version = 1 (integer) ... the typed envelope rejects'. R546-B7 made SchemaVersion read the bare integer (oss/yah-base/crates/workload-spec/src/version.rs), and the workload_envelope run proves it: the only error reported for the scaffold template was 'missing field command', never schema_version. The subtree reader has other reasons to exist, but that one is gone.")
 //!
 //! @yah:ticket(R658-B3, "mesofact new scaffolds a workload.toml the deploy path cannot execute: BuildConfig.command is required but the template deliberately omits it")
-//! @yah:at(2026-08-30T08:33:45Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-09-02T19:08:17Z)
 //! @yah:parent(R658)
 //! @yah:severity(high)
 //! @yah:next("DECISION REQUIRED, do not guess. oss/mesofact/crates/mesofact/src/cli/new/template/workload.toml (new in ef8bd656) declares kind = mesofact-static with no [build] command, and its own header comment says that is deliberate: 'Left unset, mesofact-dev runs the build pipeline in-process — no third binary, no package manager, no Node.' But BuildConfig.command is a required String (oss/yah-base/crates/workload-spec/src/lib.rs:1428), so the file does not parse through workload_spec::Workload.")
@@ -393,6 +394,11 @@
 //! @yah:next("Option (a) was taken. The open question that made this a decision was already answered by the code: yah cloud bundle build does NOT require a command. app/yah/cli/src/cloud.rs:3368 read_workload_build has always typed it Option<String>; assemble_component_bundle_with_sidecars needs it only under --run-build; deploy_mesofact_bundle refuses None by name at cloud.rs:5841. So no in-process build branch had to be invented: the reconciler skips the build step for None, exactly as it already did for a workload with no workload.toml at all.")
 //! @yah:next("TO CLOSE: re-run cargo test -p xtask --test main --locked -- workload_envelope:: (passes now) and archive. Nothing left to build here.")
 //! @yah:handoff("FIXED BY R838-B1 (same bug, filed twice; R838-B1 is the older ID). BuildConfig.command is now Option<String> in oss/yah-base/crates/workload-spec/src/lib.rs. cargo test -p xtask --tests is 54/54 green including workload_envelope, the gate that was failing.")
+//! @yah:handoff("GENERATED ARTIFACTS CONFIRMED LANDED, which R838-B1's handoff flagged as still-uncommitted and therefore red. Both are now committed and clean against the index (git status --porcelain reports nothing for either): .yah/schema/workload.toml.schema.json carries command with \"default\": null and \"type\": [\"string\",\"null\"] under the BuildConfig object, and packages/yah/workload-spec/index.ts carries `command: string | null` at line 452. The unrelated required-\"command\" at schema line 126 is the Almanac/render struct (lib.rs:1661), which is correctly still a bare String. So scripts/check-schema-drift.sh and scripts/check-workload-spec-ts.sh no longer have anything to fail on for this change.")
+//! @yah:verify("cargo test -p xtask --test main --locked -- workload_envelope:: — 1 passed, 0 failed, 55 filtered out. every_on_disk_workload_toml_parses_through_the_envelope is ok; it was 0 passed / 1 failed with \"missing field command\" when this ticket was filed. This is the exact argv named in the ticket's @yah:verify, and it is the criterion this ticket closes on.")
+//! @yah:gotcha("DISPROVED A CLAIM ON R836-B2 IN PASS and recorded it there. Its COVERAGE NOTE said the failing assertion lives in xtask's lib target which \"neither\" check.toml xtask step reaches, and its second @yah:next asked to widen the guard to include --lib. Measured: `--tests` DOES reach the lib target — running check.toml's own xtask-tests argv produced the 43/1 result above and cargo's footer read \"error: test failed, to rerun pass -p xtask --lib\". So that next step is a no-op and the bar already covers the assertion.")
+//! @yah:cleanup("NOT FIXED, out of this ticket's blast radius, flagged for whoever owns the mesofact_static reconciler: oss/yubaba/crates/cloud/src/reconciler/mesofact_static.rs:240-245 has 13 unused imports (EnvVar, ExposeSpec, ImageRef, MeshExpose, Millis, NamespaceId, ResourceLimits, RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec, NATIVE_IDENTITY_DIGEST). Warnings only, so nothing is blocked. They are pre-existing on committed main (file is clean in the working tree; last moved in committed 9677282b \"mes\", 2026-09-01), NOT introduced by the R838-B1 change and not a live peer's WIP. Worth a look because that many newly-unused imports usually means a block of code was removed, and it is worth confirming that removal was intended rather than collateral.")
+//! @yah:gotcha("CORRECTION to this ticket's own inherited handoff line \"cargo test -p xtask --tests is 54/54 green including workload_envelope\". That was true when R838-B1 wrote it and is NOT true on main as of 2026-09-02. That argv now gives 43 passed / 1 failed, failing in the LIB target on cluster_epochs::tests::the_declaration_records_current_per_input_digests_for_every_axis (\"state_epoch: recorded digest for `rust-file oss/yubaba/crates/yubaba/src/raft/store.rs` is stale\"). That failure is R836-B2, is unrelated to workload.toml, and is deliberately NOT a regenerate-the-artifact case — it is a mixed-operation compatibility call (bump the state_epoch vs re-record the digest) owned by whoever owns the raft store change, so it was correctly left alone here. It matters for reading this ticket because `--tests` carries no --no-fail-fast: that single lib failure aborts the step before the integration binary runs, so workload_envelope is reported as neither passed nor failed rather than green. That is why this ticket was verified with the narrower `--test main -- workload_envelope::`, which isolates the gate this ticket actually owns. check.toml step xtask-tests stays red camp-wide until R836-B2 is answered.")
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -1367,11 +1373,20 @@ pub struct MesofactServeBundle {
     /// port, which a proxy pairs with the workload's mesh IP to get a dialable
     /// address.
     ///
-    /// `None` → kamaji falls back to its node-wide default
-    /// (`KAMAJI_BUNDLE_PORT` / `DEFAULT_BUNDLE_PORT` = 8080), which is the
-    /// pre-R599-F12 behaviour and is only correct while a node hosts one
-    /// bundle. Declaring a port per workload is what lets one node host
-    /// several — that singleton default is the thing it removes.
+    /// `None` → **the supervisor allocates one** (R844-F2), and reports the
+    /// port it bound back to yubaba on the next workload listing, where it
+    /// lands in the service record an ingress upstream is rendered from. This
+    /// is the normal case: a mirror should not have to name a port at all.
+    ///
+    /// It used to mean "fall back to kamaji's node-wide default
+    /// (`KAMAJI_BUNDLE_PORT`, else 8080)", which was a single node-wide slot
+    /// wearing the word *default* — correct only while a node hosted one
+    /// bundle, and a silent collision for the second. R599-F12 added this field
+    /// so a workload could opt out of that; R844-F2 removed the default itself,
+    /// so opting out is no longer something anyone has to remember to do.
+    ///
+    /// Declaring a port still pins it exactly, for a workload that must be
+    /// reachable at a known number.
     ///
     /// No `skip_serializing_if` — see `serve_bundle`'s note: the postcard wire
     /// codec is positional, so an omitted byte shifts every later field.

@@ -36,6 +36,36 @@
 //!
 //! So the group answers *which blast radius*, and the role answers *may it
 //! vote*. Only the second gates a join.
+//!
+//! # Reading a live cluster against these declarations
+//!
+//! Because only the role gates a join, **the declared group and the raft
+//! membership are different sets, and the gap between them is the rule working
+//! rather than drift.** A `non-voter` is never joined, so it is absent from
+//! `/raft/status`'s `members` map *by construction*. us-west-003 declaring
+//! `sovereign_group = "prod"` while appearing nowhere in prod's membership is
+//! the correct and expected observation — it is a prod worker, inside the blast
+//! radius, holding no seat.
+//!
+//! This is written down because the comparison invites a false alarm: the
+//! obvious reading of "declared prod" against a three-node `members` map is
+//! "declared-vs-actual drift", and it is wrong. Group membership was never a
+//! claim about quorum membership. What the two sets share is only the voters.
+//!
+//! The observations that **are** worth an alarm, none of which the above is:
+//!
+//! - a **`voter`** in group G absent from G's raft membership — it was declared
+//!   quorum-eligible and never joined, so either a join failed or the group
+//!   stamp is aspirational;
+//! - a **`non-voter`** *present* in a raft membership — the guarantee is broken,
+//!   which means a join gate was bypassed rather than merely misconfigured;
+//! - a node in a membership whose declared group differs from the cluster's —
+//!   the cross-group join [`join_permitted`] exists to refuse.
+//!
+//! Note also that a node's *running* daemon is the authority on what it
+//! declares, not its TOML: `/raft/status` reporting `sovereign_group: null` on a
+//! box whose file says `prod` means the binary predates the field, so read it as
+//! "this build cannot tell you" rather than as a contradiction.
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +94,12 @@ pub enum SovereignRole {
     /// In the group's blast radius — shares its upgrade cadence, its secrets,
     /// its destruction — but never a quorum seat. Refused by [`join_permitted`]
     /// on either side of a join.
+    ///
+    /// Consequently a node stamped this way is **absent from its group's
+    /// `/raft/status` `members` map, and that absence is correct** — see the
+    /// module docs' "Reading a live cluster" section before reporting it as
+    /// declared-vs-actual drift. A prod worker holding no seat is the whole
+    /// point of the variant.
     NonVoter,
 }
 

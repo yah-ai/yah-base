@@ -27,4 +27,4 @@ serde = { version = "1", features = ["derive"] }
 # operator reads when they need to know which cell owns a tenant.
 toml = "0.8"
 thiserror = "1"
-yah-object-store = { path = "../object-store", version = "0.8.29" }
+yah-object-store = { path = "../object-store", version = "0.8.30" }

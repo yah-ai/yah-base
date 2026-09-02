@@ -236,6 +236,24 @@ fn check_identifier(what: &'static str, value: &str) -> Result<(), PointerError>
     Ok(())
 }
 
+/// Check a tenant identifier against the rule the pointer operations enforce.
+///
+/// Exposed for callers that need to fail *early*: the cross-cell move protocol
+/// (R736-F4) validates its whole plan before it quiesces anything, because
+/// discovering a malformed cell id at the step-5 CAS means the source was
+/// drained and the WAL shipped for a move that could never have committed.
+/// Re-stating the rule in that crate instead would be a rule in two places
+/// with nothing keeping them equal.
+pub fn validate_tenant(tenant: &str) -> Result<(), PointerError> {
+    check_identifier("tenant", tenant)
+}
+
+/// Check a cell identifier against the rule the pointer operations enforce.
+/// See [`validate_tenant`].
+pub fn validate_cell(cell: &str) -> Result<(), PointerError> {
+    check_identifier("cell", cell)
+}
+
 fn encode(record: &PointerRecord) -> Result<Vec<u8>, PointerError> {
     toml::to_string_pretty(record)
         .map(String::into_bytes)
@@ -533,6 +551,18 @@ mod tests {
                 "cell {bad:?} should be refused"
             );
         }
+    }
+
+    #[test]
+    fn the_public_validators_enforce_exactly_what_the_operations_do() {
+        // R736-F4 fails a move plan up front with these rather than restating
+        // the rule; this pins the two to the same answer.
+        for bad in ["", "a/b", "has space", "nul\u{0}byte"] {
+            assert!(validate_tenant(bad).is_err(), "tenant {bad:?}");
+            assert!(validate_cell(bad).is_err(), "cell {bad:?}");
+        }
+        assert!(validate_tenant("noisetable").is_ok());
+        assert!(validate_cell("prod-eu").is_ok());
     }
 
     /// A store whose object changes *between* the ETag read and the body read.
