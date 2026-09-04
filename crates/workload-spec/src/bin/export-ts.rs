@@ -101,6 +101,11 @@ fn main() {
     emit!(AssetEntry);
     emit!(StaticAssetWorkload);
 
+    // R852-F1 — the per-tenant passway. Leaf first: TenantPasswayWorkload
+    // names TenantPasswayTls.
+    emit!(TenantPasswayTls);
+    emit!(TenantPasswayWorkload);
+
     emit!(Workload);
 
     // Anchor the output path to the yah camp root via CARGO_MANIFEST_DIR so the

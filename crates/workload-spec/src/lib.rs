@@ -399,6 +399,26 @@
 //! @yah:gotcha("DISPROVED A CLAIM ON R836-B2 IN PASS and recorded it there. Its COVERAGE NOTE said the failing assertion lives in xtask's lib target which \"neither\" check.toml xtask step reaches, and its second @yah:next asked to widen the guard to include --lib. Measured: `--tests` DOES reach the lib target — running check.toml's own xtask-tests argv produced the 43/1 result above and cargo's footer read \"error: test failed, to rerun pass -p xtask --lib\". So that next step is a no-op and the bar already covers the assertion.")
 //! @yah:cleanup("NOT FIXED, out of this ticket's blast radius, flagged for whoever owns the mesofact_static reconciler: oss/yubaba/crates/cloud/src/reconciler/mesofact_static.rs:240-245 has 13 unused imports (EnvVar, ExposeSpec, ImageRef, MeshExpose, Millis, NamespaceId, ResourceLimits, RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec, NATIVE_IDENTITY_DIGEST). Warnings only, so nothing is blocked. They are pre-existing on committed main (file is clean in the working tree; last moved in committed 9677282b \"mes\", 2026-09-01), NOT introduced by the R838-B1 change and not a live peer's WIP. Worth a look because that many newly-unused imports usually means a block of code was removed, and it is worth confirming that removal was intended rather than collateral.")
 //! @yah:gotcha("CORRECTION to this ticket's own inherited handoff line \"cargo test -p xtask --tests is 54/54 green including workload_envelope\". That was true when R838-B1 wrote it and is NOT true on main as of 2026-09-02. That argv now gives 43 passed / 1 failed, failing in the LIB target on cluster_epochs::tests::the_declaration_records_current_per_input_digests_for_every_axis (\"state_epoch: recorded digest for `rust-file oss/yubaba/crates/yubaba/src/raft/store.rs` is stale\"). That failure is R836-B2, is unrelated to workload.toml, and is deliberately NOT a regenerate-the-artifact case — it is a mixed-operation compatibility call (bump the state_epoch vs re-record the digest) owned by whoever owns the raft store change, so it was correctly left alone here. It matters for reading this ticket because `--tests` carries no --no-fail-fast: that single lib failure aborts the step before the integration binary runs, so workload_envelope is reported as neither passed nor failed rather than green. That is why this ticket was verified with the narrower `--test main -- workload_envelope::`, which isolates the gate this ticket actually owns. check.toml step xtask-tests stays red camp-wide until R836-B2 is answered.")
+//!
+//! @yah:ticket(R844-F17, "Port names are unwritable in every manifest — the declaration surface F15 built the plumbing for")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-09-04T01:29:45Z)
+//! @yah:parent(R844)
+//! @yah:depends_on(R844-F15)
+//! @yah:handoff("LANDED. A manifest can name its ports. `MeshExpose.ports` went from `Vec&lt;u16&gt;` to `Vec&lt;MeshPort&gt;` (oss/yah-base/crates/workload-spec/src/lib.rs) and accepts three spellings that mix freely in one array: a bare number `8080` (unnamed — every manifest written before this), a bare string `\\\"http\\\"` (a name whose number the supervisor picks), and a table `{ name = \\\"http\\\", port = 8080 }` (both stated). Read it with `MeshExpose::numbers()`, `named_numbers()`, `names()`; write the old shape with `MeshExpose::anonymous_ports([..])`. There is deliberately NO conversion back to a plain `Vec&lt;u16&gt;`: a name-only entry has no number yet, and a `Vec&lt;u16&gt;` field could not say that its list is shorter than the one the author wrote.")
+//! @yah:handoff("THE NAMES REACH THE RECORD, which is the only thing that makes this worth the blast radius. `kamaji::declared_port_names(&amp;MeshExpose)` (oss/kamaji/crates/kamaji/src/lib.rs) is the new single lowering from manifest to the `name -&gt; port` map every tier below already spoke, and it replaced `name_anonymous_ports(&amp;spec.expose.mesh.ports)` at all five call sites — kamaji's fake/containerd/docker/native backends and yubaba's `ServiceRecordStore::upsert_deployed`. So `ports = [{ name = \\\"http\\\", port = 8080 }, { name = \\\"metrics\\\", port = 9090 }]` now publishes `{\\\"http\\\":8080,\\\"metrics\\\":9090}` in the service record, `ServiceRecordFanout::port_for` resolves `http`, and the ingress planner stops refusing a two-listener workload. That refusal was the ONLY reason a multi-port slot had to keep a `port` pin forever, which is the whole R844 thesis.")
+//! @yah:handoff("THE NAMING RULE, and the care in it — `declared_port_names` does NOT promote an unnamed leftover to `http`. If NOTHING is named the whole list falls through to `name_anonymous_ports` byte-for-byte (sole port -&gt; `http`; several -&gt; their own numbers, none `http`), which is the compatibility property the entire change rests on and is asserted directly against the old function by kamaji::tests::an_unnamed_declaration_resolves_identically_to_the_old_synthesis. If ANYTHING is named, declared names are used verbatim and unnamed siblings become their own number. Rejected the obvious alternative — \\\"the one they left bare must be the default\\\" — for the same reason R844-F15 rejected first-is-http: an author who names one of three ports has shown they name deliberately, so promoting the leftover invents exactly the fact (THIS is the listener the world dials) that naming exists to state. A caller asking for `http` and getting None sends them back to the manifest.")
+//! @yah:handoff("PROTOCOL V7, and it is not the same kind of break as V2/V4/V5/V6 — read the new stanza in oss/kamaji/crates/kamaji-proto/src/version.rs before touching either wire. `WorkloadSpec` rides `Workload::Container` inside the postcard `Deploy` frame, so changing the ELEMENT TYPE of `expose.mesh.ports` (a `Vec&lt;u16&gt;` is len + varints; a `Vec&lt;MeshPort&gt;` is len + two-`Option` structs) does not fail cleanly at the port list — an unbumped peer consumes the wrong byte count and then misreads EVERY FIELD AFTER IT in the spec, i.e. deploys a wrong image or a wrong volume mount instead of erroring. `ProtocolVersion::CURRENT` is now V7. The blast radius is unchanged and unchanged in kind: one node, yubaba+kamaji rolled as a pair, which R844-F15's V6 already requires — so this rides that same paired roll at zero extra operational cost, and T10's recorded ordering does not change.")
+//! @yah:handoff("THE JSON WIRE IS UNAFFECTED, deliberately and by the same split `ImageRef` makes (R590-B3): `MeshPort` branches on `is_human_readable()`, so TOML/JSON get the flexible three-spelling form and postcard gets the plain positional two-`Option` struct. Consequence worth knowing — an UNNAMED port serializes to JSON as the bare number it always was, so `{\\\"ports\\\":[8080]}` is byte-identical in both directions against an un-rolled reader; only a manifest that actually names a port produces JSON an old reader cannot take. Pinned by tests/mesh_ports.rs::the_binary_wire_carries_both_halves_of_every_spelling and ::every_spelling_round_trips_through_toml.")
+//! @yah:handoff("THE NAME-ONLY SPELLING IS ACCEPTED AND WARNS, which is a deliberate choice between two worse ones. `ports = [\\\"http\\\", \\\"wss\\\"]` parses, validates and crosses both wires, but NOTHING BINDS IT: I measured why and it is structural, not an oversight — a container's ports are its image's, the native and bundle tiers WRITE `expose.mesh.ports` from the port they already resolved rather than reading it (native.rs:158 says so in its own words), and `kamaji::ports::PortAllocator::resolve_set`, which R844-F14 built for exactly this, still has ZERO production callers. So `validate::shape` emits a ShapeWarning naming the port and telling the author to state the number. Rejecting the spelling would refuse one the guide and `kamaji::ports`' own module doc both document; accepting it silently would be the inert-config failure this relay exists to eliminate. Filed as R844-F21 with the measurement and the one design question it has to answer first (what a name-only port means on a CONTAINER workload).")
+//! @yah:handoff("DISCOVERED WORK DONE IN THIS PASS, beyond the ticket title. (1) TWO PRODUCERS NOW STATE `http` INSTEAD OF LEAVING IT TO BE RE-DERIVED: kamaji-bin's bundle archetype (server.rs, the `ports` parsed back off `--listen`) and yubaba's mesofact-static reconciler (mesofact_static.rs, the allocator's `spawn_port`) both asked the allocator for the port under `kamaji::ports::HTTP` and then threw the name away; both now write `MeshPort::pinned(HTTP, n)`. Same value today, right value if a bundle ever serves a second listener. (2) `validate::shape` gained the port-list rules it never had — an entry stating neither name nor number, a name that is not a DNS label of at most 15 chars, a repeated name, a repeated number. The two uniqueness rules are load-bearing: a repeated NAME makes `name -&gt; port` ambiguous at the exact moment `ServiceRecord::port(\\\"http\\\")` or `PORT_HTTP` asks for it. (3) Two positional reads in oss/yah-base/crates/local-driver corrected to go through `numbers()` (local_runtime's sim-tier host-port publish, pond_ssr_runtime's container port). (4) The guide's \\\"no manifest schema carries a port-NAME key yet\\\" section in .yah/docs/guides/write-a-service-toml.md is replaced with the real spelling — that paragraph is what this ticket was filed off.")
+//! @yah:gotcha("A WORKSPACE-LOCAL `cargo check --all-targets` DOES NOT SEE oss/yah-base's TEST TARGETS, and this change proved it. `cargo check --workspace --all-targets` from the camp root (exit 0) and the same in oss/kamaji and oss/yubaba (exit 0) all passed while `yah-local-driver`'s LIB TEST target still failed to compile — oss/yah-base is excluded from the root workspace, and the other two consume it as a path dep whose test targets are never built. The break only surfaced under `cargo test --manifest-path oss/yah-base/Cargo.toml --workspace`. If you touch a workload-spec type, that argv is not optional.")
+//! @yah:gotcha("THE TWO DRIFT GATES ARE RED UNTIL THIS COMMITS, and that is the gate working rather than real drift — do not chase it. `scripts/check-schema-drift.sh` and `scripts/check-workload-spec-ts.sh` both REGENERATE and then `git diff --quiet`, so an uncommitted regen always reports drift. I ran both generators (`cargo run -p xtask -- emit-schemas`, `cargo run --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --bin export-ts`) and the artifacts are current on disk: `.yah/schema/workload.toml.schema.json` gained a `MeshPortRepr` definition rendering the union as `anyOf[integer|string|{name, port?}]` and `MeshExpose.ports` now `$ref`s it; `packages/yah/workload-spec/index.ts` carries `ports: (number | string | { name: string, port?: number })[]`. `git diff --stat` on those two paths is 42 + 15 lines and NOTHING ELSE, so no peer's pending regen got swept in.")
+//! @yah:gotcha("`cargo test -p yah --lib` FAILED ONCE MID-VERIFICATION WITH AN IMPOSSIBLE-LOOKING BUILD ERROR AND IT WAS NOT THIS CHANGE — recorded here because the next person will hit it and CLAUDE.md points them at the wrong tool. Signature: `can't find crate for runner / kg_rust / kg_store / kg_ts / kg / party / agent_tools / camp_service` plus `extern location for {serde,tokio,anyhow,...} does not exist`, killing yah-mcp and yah-eval — crates this change never touches. I followed CLAUDE.md's orphan-gc procedure first and IT EXONERATED orphan-gc: `cargo orphan-gc log -n 300` matched none of the missing hashes and every entry in the hour reads `deleted 0 artifacts`. The real cause is R748-B17 (the camp-service stale sweep splitting a unit's .rmeta from its .rlib in deps/), whose own 2026-08-31 gotcha names SIX of those exact crates and whose fix is in source but not in the long-lived CampService processes doing the deleting. A bare re-run with no clean and no edit passed 1360/0/1. Evidence appended to R748-B17.")
+//! @yah:verify("EVERY NUMBER BELOW WAS RUN BY ME, and the last four on a settled tree after the final edit. workload-spec: `cargo test --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --all-features` = 162 lib + 87 integration passed / 0 failed (73 integration before, so +14 new in tests/mesh_ports.rs). yah-base workspace: `cargo test --manifest-path oss/yah-base/Cargo.toml --workspace` = every target ok (37/99/34/38/23/28/146/87/1/1, 0 failed). kamaji: `cargo test --manifest-path oss/kamaji/Cargo.toml --workspace --all-features` = every target ok, kamaji lib 51 passed (45 before, +6 for `declared_port_names`), kamaji-bin lib 278 passed, sibling_wire_e2e and docker_backend_e2e 2 passed each — the two suites R844-F15's postcard bug broke, which is the check that matters for a V7 bump.")
+//! @yah:verify("yubaba: `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib` = 1011 passed / 0 failed / 4 ignored; `-p yubaba --lib` = 632 passed / 0 failed; `-p yubaba --features testing --test testing -- integration_service_records::` = 11 passed / 0 failed (the suite that asserts a deploy publishes a ready dialable record, i.e. the path `declared_port_names` now feeds). Root: `cargo test -p yah --lib` = 1360 passed / 0 failed / 1 ignored. THE R844 PURITY CANARY, run twice and green both times: `cargo test -p xtask --test main mirror_ingress` = 11 passed / 0 failed — plan_ingress still plans the camp's REAL .yah/services tree with no network, no credentials and no CloudConfig.")
+//! @yah:verify("CARGO EXIT CODES CAPTURED DIRECTLY, not inferred from a grep (an earlier run of mine reported `rc=1` which was ripgrep's no-matches status, i.e. a PASS wearing a failure's clothes — re-run to settle it): `cargo check --manifest-path oss/kamaji/Cargo.toml --workspace --all-features --all-targets` cargo-exit=0, zero `^error` lines; `cargo check --workspace --all-targets` cargo-exit=0, zero `^error` lines. SCOPE HELD: `git diff -- .yah/services/` is EMPTY — this change touches no mirror, and the three apex pins R844-T10 owns are untouched at cloud.toml:105/:250/:276.")
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -631,6 +651,19 @@ pub enum Workload {
     /// Rollback is a pointer-flip via `mirror.toml [asset_aliases]`; bytes are
     /// append-only and never re-pushed on rollback. See W160.
     StaticAsset(StaticAssetWorkload),
+
+    /// One cold, per-tenant passway serving a single custom domain, forked on
+    /// demand by kamaji's JIT tier (R852-F1 / W267 §"Free-tier ingress at 10k
+    /// domains"). Unlike the `Container`-shaped **node** ingress appliance
+    /// above, this one is native-forked and zero-resident — see
+    /// [`TenantPasswayWorkload`] for why that difference is what made it a
+    /// variant rather than another annotated container.
+    ///
+    /// **Appended last, deliberately.** postcard encodes an external tag as the
+    /// variant *index*, so a variant inserted anywhere but the end renumbers
+    /// every later one and a pre-R852 node silently decodes the wrong shape off
+    /// the kamaji UDS.
+    TenantPassway(TenantPasswayWorkload),
 }
 
 impl Workload {
@@ -647,6 +680,15 @@ impl Workload {
             Workload::Container(_) => "container",
             Workload::Almanac(_) => "almanac",
             Workload::StaticAsset(_) => "static-asset",
+            Workload::TenantPassway(_) => "tenant-passway",
+        }
+    }
+
+    /// The per-tenant passway declaration, if this is one.
+    pub fn tenant_passway(&self) -> Option<&TenantPasswayWorkload> {
+        match self {
+            Workload::TenantPassway(w) => Some(w),
+            _ => None,
         }
     }
 
@@ -697,6 +739,7 @@ enum WorkloadTagged {
     Container(ContainerManifest),
     Almanac(AlmanacManifest),
     StaticAsset(StaticAssetWorkload),
+    TenantPassway(TenantPasswayWorkload),
 }
 
 /// Borrowing twin of [`WorkloadTagged`] so `Serialize` need not clone the
@@ -708,6 +751,7 @@ enum WorkloadTaggedRef<'a> {
     Container(&'a ContainerManifest),
     Almanac(&'a AlmanacManifest),
     StaticAsset(&'a StaticAssetWorkload),
+    TenantPassway(&'a TenantPasswayWorkload),
 }
 
 /// Externally-tagged mirror — the postcard wire shape R590-B3 established.
@@ -727,6 +771,7 @@ enum WorkloadExternal {
     Container(WorkloadSpec),
     Almanac(AlmanacManifest),
     StaticAsset(StaticAssetWorkload),
+    TenantPassway(TenantPasswayWorkload),
 }
 
 /// Borrowing twin of [`WorkloadExternal`]. Same order requirement.
@@ -737,6 +782,7 @@ enum WorkloadExternalRef<'a> {
     Container(&'a WorkloadSpec),
     Almanac(&'a AlmanacManifest),
     StaticAsset(&'a StaticAssetWorkload),
+    TenantPassway(&'a TenantPasswayWorkload),
 }
 
 impl Serialize for Workload {
@@ -750,6 +796,7 @@ impl Serialize for Workload {
                 Workload::Container(w) => WorkloadTaggedRef::Container(w),
                 Workload::Almanac(w) => WorkloadTaggedRef::Almanac(w),
                 Workload::StaticAsset(w) => WorkloadTaggedRef::StaticAsset(w),
+                Workload::TenantPassway(w) => WorkloadTaggedRef::TenantPassway(w),
             }
             .serialize(s)
         } else {
@@ -767,6 +814,7 @@ impl Serialize for Workload {
                 }
                 Workload::Almanac(w) => WorkloadExternalRef::Almanac(w),
                 Workload::StaticAsset(w) => WorkloadExternalRef::StaticAsset(w),
+                Workload::TenantPassway(w) => WorkloadExternalRef::TenantPassway(w),
             }
             .serialize(s)
         }
@@ -784,6 +832,7 @@ impl<'de> Deserialize<'de> for Workload {
                 WorkloadTagged::Container(w) => Workload::Container(w),
                 WorkloadTagged::Almanac(w) => Workload::Almanac(w),
                 WorkloadTagged::StaticAsset(w) => Workload::StaticAsset(w),
+                WorkloadTagged::TenantPassway(w) => Workload::TenantPassway(w),
             })
         } else {
             Ok(match WorkloadExternal::deserialize(de)? {
@@ -793,6 +842,7 @@ impl<'de> Deserialize<'de> for Workload {
                 WorkloadExternal::Container(w) => Workload::container(w),
                 WorkloadExternal::Almanac(w) => Workload::Almanac(w),
                 WorkloadExternal::StaticAsset(w) => Workload::StaticAsset(w),
+                WorkloadExternal::TenantPassway(w) => Workload::TenantPassway(w),
             })
         }
     }
@@ -1007,7 +1057,7 @@ impl ContainerBuild {
         let image = compose_import::parse_pinned_image_ref(&format!("{image_tag}@{digest}"))
             .map_err(|e| format!("lowering container recipe {:?}: {e}", self.name))?;
 
-        let ports = self.run.port.map(|p| vec![p]).unwrap_or_default();
+        let ports = MeshExpose::anonymous_ports(self.run.port);
 
         Ok(WorkloadSpec {
             schema_version: self.schema_version,
@@ -1441,6 +1491,312 @@ impl Default for BundleLifecycle {
     /// deploy-and-supervise default.
     fn default() -> Self {
         BundleLifecycle::KeepAlive
+    }
+}
+
+// ── Per-tenant passway (R852-F1 / W267 §Free-tier ingress at 10k domains) ─────
+
+/// Container-side / node-side path a per-tenant passway reads its PEM chain
+/// from, when the declaration does not name one. Deliberately per-domain: two
+/// tenants sharing a path is two tenants sharing a certificate.
+pub const DEFAULT_TENANT_PASSWAY_CERT_DIR: &str = "/run/yah/passway/tenants";
+
+/// Node path of the passway binary a per-tenant passway forks, when the
+/// declaration does not name one. Matches the path the passway image installs
+/// to, which is what `local-driver`'s node-appliance spec also runs.
+pub const DEFAULT_PASSWAY_COMMAND: &str = "/usr/local/bin/passway";
+
+/// One **cold, per-tenant passway** — a TLS terminator that serves exactly one
+/// custom tenant domain, forked on demand by kamaji's JIT tier
+/// (`kamaji::jit::JitRuntime`) and self-reaped when idle.
+///
+/// This is the declaration W267's free-tier ingress design was missing. R779
+/// shipped every mechanism — the SNI demux that splices `:443` by ClientHello
+/// without terminating TLS, passway's fd-3 adoption + idle self-reap, the
+/// R2-backed cert store off raft, the per-domain DNS-01 issuer — but nothing
+/// could *say* "there is a passway for `shop.tenant.io` at `127.0.0.1:8443`",
+/// because kamaji's on-demand tier was reachable only through
+/// [`MesofactServeBundle`], a mesofact-specific carrier.
+///
+/// ## Why a variant and not an annotated [`Workload::Container`]
+///
+/// The W267 **node appliance** is a container (see `Workload::Container`'s doc
+/// comment): one resident passway per public-IP node, image-pulled, supervised
+/// like anything else, so an archetype + annotation expressed it with no wire
+/// change. A per-tenant passway is the opposite on every axis that decides the
+/// question. It is **native-forked, not containerized** — kamaji's JIT tier
+/// hands the child an inherited fd, and that path (`kamaji::jit`) forks a
+/// process, not a container. It is **zero-resident**, so the deploy Ack means
+/// "socket bound and armed", not "a process is running". And there are ten
+/// thousand of them, generated from the enrollment set rather than written by
+/// hand. Squeezing that into `Container` would mean a spec whose image is a
+/// lie and whose supervision arm is chosen by an annotation nobody reading the
+/// type would look for.
+///
+/// ## The bind string is the fd-table key
+///
+/// [`listen`](Self::listen) is **declared, never allocated.** It is the address
+/// the tenant's enrollment record already names as its demux backend
+/// (`yubaba::cert_store::Enrollment::tls_backend`), so kamaji must bind exactly
+/// it — an allocator picking a port here would arm a socket the demux never
+/// routes to, and the tenant's domain would resolve, handshake, and hang.
+///
+/// The same string is also passway's `PASSWAY_LISTEN`, and it must match **byte
+/// for byte**: passway's socket-activation path (on by default) *panics* rather
+/// than binding fresh when `LISTEN_FDS` is set and the seed does not take, so a
+/// drifted string is a workload that forks and immediately dies on every
+/// connection. [`jit_spec`](Self::jit_spec) is the reason that cannot happen —
+/// it renders `PASSWAY_LISTEN` from this one field rather than asking a caller
+/// to restate it, the same "derive, never re-state" rule
+/// `yubaba::domain_admin` applies to the DNS-01 record name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct TenantPasswayWorkload {
+    #[serde(default)]
+    pub schema_version: SchemaVersion,
+
+    /// The single custom domain this passway terminates TLS for — the SNI the
+    /// demux matched to route here, and the hostname
+    /// [`jit_spec`](Self::jit_spec) keys the rendered `PASSWAY_UPSTREAMS`
+    /// entries on.
+    pub domain: String,
+
+    /// `host:port` kamaji binds and holds in custody, and the address the demux
+    /// splices this domain's bytes to. See the type doc: declared, not
+    /// allocated, and byte-identical to `PASSWAY_LISTEN`.
+    pub listen: String,
+
+    /// Plaintext backends passway forwards to after terminating TLS, as bare
+    /// `host:port`. Rendered as `<domain>=<addr>` entries — repeated entries
+    /// load-balance (R844-F3), which is why this is a list and not one address.
+    ///
+    /// Empty is legal and means "no backend yet": passway answers 503 rather
+    /// than refusing to start, so a domain can be enrolled and issued before
+    /// the tenant's app is placed.
+    #[serde(default)]
+    pub upstreams: Vec<String>,
+
+    /// Where the per-domain PEM pair the R2 cert store holds
+    /// (`yubaba::cert_store`) has been materialized on the node.
+    pub tls: TenantPasswayTls,
+
+    /// Idle time with no in-flight request before the process exits, leaving
+    /// kamaji holding the socket and re-forking on the next connection.
+    ///
+    /// `None` means **never reap** — a long-running per-tenant passway. That is
+    /// the shape the free tier exists to avoid (10k resident processes is the
+    /// number W267 §"Scaling B to a free tier" set out to dissolve), and it also
+    /// re-opens a rotation gap a cold passway does not have: a cold one re-reads
+    /// [`tls`](Self::tls) at every cold start, while a resident one holds the
+    /// chain it started with. Sub-second values round **up** to one second, and
+    /// zero is not "never" — see [`idle_ttl_secs`](Self::idle_ttl_secs).
+    ///
+    /// No `skip_serializing_if`: this rides the positional postcard wire.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub idle_ttl: Option<Millis>,
+
+    /// Node path of the passway binary to fork. `None` →
+    /// [`DEFAULT_PASSWAY_COMMAND`].
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub command: Option<String>,
+
+    /// Extra environment for the forked process — the ACME/auth/health knobs
+    /// passway reads that this type has no opinion about.
+    ///
+    /// **Cannot override the derived keys.** [`jit_spec`](Self::jit_spec)
+    /// applies this map *first* and the derived
+    /// (`PASSWAY_LISTEN`/`LISTEN_FDS`/`PASSWAY_IDLE_TTL_SECS`/
+    /// `PASSWAY_UPSTREAMS`/`PASSWAY_TLS_*`) keys last, so an escape hatch cannot
+    /// silently break the fd handoff — which would surface as a domain that
+    /// hangs, not as a config error.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// Node-side paths of one tenant's materialized certificate pair.
+///
+/// Paths rather than [`SecretMount`]s: the JIT tier forks a *process*, not a
+/// container, so there is no mount namespace to project a secret into — the
+/// files are read from the node filesystem by the forked passway. Whoever
+/// materializes them out of `yubaba::cert_store` owns their permissions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct TenantPasswayTls {
+    /// PEM chain path (`PASSWAY_TLS_CERT`).
+    pub cert: String,
+    /// PEM private-key path (`PASSWAY_TLS_KEY`).
+    pub key: String,
+}
+
+impl TenantPasswayTls {
+    /// The conventional per-domain pair under
+    /// [`DEFAULT_TENANT_PASSWAY_CERT_DIR`]: `<dir>/<domain>/{tls.crt,tls.key}`.
+    pub fn for_domain(domain: &str) -> Self {
+        Self {
+            cert: format!("{DEFAULT_TENANT_PASSWAY_CERT_DIR}/{domain}/tls.crt"),
+            key: format!("{DEFAULT_TENANT_PASSWAY_CERT_DIR}/{domain}/tls.key"),
+        }
+    }
+}
+
+impl TenantPasswayWorkload {
+    /// A cold per-tenant passway for `domain` on `listen`, with the
+    /// conventional cert paths and a one-minute idle TTL.
+    pub fn cold(domain: impl Into<String>, listen: impl Into<String>) -> Self {
+        let domain = domain.into();
+        Self {
+            schema_version: SchemaVersion::V1,
+            tls: TenantPasswayTls::for_domain(&domain),
+            domain,
+            listen: listen.into(),
+            upstreams: Vec::new(),
+            idle_ttl: Some(Millis::from_secs(60)),
+            command: None,
+            env: BTreeMap::new(),
+        }
+    }
+
+    /// Point this passway at `addrs` (bare `host:port`).
+    pub fn with_upstreams<S: Into<String>>(mut self, addrs: impl IntoIterator<Item = S>) -> Self {
+        self.upstreams = addrs.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The passway binary this workload forks.
+    pub fn command_path(&self) -> &str {
+        self.command.as_deref().unwrap_or(DEFAULT_PASSWAY_COMMAND)
+    }
+
+    /// `PASSWAY_IDLE_TTL_SECS`, or `None` for "never reap".
+    ///
+    /// Rounds **up** to one second, for the reason the bundle JIT path rounds
+    /// up: passway reads this as an integer number of seconds, so a 500 ms TTL
+    /// would truncate to `0` — and `0` there does not mean "reap immediately",
+    /// it means the reap never fires. Rounding down would turn a declared cold
+    /// workload resident without any error to read.
+    pub fn idle_ttl_secs(&self) -> Option<u64> {
+        self.idle_ttl.map(|t| t.as_ms().div_ceil(1000).max(1))
+    }
+
+    /// `PASSWAY_UPSTREAMS` for this domain: `<domain>=<addr>` per backend,
+    /// comma-joined. Empty when no backend is declared, which passway reads as
+    /// "fail ready with 503".
+    pub fn passway_upstreams(&self) -> String {
+        self.upstreams
+            .iter()
+            .map(|a| format!("{}={}", self.domain, a))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// The [`WorkloadSpec`] kamaji's JIT runtime forks for this tenant.
+    ///
+    /// `id` is the kamaji workload identity (also the mesh ident and the
+    /// custodian key). Everything else is derived from `self` — see the type
+    /// doc for why no caller is allowed to restate `PASSWAY_LISTEN`.
+    ///
+    /// - `entrypoint` is the passway binary; `command` is empty, because passway
+    ///   is configured entirely by environment (it has no config-file parser).
+    /// - `restart_policy` is [`RestartPolicy::Never`]: the JIT supervisor owns
+    ///   re-forking on the next connection, and an idle self-reap is an expected
+    ///   exit, not a crash.
+    /// - `expose.mesh.ports` is parsed back off [`listen`](Self::listen) rather
+    ///   than carried separately, so the declared port cannot drift from the
+    ///   bound one.
+    /// - `LISTEN_FDS=1` is set here as well as by the JIT supervisor. That is
+    ///   deliberate redundancy, not a duplicate: it makes the spec truthful
+    ///   about how this process expects to get its socket to anyone reading the
+    ///   spec alone, and setting it twice to the same value is inert.
+    pub fn jit_spec(&self, id: &str) -> WorkloadSpec {
+        let mut env: BTreeMap<String, String> = self.env.clone();
+        // Derived keys go last: an `env` escape hatch must not be able to break
+        // the fd handoff (see the field doc).
+        env.insert("PASSWAY_LISTEN".into(), self.listen.clone());
+        env.insert("LISTEN_FDS".into(), "1".into());
+        env.insert("PASSWAY_TLS_MODE".into(), "manual".into());
+        env.insert("PASSWAY_TLS_CERT".into(), self.tls.cert.clone());
+        env.insert("PASSWAY_TLS_KEY".into(), self.tls.key.clone());
+        env.insert("PASSWAY_UPSTREAM_SOURCE".into(), "static".into());
+        env.insert("PASSWAY_UPSTREAMS".into(), self.passway_upstreams());
+        match self.idle_ttl_secs() {
+            Some(secs) => {
+                env.insert("PASSWAY_IDLE_TTL_SECS".into(), secs.to_string());
+            }
+            // Unset, not `0` — passway reads an absent variable as "never
+            // reap", and `0` as a zero-second timer that fires immediately.
+            None => {
+                env.remove("PASSWAY_IDLE_TTL_SECS");
+            }
+        }
+
+        WorkloadSpec {
+            schema_version: SchemaVersion::V1,
+            name: id.to_string(),
+            image: ImageRef {
+                // Identity metadata only — the JIT tier forks a node binary and
+                // pulls nothing, exactly like the bundle-serving native path.
+                registry: "passway".into(),
+                repository: format!("tenant/{}", self.domain),
+                tag: "jit".into(),
+                digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
+            },
+            tier: TierTag("infra".into()),
+            tenant: TenantId::singleton(),
+            namespace: NamespaceId::singleton(),
+            replicas: 1,
+            entrypoint: Some(vec![self.command_path().to_string()]),
+            command: Some(vec![]),
+            workdir: None,
+            user: None,
+            env: env
+                .into_iter()
+                .map(|(name, value)| EnvVar {
+                    name,
+                    value: EnvValue::Literal { value },
+                })
+                .collect(),
+            secrets: vec![],
+            volumes: vec![],
+            resources: ResourceLimits {
+                memory_mb: 64,
+                cpu_millis: 256,
+                ephemeral_storage_mb: 64,
+            },
+            depends_on: vec![],
+            // No probe: a `TcpConnect` probe would dial the held socket and
+            // fork the process on every interval, defeating the idle reap. The
+            // JIT bundle path refuses one for the same reason.
+            healthcheck: None,
+            restart_policy: RestartPolicy::Never,
+            archetype: None,
+            stop_policy: StopPolicy {
+                signal: 15,
+                grace_period: Millis::from_secs(5),
+            },
+            expose: ExposeSpec {
+                mesh: MeshExpose {
+                    identity: MeshIdent(id.to_string()),
+                    ports: MeshExpose::anonymous_ports(self.listen_port()),
+                    allow_from: vec![],
+                },
+                public: None,
+                operator: None,
+            },
+            labels: Default::default(),
+            annotations: Default::default(),
+        }
+    }
+
+    /// Port half of [`listen`](Self::listen), when it parses.
+    pub fn listen_port(&self) -> Option<u16> {
+        self.listen
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
     }
 }
 
@@ -2191,7 +2547,10 @@ impl WorkloadSpec {
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent(format!("forge.{forge_id}")),
-                    ports,
+                    // A forge job's ports come from a caller holding bare
+                    // numbers (a job exposes what its image exposes), so they
+                    // stay unnamed — `kamaji::name_anonymous_ports` names them.
+                    ports: MeshExpose::anonymous_ports(ports),
                     allow_from: vec![],
                 },
                 public: None,
@@ -2709,16 +3068,66 @@ pub enum EnvValue {
 }
 
 /// Which aspect of a mesh peer's address to inject.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+///
+/// ## Which port, when the peer has several (R844-B22)
+///
+/// [`Self::Url`] and [`Self::Port`] used to mean "the *first* entry in the
+/// peer's `expose.mesh.ports`". That was a positional guess — the same one
+/// `kamaji::name_anonymous_ports` refuses to make and that R844-F15 removed
+/// from the service-record fanout — and it could hand a dependent workload a
+/// metrics listener's number in its environment while looking entirely
+/// successful. It survived only because, before R844-F17, a manifest had no way
+/// to *name* a port, so "first" was the only selector that existed.
+///
+/// They now resolve by the same rule everything else in this workspace uses:
+/// one port resolves to that port; several resolve to the one named `http`;
+/// several with no `http` is an **error**, not a pick. The error is the feature
+/// — it sends the author back to the manifest to say which listener they meant,
+/// instead of handing a dependent a plausible wrong number.
+///
+/// [`Self::UrlNamed`] / [`Self::PortNamed`] say it outright and are the
+/// spelling to prefer for any peer with more than one listener.
+///
+/// The named variants are **appended** rather than added as fields on the
+/// existing ones: `MeshLookup` rides `EnvValue::FromMesh` inside a
+/// [`WorkloadSpec`] across the postcard kamaji UDS, where an enum is encoded by
+/// variant index, so appending leaves every existing encoding byte-identical
+/// while adding a field to `Url` would not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MeshLookup {
-    /// Full URL, e.g. `"http://noisetable-db.pdx:5432"`.
+    /// Full URL, e.g. `"http://noisetable-db.pdx:5432"`. See the type docs for
+    /// which port this picks when the peer has several.
     Url,
     /// Hostname only, e.g. `"noisetable-db.pdx"`.
     Host,
-    /// Port only, e.g. `"5432"`.
+    /// Port only, e.g. `"5432"`. See the type docs for which port this picks
+    /// when the peer has several.
     Port,
+    /// Full URL at the peer's port called `name`, e.g. `"http://api.pdx:8443"`
+    /// for `name = "wss"`. Errors when the peer has no port by that name.
+    UrlNamed { name: String },
+    /// The peer's port called `name`, stringified. Errors when the peer has no
+    /// port by that name.
+    PortNamed { name: String },
+}
+
+impl MeshLookup {
+    /// The port name this lookup selects, or `None` when it takes the default
+    /// (see the type docs) or needs no port at all.
+    pub fn port_name(&self) -> Option<&str> {
+        match self {
+            MeshLookup::UrlNamed { name } | MeshLookup::PortNamed { name } => Some(name),
+            MeshLookup::Url | MeshLookup::Host | MeshLookup::Port => None,
+        }
+    }
+
+    /// Whether this lookup needs a port at all — `Host` is the one that does
+    /// not, and it must keep resolving for a portless peer.
+    pub fn needs_port(&self) -> bool {
+        !matches!(self, MeshLookup::Host)
+    }
 }
 
 // ── Secrets ───────────────────────────────────────────────────────────────────
@@ -3288,6 +3697,207 @@ pub enum MeshPeer {
     },
 }
 
+/// One port a workload listens on, as its manifest declares it (R844-F17).
+///
+/// Before this, `expose.mesh.ports` was an array of bare numbers and a port
+/// name was unwritable anywhere in the workspace — names were real at every
+/// tier *below* the manifest (kamaji's allocator resolves `name -> port`, a
+/// service record publishes `{"http": 8080, "wss": 8443}`, the sibling wire
+/// carries `named_ports`, `PORT_<NAME>` reaches the process) and synthesised
+/// from nothing at the top by [`crate::MeshExpose`]'s number list. This is the
+/// declaration surface that had to exist for any of that to be *stated* rather
+/// than guessed.
+///
+/// ## Three spellings, one type
+///
+/// ```toml
+/// ports = [8080]                            # a number, unnamed
+/// ports = ["http", "wss"]                   # names; the supervisor picks the numbers
+/// ports = [{ name = "https", port = 443 }]  # both stated
+/// ```
+///
+/// They mix freely in one array (`ports = [{ name = "http", port = 8080 },
+/// "metrics"]`), because the two facts are independent: a container's ports are
+/// fixed by its image and still want names, while a native workload's numbers
+/// are the allocator's to choose and only the names are the author's.
+///
+/// ## What each spelling means downstream
+///
+/// - **A number** is a request to listen there. On a container backend that is
+///   simply the container-side port. On the published (fleet) tier a number
+///   outside `kamaji::ports::WORLD_FIXED_PORTS` is refused at bring-up rather
+///   than honoured (R844-F14) — a stale pin is how one workload lands on the
+///   port a co-tenant already holds.
+/// - **A name** is what a consumer asks for: `ServiceRecord::port("wss")`, the
+///   ingress planner resolving which listener a hostname fronts, the
+///   `PORT_<NAME>` variable the process reads. A workload declaring several
+///   ports and naming none has nothing called `http`, and the front door
+///   refuses to resolve rather than publish a hostname at whichever listener
+///   sorted first (`kamaji::name_anonymous_ports`). Naming them is how you
+///   answer that question instead of being asked it.
+///
+/// ## Wire shapes
+///
+/// Human-readable formats (TOML/JSON) accept all three spellings and
+/// round-trip back to the most compact faithful one. The binary wire (postcard,
+/// behind the kamaji UDS) carries the plain two-`Option` struct: `untagged`
+/// needs `deserialize_any`, which postcard refuses — the same split
+/// [`ImageRef`] makes, and for the same reason (R590-B3).
+///
+/// Deliberately NOT `Default`: the all-`None` value is the one shape no accepted
+/// spelling produces and `validate::shape` rejects, so a `..Default::default()`
+/// would hand a caller exactly the invalid port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshPort {
+    /// The name this port is known by — `http`, `wss`, `metrics`. `None` when
+    /// the manifest wrote a bare number; `kamaji::name_anonymous_ports` then
+    /// decides what to call it, which is deliberately *not* `http` when there
+    /// is more than one.
+    pub name: Option<String>,
+
+    /// The port number, when the manifest states one. `None` means the
+    /// supervisor allocates it and tells the workload via `PORT_<NAME>`.
+    pub number: Option<u16>,
+}
+
+impl MeshPort {
+    /// A bare number, unnamed — the pre-R844-F17 spelling, still valid.
+    pub fn anonymous(number: u16) -> Self {
+        Self {
+            name: None,
+            number: Some(number),
+        }
+    }
+
+    /// A named port whose number the supervisor allocates.
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            number: None,
+        }
+    }
+
+    /// A named port whose number the manifest states.
+    pub fn pinned(name: impl Into<String>, number: u16) -> Self {
+        Self {
+            name: Some(name.into()),
+            number: Some(number),
+        }
+    }
+}
+
+impl From<u16> for MeshPort {
+    fn from(number: u16) -> Self {
+        Self::anonymous(number)
+    }
+}
+
+impl From<&str> for MeshPort {
+    fn from(name: &str) -> Self {
+        Self::named(name)
+    }
+}
+
+impl From<String> for MeshPort {
+    fn from(name: String) -> Self {
+        Self::named(name)
+    }
+}
+
+/// The self-describing spelling of a [`MeshPort`] — the shape a TOML/JSON
+/// author writes, and the one the generated JSON schema and TS bindings
+/// advertise.
+///
+/// Kept as its own type rather than folded into `MeshPort` because it is only
+/// half the story: the binary wire never sees it (see [`MeshPort`]'s docs), and
+/// a struct with two `Option`s is the shape every *consumer* wants regardless
+/// of which of the three forms the author picked.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+enum MeshPortRepr {
+    /// `8080` — a number with no name.
+    Number(u16),
+    /// `"http"` — a name whose number the supervisor allocates.
+    Name(String),
+    /// `{ name = "https", port = 443 }` — both stated. `port` may be omitted,
+    /// which is the table spelling of the bare-name form.
+    Both {
+        name: String,
+        #[serde(default)]
+        port: Option<u16>,
+    },
+}
+
+impl Serialize for MeshPort {
+    fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if !ser.is_human_readable() {
+            // Postcard and friends: the plain positional struct, every field
+            // always encoded. See the V6 stanza in `kamaji_proto::version` —
+            // there is no `skip_serializing_if` that is safe here.
+            #[derive(Serialize)]
+            struct Fields<'a> {
+                name: &'a Option<String>,
+                number: &'a Option<u16>,
+            }
+            return Fields {
+                name: &self.name,
+                number: &self.number,
+            }
+            .serialize(ser);
+        }
+
+        match (&self.name, self.number) {
+            (Some(name), Some(port)) => MeshPortRepr::Both {
+                name: name.clone(),
+                port: Some(port),
+            },
+            (Some(name), None) => MeshPortRepr::Name(name.clone()),
+            (None, Some(port)) => MeshPortRepr::Number(port),
+            // Not constructible from any accepted spelling; `validate::shape`
+            // rejects it too. Emitted as an empty table rather than silently
+            // becoming something else.
+            (None, None) => MeshPortRepr::Both {
+                name: String::new(),
+                port: None,
+            },
+        }
+        .serialize(ser)
+    }
+}
+
+impl<'de> Deserialize<'de> for MeshPort {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if !de.is_human_readable() {
+            #[derive(Deserialize)]
+            struct Fields {
+                name: Option<String>,
+                number: Option<u16>,
+            }
+            let f = Fields::deserialize(de)?;
+            return Ok(MeshPort {
+                name: f.name,
+                number: f.number,
+            });
+        }
+
+        Ok(match MeshPortRepr::deserialize(de)? {
+            MeshPortRepr::Number(port) => MeshPort::anonymous(port),
+            MeshPortRepr::Name(name) => MeshPort::named(name),
+            MeshPortRepr::Both { name, port } => MeshPort {
+                name: Some(name),
+                number: port,
+            },
+        })
+    }
+}
+
 /// Mesh-internal port exposure and peer access control.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -3296,9 +3906,18 @@ pub struct MeshExpose {
     /// cluster. Regex: `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, length ≤ 63.
     pub identity: MeshIdent,
 
-    /// Container-side ports this workload listens on. Other workloads reach
-    /// it at `<identity>:<port>` on the mesh.
-    pub ports: Vec<u16>,
+    /// Ports this workload listens on, each optionally named (R844-F17). Other
+    /// workloads reach it at `<identity>:<port>` on the mesh.
+    ///
+    /// See [`MeshPort`] for the three accepted spellings. Read the numbers with
+    /// [`MeshExpose::numbers`] and the names with
+    /// [`MeshExpose::named_numbers`] — there is deliberately no way to read
+    /// this as a plain `Vec<u16>`, because a name-only entry has no number yet
+    /// and a conversion that dropped it would be exactly the silent loss named
+    /// ports exist to prevent.
+    #[ts(type = "(number | string | { name: string, port?: number })[]")]
+    #[cfg_attr(feature = "json-schema", schemars(with = "Vec<MeshPortRepr>"))]
+    pub ports: Vec<MeshPort>,
 
     /// Peers permitted to initiate connections to this workload on the mesh
     /// (W206 / R558-F3). Same-tenant tier rules and explicit cross-tenant
@@ -3311,6 +3930,48 @@ pub struct MeshExpose {
 }
 
 impl MeshExpose {
+    /// Every port *number* this workload declares, in declaration order.
+    ///
+    /// Name-only entries (`ports = ["http"]`) carry no number and are simply
+    /// absent here — they do not have one until a supervisor allocates it. That
+    /// is why this is a method rather than the field: a caller reading numbers
+    /// has to be able to see that the list it got is shorter than the list the
+    /// author wrote, and a `Vec<u16>` field could not say so.
+    pub fn numbers(&self) -> Vec<u16> {
+        self.ports.iter().filter_map(|p| p.number).collect()
+    }
+
+    /// Whether `port` appears as a declared number.
+    pub fn declares_number(&self, port: u16) -> bool {
+        self.ports.iter().any(|p| p.number == Some(port))
+    }
+
+    /// The `name -> number` map for every port the manifest declares *both*
+    /// for. Name-only ports are absent (no number yet) and unnamed ports are
+    /// absent (no name); `kamaji::name_anonymous_ports` is what fills the
+    /// second gap once numbers are known.
+    pub fn named_numbers(&self) -> BTreeMap<String, u16> {
+        self.ports
+            .iter()
+            .filter_map(|p| Some((p.name.clone()?, p.number?)))
+            .collect()
+    }
+
+    /// Every port name the manifest states, in declaration order.
+    pub fn names(&self) -> Vec<&str> {
+        self.ports
+            .iter()
+            .filter_map(|p| p.name.as_deref())
+            .collect()
+    }
+
+    /// The pre-R844-F17 spelling as a value: a list of unnamed numbers. Kept
+    /// because most call sites — and every test fixture — genuinely mean
+    /// "these numbers, names irrelevant".
+    pub fn anonymous_ports(numbers: impl IntoIterator<Item = u16>) -> Vec<MeshPort> {
+        numbers.into_iter().map(MeshPort::anonymous).collect()
+    }
+
     /// Whether a peer may initiate a mesh connection to a workload whose mesh
     /// exposure is `self`. `own_tenant` is the tenant of the workload being
     /// protected; the remaining arguments identify the connecting peer.
@@ -3760,7 +4421,7 @@ port = 4325
         assert_eq!(spec.image.digest, digest);
         assert_eq!(spec.image.repository, "yah-local/yah-cloud-admin");
         assert_eq!(spec.image.tag, "dev");
-        assert_eq!(spec.expose.mesh.ports, vec![4325]);
+        assert_eq!(spec.expose.mesh.numbers(), vec![4325]);
         assert_eq!(spec.env.len(), 1);
         assert_eq!(spec.volumes.len(), 1);
 

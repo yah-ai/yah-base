@@ -11,8 +11,12 @@ description = "yah credential vault: AES-256-GCM at-rest encryption keyed by a p
 aes-gcm = "0.10"
 anyhow = "1.0"
 argon2 = "0.5"
+# Spelled out rather than inherited: oss/yah-base is an independent Cargo
+# workspace, so the yah root's `workspace = true` deps are not reachable here.
+chrono = { version = "0.4", features = ["serde"] }
 directories = "6.0"
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 
 [dev-dependencies]

@@ -111,7 +111,7 @@ fn full_spec() -> WorkloadSpec {
         expose: ExposeSpec {
             mesh: MeshExpose {
                 identity: MeshIdent("noisetable-api.pdx".into()),
-                ports: vec![8080, 9090],
+                ports: MeshExpose::anonymous_ports([8080, 9090]),
                 allow_from: vec![
                     MeshPeer::Tier(TierTag("private".into())),
                     MeshPeer::Tier(TierTag("tenant".into())),
@@ -224,6 +224,145 @@ fn container_recipe_is_refused_by_postcard_rather_than_encoded() {
     assert!(json.contains("yah-local/yah-cloud-admin:dev"), "{json}");
 }
 
+// ── Per-tenant passway (R852-F1) ─────────────────────────────────────────────
+
+fn tenant_passway() -> TenantPasswayWorkload {
+    TenantPasswayWorkload::cold("shop.tenant.io", "127.0.0.1:8443")
+        .with_upstreams(["100.64.0.9:8080", "100.64.0.10:8080"])
+}
+
+/// The wire-compat half of appending a variant. `TenantPassway` is index 4, so
+/// every pre-existing variant keeps the index a deployed node already decodes
+/// — the failure a mid-enum insertion would cause is silent (a node reads
+/// `StaticAsset` bytes as `Almanac`), so it gets an explicit frame assertion
+/// rather than only a round-trip.
+#[test]
+fn tenant_passway_postcard_frame_is_index_four_then_the_bare_payload() {
+    let w = tenant_passway();
+    let enveloped =
+        postcard::to_stdvec(&Workload::TenantPassway(w.clone())).expect("envelope encodes");
+    let bare = postcard::to_stdvec(&w).expect("bare payload");
+
+    let mut expected = vec![4u8];
+    expected.extend_from_slice(&bare);
+    assert_eq!(
+        enveloped, expected,
+        "the tenant-passway wire frame is not [4] ++ payload — kamaji decodes this positionally"
+    );
+
+    let decoded: Workload = postcard::from_bytes(&enveloped).expect("postcard decode");
+    assert_eq!(decoded, Workload::TenantPassway(w));
+}
+
+/// The human-readable half: flat, internally tagged on `kind`, so a
+/// hand-written manifest is a normal TOML/JSON document.
+#[test]
+fn tenant_passway_round_trips_through_json_as_a_flat_kind_tagged_object() {
+    let original = Workload::TenantPassway(tenant_passway());
+    let json = serde_json::to_string(&original).expect("serialize");
+    assert!(json.contains("\"kind\":\"tenant-passway\""), "{json}");
+    let decoded: Workload = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(decoded, original);
+    assert_eq!(decoded.kind_str(), "tenant-passway");
+    assert!(decoded.tenant_passway().is_some());
+}
+
+/// The invariant the whole kind exists to hold: `PASSWAY_LISTEN` is *derived*
+/// from the one declared `listen`, never restated by a caller. passway's
+/// socket-activation path panics rather than binding fresh when `LISTEN_FDS`
+/// is set and the seed does not take, so a drift here is a workload that forks
+/// and dies on every connection.
+#[test]
+fn jit_spec_derives_the_bind_string_and_the_env_escape_hatch_cannot_override_it() {
+    let mut w = tenant_passway();
+    // A caller trying to set the load-bearing keys by hand.
+    w.env.insert("PASSWAY_LISTEN".into(), "0.0.0.0:443".into());
+    w.env.insert("LISTEN_FDS".into(), "0".into());
+    w.env.insert("PASSWAY_TLS_MODE".into(), "acme".into());
+    w.env
+        .insert("PASSWAY_HEALTH_PATH".into(), "/healthz".into());
+
+    let spec = w.jit_spec("passway-shop-tenant-io");
+    let get = |k: &str| -> Option<String> {
+        spec.env.iter().find(|e| e.name == k).map(|e| match &e.value {
+            EnvValue::Literal { value } => value.clone(),
+            other => panic!("{k} must be a literal, got {other:?}"),
+        })
+    };
+
+    assert_eq!(get("PASSWAY_LISTEN").as_deref(), Some("127.0.0.1:8443"));
+    assert_eq!(get("LISTEN_FDS").as_deref(), Some("1"));
+    assert_eq!(get("PASSWAY_TLS_MODE").as_deref(), Some("manual"));
+    // The non-load-bearing key the caller set survives — this is an escape
+    // hatch, not a whitelist.
+    assert_eq!(get("PASSWAY_HEALTH_PATH").as_deref(), Some("/healthz"));
+
+    // Upstreams carry the domain prefix, one entry per backend (R844-F3
+    // load-balances repeats), and the port the mesh declares is parsed back off
+    // `listen` rather than carried twice.
+    assert_eq!(
+        get("PASSWAY_UPSTREAMS").as_deref(),
+        Some("shop.tenant.io=100.64.0.9:8080,shop.tenant.io=100.64.0.10:8080")
+    );
+    assert_eq!(spec.expose.mesh.numbers(), vec![8443]);
+    assert_eq!(spec.expose.mesh.identity.0, "passway-shop-tenant-io");
+    // The JIT supervisor owns re-forking; an idle self-reap is not a crash.
+    assert!(matches!(spec.restart_policy, RestartPolicy::Never));
+    assert_eq!(
+        spec.entrypoint.as_deref(),
+        Some(["/usr/local/bin/passway".to_string()].as_slice())
+    );
+}
+
+/// `idle_ttl` rounds UP, and `None` means the variable is absent rather than
+/// zero — passway reads an absent `PASSWAY_IDLE_TTL_SECS` as "never reap" and
+/// a `0` as a timer, so truncating 500ms to 0 would turn a declared-cold
+/// workload resident with nothing to read in any log.
+#[test]
+fn idle_ttl_rounds_up_and_never_reap_omits_the_variable() {
+    let has_ttl = |w: &TenantPasswayWorkload| -> Option<String> {
+        w.jit_spec("x")
+            .env
+            .iter()
+            .find(|e| e.name == "PASSWAY_IDLE_TTL_SECS")
+            .map(|e| match &e.value {
+                EnvValue::Literal { value } => value.clone(),
+                other => panic!("unexpected {other:?}"),
+            })
+    };
+
+    let mut w = tenant_passway();
+    w.idle_ttl = Some(Millis::from_ms(500));
+    assert_eq!(w.idle_ttl_secs(), Some(1));
+    assert_eq!(has_ttl(&w).as_deref(), Some("1"));
+
+    w.idle_ttl = Some(Millis::from_ms(1500));
+    assert_eq!(has_ttl(&w).as_deref(), Some("2"));
+
+    w.idle_ttl = None;
+    assert_eq!(w.idle_ttl_secs(), None);
+    assert_eq!(has_ttl(&w), None, "never-reap must OMIT the variable, not zero it");
+
+    // Even when the escape hatch tries to reintroduce it.
+    w.env
+        .insert("PASSWAY_IDLE_TTL_SECS".into(), "30".into());
+    assert_eq!(has_ttl(&w), None);
+}
+
+/// A passway with no backend yet is legal — a domain is enrolled and issued
+/// before the tenant's app is placed — and renders an empty upstream list,
+/// which passway answers 503 on rather than refusing to start.
+#[test]
+fn a_tenant_passway_with_no_upstreams_renders_an_empty_list() {
+    let w = TenantPasswayWorkload::cold("new.tenant.io", "127.0.0.1:9443");
+    assert_eq!(w.passway_upstreams(), "");
+    assert_eq!(
+        w.tls.cert,
+        "/run/yah/passway/tenants/new.tenant.io/tls.crt",
+        "cert paths are per-domain: a shared path is a shared certificate"
+    );
+}
+
 /// The narrowest unit: the untagged Deserialize itself, exercised directly on
 /// the binary format so a regression points straight at `ImageRef`.
 #[test]
@@ -327,7 +466,7 @@ fn minimal_spec_round_trips_through_json_and_postcard() {
         expose: ExposeSpec {
             mesh: MeshExpose {
                 identity: MeshIdent("minimal.local".into()),
-                ports: vec![80],
+                ports: MeshExpose::anonymous_ports([80]),
                 allow_from: vec![],
             },
             public: None,
@@ -464,7 +603,7 @@ fn admits_peer_enforces_deny_by_default_across_tenants() {
     let public = TierTag("public".into());
     let expose = |allow_from| MeshExpose {
         identity: MeshIdent("api".into()),
-        ports: vec![8080],
+        ports: MeshExpose::anonymous_ports([8080]),
         allow_from,
     };
 

@@ -279,7 +279,9 @@ fn translate_service(
         expose: ExposeSpec {
             mesh: MeshExpose {
                 identity: MeshIdent(mesh_name),
-                ports: mesh_ports,
+                // docker-compose has no port-name concept, so an import can
+                // only ever produce unnamed numbers (R844-F17).
+                ports: MeshExpose::anonymous_ports(mesh_ports),
                 allow_from: vec![],
             },
             public: None,

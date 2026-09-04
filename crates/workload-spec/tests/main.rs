@@ -10,6 +10,7 @@
 //! by this move.
 
 mod compose_import;
+mod mesh_ports;
 mod mesh_resolver;
 mod restart_policy;
 mod round_trip;

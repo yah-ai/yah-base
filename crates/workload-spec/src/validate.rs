@@ -36,6 +36,9 @@ pub enum FieldPath {
     Volume(usize, &'static str),
     /// Public port not found in `expose.mesh.ports`.
     ExposeMeshPort(u16),
+    /// `expose.mesh.ports[index]` — a malformed port declaration (R844-F17):
+    /// an empty entry, a bad name, or a name/number repeated within the list.
+    MeshPort(usize),
     /// `secrets[index].<sub>` — e.g. `Secret(0, "target.path")`.
     Secret(usize, &'static str),
     /// `healthcheck.<sub>`.
@@ -66,6 +69,7 @@ impl fmt::Display for FieldPath {
             FieldPath::Tier => write!(f, "tier"),
             FieldPath::Volume(i, sub) => write!(f, "volumes[{i}].{sub}"),
             FieldPath::ExposeMeshPort(port) => write!(f, "expose.public.port ({port})"),
+            FieldPath::MeshPort(i) => write!(f, "expose.mesh.ports[{i}]"),
             FieldPath::Secret(i, sub) => write!(f, "secrets[{i}].{sub}"),
             FieldPath::Healthcheck(sub) => write!(f, "healthcheck.{sub}"),
             FieldPath::RestartPolicy => write!(f, "restart_policy"),
@@ -166,6 +170,122 @@ fn check_mesh_ident(value: &str, path: FieldPath) -> Result<(), ShapeError> {
     Ok(())
 }
 
+/// The longest a port name may be. Matches IANA's service-name limit, which is
+/// what Kubernetes uses for the same field and what any tool that has to render
+/// a port name in a fixed column already assumes.
+const MESH_PORT_NAME_MAX: usize = 15;
+
+/// Validates `expose.mesh.ports` (R844-F17): every entry states something, every
+/// name is a DNS label short enough to be a service name, and nothing is
+/// declared twice.
+///
+/// The uniqueness rules are the load-bearing half. A repeated *name* would make
+/// `name -> port` ambiguous at exactly the moment a consumer asks for it —
+/// `ServiceRecord::port("http")` and the `PORT_HTTP` variable both resolve
+/// through that map — and a repeated *number* is a workload asking to bind one
+/// socket twice. Both are caught here rather than at bring-up because the
+/// author can still see the manifest.
+fn check_mesh_ports(
+    mesh: &crate::MeshExpose,
+    warnings: &mut Vec<ShapeWarning>,
+) -> Result<(), ShapeError> {
+    let mut seen_names: Vec<&str> = Vec::new();
+    let mut seen_numbers: Vec<u16> = Vec::new();
+
+    for (i, port) in mesh.ports.iter().enumerate() {
+        let path = FieldPath::MeshPort(i);
+
+        if port.name.is_none() && port.number.is_none() {
+            return Err(ShapeError::Field {
+                path,
+                reason: "declares neither a name nor a number — write a number \
+                         (8080), a name (\"http\"), or both \
+                         ({ name = \"http\", port = 8080 })"
+                    .to_string(),
+            });
+        }
+
+        if let Some(name) = port.name.as_deref() {
+            if name.len() > MESH_PORT_NAME_MAX {
+                return Err(ShapeError::Field {
+                    path,
+                    reason: format!(
+                        "port name {name:?} is {} characters; the maximum is \
+                         {MESH_PORT_NAME_MAX}",
+                        name.len()
+                    ),
+                });
+            }
+            if !dns_label_re().is_match(name) {
+                return Err(ShapeError::Field {
+                    path,
+                    reason: format!(
+                        "port name {name:?} must match \
+                         ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+                    ),
+                });
+            }
+            if seen_names.contains(&name) {
+                return Err(ShapeError::Field {
+                    path,
+                    reason: format!(
+                        "port name {name:?} is declared twice; a name is how a \
+                         consumer selects one port, so it has to pick out \
+                         exactly one"
+                    ),
+                });
+            }
+            seen_names.push(name);
+        }
+
+        match port.number {
+            Some(number) => {
+                if seen_numbers.contains(&number) {
+                    return Err(ShapeError::Field {
+                        path,
+                        reason: format!(
+                            "port {number} is declared twice; a workload cannot \
+                             bind the same port on two listeners"
+                        ),
+                    });
+                }
+                seen_numbers.push(number);
+            }
+            // Still a warning rather than an error, but R844-F21 changed what
+            // it has to say. A name-only port IS allocated now — on the native
+            // backend, which owns the workload's network namespace: kamaji
+            // picks the number, remembers it per `(ident, name)` across a
+            // restart, and hands it to the process as `PORT_<NAME>`.
+            //
+            // It is still unbindable on a container backend, where the ports
+            // are the image's and both backends refuse the spelling outright
+            // (`kamaji::reject_unresolved_ports`). Shape validation cannot tell
+            // which backend a spec will land on — placement decides that later
+            // — so naming the split is the most this layer can honestly say,
+            // and it is why an error here would be wrong.
+            None => warnings.push(ShapeWarning {
+                path,
+                message: format!(
+                    "port {:?} declares no number: the native backend allocates \
+                     one and tells the process via PORT_{}, but a container \
+                     backend refuses it — a container's ports are its image's. \
+                     State the number ({{ name = {:?}, port = <n> }}) if this \
+                     workload runs as a container.",
+                    port.name.as_deref().unwrap_or_default(),
+                    port.name
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_uppercase()
+                        .replace(|c: char| !c.is_ascii_alphanumeric(), "_"),
+                    port.name.as_deref().unwrap_or_default(),
+                ),
+            }),
+        }
+    }
+
+    Ok(())
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Run shape validation — sync, no I/O.
@@ -181,11 +301,15 @@ fn check_mesh_ident(value: &str, path: FieldPath) -> Result<(), ShapeError> {
 /// - `replicas`: 0–100.
 /// - `image.tag`: non-empty when `digest` is `None`.
 /// - `volumes[*].source = Bind`: only allowed when `tier = "infra"`.
+/// - `expose.mesh.ports[*]`: each entry states a name and/or a number; names are
+///   DNS labels ≤ 15 chars; no name and no number is declared twice (R844-F17).
 /// - `expose.public.port`: must appear in `expose.mesh.ports`.
 /// - `secrets[*].target`: file paths must be absolute; env-var names must
 ///   match `^[A-Z_][A-Z0-9_]*$`.
 ///
 /// Soft checks (produce warnings, not errors):
+/// - `expose.mesh.ports[*]`: a name with no number — nothing allocates from the
+///   manifest yet, so nothing binds it (R844-F17).
 /// - Unknown tier value.
 /// - `RestartPolicy::Never` without `annotations["yah.forge"] = "true"`.
 /// - `healthcheck.initial_delay < stop_policy.grace_period * 2`.
@@ -266,15 +390,19 @@ pub fn shape(spec: &WorkloadSpec) -> Result<Vec<ShapeWarning>, ShapeError> {
         }
     }
 
+    // expose.mesh.ports[*]: names well-formed, nothing declared twice (R844-F17)
+    check_mesh_ports(&spec.expose.mesh, &mut warnings)?;
+
     // expose.public.port must appear in expose.mesh.ports
     if let Some(public) = &spec.expose.public {
-        if !spec.expose.mesh.ports.contains(&public.port) {
+        if !spec.expose.mesh.declares_number(public.port) {
             return Err(ShapeError::Field {
                 path: FieldPath::ExposeMeshPort(public.port),
                 reason: format!(
                     "port {} must appear in expose.mesh.ports {:?} \
                      before it can be exposed publicly",
-                    public.port, spec.expose.mesh.ports
+                    public.port,
+                    spec.expose.mesh.numbers()
                 ),
             });
         }
@@ -582,8 +710,85 @@ pub enum MeshError {
     )]
     NoPorts { ident: String, lookup: MeshLookup },
 
+    /// The peer exposes several ports and the lookup did not say which
+    /// (R844-B22). Deliberately an error rather than a pick — see
+    /// [`MeshLookup`]'s docs.
+    #[error(
+        "mesh ident {ident:?} exposes {} ports ({}) and none is named \"http\", \
+         so {lookup:?} cannot say which one to use. Name the port in the \
+         lookup (kind = \"port_named\", name = \"…\"), or name one of the \
+         peer's ports \"http\" in its expose.mesh.ports.",
+        .names.len(),
+        .names.join(", ")
+    )]
+    AmbiguousPort {
+        ident: String,
+        lookup: MeshLookup,
+        names: Vec<String>,
+    },
+
+    /// The lookup named a port the peer does not expose (R844-B22).
+    #[error(
+        "mesh ident {ident:?} exposes no port named {name:?}; it has {}",
+        if .available.is_empty() { "none".to_string() } else { .available.join(", ") }
+    )]
+    NoSuchPort {
+        ident: String,
+        name: String,
+        available: Vec<String>,
+    },
+
     #[error("mesh state lookup failed: {0}")]
     Lookup(String),
+}
+
+/// The port name a peer's sole/default listener carries. Agrees with
+/// `kamaji::DEFAULT_PORT_NAME` by convention rather than by import: kamaji sits
+/// *above* workload-spec in the publish DAG (`yah-base <- {qed,kamaji} <-
+/// yubaba`), so depending on it here would invert the graph. The two are pinned
+/// together by `default_port_name_agrees_with_the_supervisor` in this file's
+/// tests.
+pub const DEFAULT_PORT_NAME: &str = "http";
+
+/// Pick the port a [`MeshLookup`] refers to out of a peer's `name -> port` map
+/// (R844-B22) — the one place the rule lives, so every resolver answers the
+/// same way.
+///
+/// - A **named** lookup takes that port, or errors naming what the peer does
+///   have. No fallback: a lookup that asked for `wss` and silently got `http`
+///   would be the positional guess wearing a name.
+/// - An **unnamed** lookup takes the sole port when there is one, else the port
+///   named [`DEFAULT_PORT_NAME`], else errors. It never takes "the first",
+///   which is what this function exists to stop.
+pub fn select_mesh_port(
+    ident: &str,
+    ports: &std::collections::BTreeMap<String, u16>,
+    lookup: &MeshLookup,
+) -> Result<u16, MeshError> {
+    if let Some(name) = lookup.port_name() {
+        return ports.get(name).copied().ok_or_else(|| MeshError::NoSuchPort {
+            ident: ident.to_string(),
+            name: name.to_string(),
+            available: ports.keys().cloned().collect(),
+        });
+    }
+
+    let mut entries = ports.iter();
+    match (entries.next(), entries.next()) {
+        (None, _) => Err(MeshError::NoPorts {
+            ident: ident.to_string(),
+            lookup: lookup.clone(),
+        }),
+        (Some((_, &only)), None) => Ok(only),
+        _ => ports
+            .get(DEFAULT_PORT_NAME)
+            .copied()
+            .ok_or_else(|| MeshError::AmbiguousPort {
+                ident: ident.to_string(),
+                lookup: lookup.clone(),
+                names: ports.keys().cloned().collect(),
+            }),
+    }
 }
 
 /// Resolve [`crate::EnvValue::FromMesh`] references to literal env values.
@@ -593,15 +798,24 @@ pub enum MeshError {
 /// Yubaba's production implementation (in `yubaba::deploy::mesh_resolve`)
 /// reads from raft state.
 ///
-/// **Resolution rules** match the arch doc §"Mesh-derived env":
-/// - [`MeshLookup::Url`] — `"http://<ident>:<port>"`, where `port` is the
-///   first entry in the referenced workload's `MeshExpose.ports`.
+/// **Resolution rules** (R844-B22 replaced the positional ones):
 /// - [`MeshLookup::Host`] — the bare DNS-ish identifier as authored (e.g.
-///   `"noisetable-db.pdx"`).
-/// - [`MeshLookup::Port`] — the first port stringified, e.g. `"5432"`.
+///   `"noisetable-db.pdx"`). Needs no port and resolves for a portless peer.
+/// - [`MeshLookup::Url`] — `"http://<ident>:<port>"`.
+/// - [`MeshLookup::Port`] — that port stringified, e.g. `"5432"`.
+/// - [`MeshLookup::UrlNamed`] / [`MeshLookup::PortNamed`] — the same, at the
+///   peer's port of that name.
 ///
-/// Implementations should perform the port lookup atomically — a `Url` and
-/// `Port` resolved in the same deploy must agree on which port was first.
+/// **Which port** is [`select_mesh_port`]'s decision, and implementations must
+/// route through it rather than re-deriving: a sole port, else the one named
+/// [`DEFAULT_PORT_NAME`], else an error. It is emphatically *not* "the first
+/// entry", which is what this trait's doc used to promise — declaration order
+/// is not a statement about which listener a dependent should dial, and acting
+/// as if it were is how a workload gets handed a metrics port as its API URL.
+///
+/// Because the rule is name-based rather than positional, a `Url` and a `Port`
+/// resolved in the same deploy agree by construction; the old doc had to ask
+/// implementations to make the lookup atomic to get that.
 pub trait MeshResolver {
     fn resolve(&self, ident: &MeshIdent, kind: MeshLookup) -> Result<String, MeshError>;
 }
@@ -615,6 +829,25 @@ pub trait MeshResolver {
 ///
 /// `FromSecret` values are deliberately untouched here — secret resolution
 /// is the secrets layer's job (R090-F5), not the mesh resolver's.
+///
+/// @yah:ticket(R844-B22, "MeshLookup::Url and ::Port resolve &quot;the first entry in expose.mesh.ports&quot; — the positional guess this relay abolishes, in the env-injection path")
+/// @yah:status(review)
+/// @yah:at(2026-09-04T14:10:34Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R844)
+/// @yah:severity(medium)
+/// @yah:gotcha("THE CLAIM IS IN THE TRAIT'S OWN DOC, so this is confirmed rather than inferred. `MeshResolver` (oss/yah-base/crates/workload-spec/src/validate.rs, \\\"Resolution rules\\\") states: `MeshLookup::Url` resolves to `\\\"http://&lt;ident&gt;:&lt;port&gt;\\\"` where port is \\\"the first entry in the referenced workload's `MeshExpose.ports`\\\", and `MeshLookup::Port` is \\\"the first port stringified\\\". That is precisely the index-guess `kamaji::name_anonymous_ports` refuses to make and that R844-F15's `ServiceRecordFanout::port_for` was rewritten to stop making — an ingress rule resolved off declaration order can publish a hostname at a metrics listener, and this path can hand a DEPENDENT WORKLOAD the same wrong number in its environment. Nothing has hit it because no fronted or depended-on workload declares two ports yet; that is the same reason F15 gave for the passway gap it left, and it stops being true the moment someone uses R844-F17's new spelling.")
+/// @yah:next("THIS IS NOW FIXABLE, WHICH IS WHY IT IS FILED — before R844-F17 a manifest could not name a port, so \\\"first\\\" was the only selector available and the doc was describing a limitation rather than a bug. `MeshExpose::named_numbers()` and `kamaji::declared_port_names()` now give a name-keyed answer.")
+/// @yah:next("SHAPE: add a named variant to `MeshLookup` (e.g. `Port { name: String }` / `Url { name: String }`) and make the unnamed forms resolve through the `http` rule instead of index 0 — i.e. one port resolves as today, several resolve to `http` if one is named that, and NONE otherwise. Returning an error when several ports are unnamed is the whole point: it sends the author to the manifest rather than handing a dependent a plausible wrong number. MIND THE WIRE: `MeshLookup` rides `EnvValue::FromMesh` inside `WorkloadSpec`, which crosses the postcard kamaji UDS — see the V6/V7 stanza in oss/kamaji/crates/kamaji-proto/src/version.rs. Adding a field to an existing variant is a bump; appending a whole new variant is not.")
+/// @yah:handoff("FIXED — the positional guess is gone from the env-injection path. `MeshLookup` gained `UrlNamed { name }` / `PortNamed { name }`, APPENDED rather than added as fields on `Url`/`Port` exactly as the ticket instructed, so every existing postcard encoding stays byte-identical (an enum is encoded by variant index) and NO ProtocolVersion bump was needed — verified by the kamaji-proto codec suite passing untouched. The unnamed forms no longer mean \"index 0\": they resolve through `workload_spec::validate::select_mesh_port`, which takes the sole port when there is one, else the port named `http`, else RETURNS AN ERROR. `MeshLookup` also lost `Copy` (it now owns a String); the one call site that relied on it is `resolve_env_from_mesh`, now cloning.")
+/// @yah:handoff("THE RULE LIVES IN ONE PLACE, which is the actual repair — the bug was not that a rule was wrong, it was that the rule was RE-DERIVED at every site, so all of them agreed about something false. `select_mesh_port(ident, &BTreeMap<String,u16>, &MeshLookup)` in workload-spec is now the only implementation; yubaba `StateMeshResolver` calls it, the workload-spec test fake calls it (it had been carrying its OWN copy of \"the first entry\", which is why the test suite confirmed the bug rather than catching it), and the `MeshResolver` trait doc now REQUIRES implementations to route through it instead of describing the rule for them to copy. A named lookup deliberately does NOT fall back to `http`: that would be the positional guess wearing a name.")
+/// @yah:handoff("REQUIRED A TYPE CHANGE THE TICKET DID NOT NAME, and it is where the names were actually being lost: `yubaba::deploy::mesh_resolve::MeshAddress.ports` was a `Vec<u16>`. A bare number list CANNOT answer \"which of these is the API port\", so positional resolution was not a shortcut in that file — it was the only thing the type permitted, and the trait doc had written that limitation down as a rule. It is now the same `BTreeMap<String,u16>` that `kamaji::WorkloadState::ports` and `ServiceRecord::resolved_ports` already carry, so a name survives from manifest to dependent environment. Cheap to change: `MeshAddress` is constructed in exactly one file and only by tests.")
+/// @yah:handoff("ONE CROSS-CRATE CONSTANT, pinned rather than duplicated silently. `select_mesh_port` needs the default port name and CANNOT import `kamaji::DEFAULT_PORT_NAME` — kamaji sits above workload-spec in the publish DAG (`yah-base <- {qed,kamaji} <- yubaba`), so the dep would invert the graph. So `workload_spec::validate::DEFAULT_PORT_NAME` states it, and `kamaji::tests::default_port_name_agrees_with_the_mesh_resolver` asserts all three spellings (kamaji DEFAULT_PORT_NAME, ports::HTTP, the validate const) are one string. Without that pin a future rename would make a dependent `FromMesh` URL and its own `PORT` env disagree about which listener is the default, silently.")
+/// @yah:verify("cargo test --manifest-path oss/yah-base/Cargo.toml -p yah-workload-spec = 146/0 + 94/0 (87 before, so +7). The behaviour change is pinned by name: `several_unnamed_ports_is_an_error_not_the_first_one` (the case that previously rendered 5432 out of [5432,9100] and had a test LOCKING THAT IN), `several_ports_resolve_through_http_when_one_is_named_that`, `a_named_lookup_selects_that_port_and_nothing_else`, `a_named_lookup_for_an_absent_port_errors_rather_than_falling_back`, `a_sole_port_resolves_whatever_it_is_called` (sole beats the http rule on purpose — no ambiguity exists with one listener), `an_empty_port_map_is_no_ports_not_ambiguous`, `host_resolves_for_a_portless_peer`.")
+/// @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib = 634 passed / 0 failed (632 before). Two new cases run the PRODUCTION resolver, not the fake: `several_unnamed_ports_error_rather_than_resolving_to_the_first` and `a_named_lookup_selects_that_port_through_the_state_resolver`. THREE PRE-EXISTING TESTS ASSERTED THE BUG and were rewritten rather than worked around — `url_renders_first_port_with_http_prefix` / `port_renders_first_port_as_string` (both crates) took a two-port peer and asserted the first one came back; their fixtures are now single-port and the multi-port case is its own explicitly-named test.")
+/// @yah:verify("WHOLE-TREE on a settled tree: cargo test --manifest-path oss/kamaji/Cargo.toml --workspace --all-features = every target ok (kamaji lib 185/0, kamaji-bin 278/0, kamaji-proto codec suite untouched and green — the no-wire-bump evidence); yah-cloud --lib 1019/0/4 ignored; yah-local-driver --lib 99/0; cargo test -p yah --lib 1364 passed / 0 failed / 1 ignored; cargo check --workspace --all-targets = ZERO errors. R844 PURITY CANARY HELD: cargo test -p xtask --test main mirror_ingress = 11 passed / 0 failed.")
+/// @yah:gotcha("MEASURED SCOPE, so nobody over- or under-reads this fix: THE FromMesh ENV PATH HAS NO PRODUCTION CALLER TODAY. `resolve_env_from_mesh` is called only from workload-spec own tests; `StateMeshResolver` is constructed only in its own module tests; and kamaji-bin `resolve_env` (native.rs:208) REFUSES an unresolved `EnvValue::FromMesh` outright with \"Yubaba must resolve mesh refs before dispatching to Kamaji\" — but nothing in yubaba calls the resolver on the deploy path. So the wrong rule had not yet handed a real workload a wrong number; it was a loaded gun, not a fired one. That is also why the fix was cheap (no call sites to migrate) and why it was worth doing NOW rather than after the path is wired.")
+/// @yah:gotcha("GENERATED ARTIFACTS REGENERATED, and they carry MORE than this ticket. `.yah/schema/workload.toml.schema.json` and `packages/yah/workload-spec/index.ts` are generated from these Rust types and the pre-commit regen was disabled 2026-08-15, so they had gone stale at R844-F17 — the TS binding still said `ports: Array<number>` weeks after `MeshExpose.ports` became `Vec<MeshPort>`. Running `cargo run -p xtask -- emit-schemas` and the workload-spec `export-ts` bin swept BOTH F17 drift and this ticket. Diff is confined to the two expected surfaces (`MeshExpose.ports`, `MeshLookup`) and nothing else. Flagging per the shared-tree rule that a derived file is nobody property: whoever owns R844-F17 should know their type change is now reflected in the bindings.")
 pub fn resolve_env_from_mesh(
     env: &[EnvVar],
     resolver: &dyn MeshResolver,
@@ -622,7 +855,7 @@ pub fn resolve_env_from_mesh(
     env.iter()
         .map(|var| match &var.value {
             EnvValue::FromMesh { ident, kind } => {
-                let value = resolver.resolve(ident, *kind)?;
+                let value = resolver.resolve(ident, kind.clone())?;
                 Ok(EnvVar {
                     name: var.name.clone(),
                     value: EnvValue::Literal { value },

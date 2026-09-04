@@ -36,6 +36,11 @@
 //! placement instead of being typed in, the same way the rented
 //! `cloudflare-tunnel` arm's ingress rules are generated from deployed
 //! workloads rather than hand-written.
+//!
+//! Discovery mode also needs [`PasswayIngressSpec::discover_ident`]
+//! (R844-B6): the record surface answers for the whole node, so the ident is
+//! what keeps this appliance fronting *its* workload rather than every Ready
+//! container on the box.
 
 use std::collections::HashMap;
 
@@ -122,8 +127,27 @@ pub struct PasswayIngressSpec {
     /// hand-configured proxy: the backend set follows placement, exactly as
     /// the rented arm's tunnel ingress rules do. Leave it `None` for a
     /// standalone edge fronting something yubaba doesn't place.
+    ///
+    /// Pairs with [`Self::discover_ident`] — set one and you must set the
+    /// other, or passway refuses to boot (R844-B6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discover_from: Option<String>,
+
+    /// R844-B6: the workload ident whose service records this passway adopts
+    /// as backends, rendered as `PASSWAY_YUBABA_IDENT`. Only meaningful
+    /// alongside [`Self::discover_from`], and **required** whenever that is
+    /// set: the discovery endpoint answers for the whole node, so a passway
+    /// polling without an ident routes its one hostname's traffic to every
+    /// Ready workload on that node.
+    ///
+    /// It is `Option` for wire compatibility only — this type is persisted,
+    /// and `into_container_workload` returns a `Workload` rather than a
+    /// `Result`, so an unpaired spec cannot be rejected at lowering time. It
+    /// lowers to a discovery-mode workload with no ident, and passway panics
+    /// at boot with the missing variable named. Loud there beats silently
+    /// fronting the wrong containers here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discover_ident: Option<String>,
 
     /// Speak TLS to upstreams. Default `false` — the mesh is already encrypted.
     #[serde(default)]
@@ -175,6 +199,11 @@ impl PasswayIngressSpec {
             Some(base_url) => {
                 env.push(literal_env("PASSWAY_UPSTREAM_SOURCE", "yubaba".into()));
                 env.push(literal_env("PASSWAY_YUBABA_URL", base_url.clone()));
+                // Omitted only when the spec is unpaired, which passway then
+                // rejects at boot by name — see `discover_ident`.
+                if let Some(ident) = &self.discover_ident {
+                    env.push(literal_env("PASSWAY_YUBABA_IDENT", ident.clone()));
+                }
             }
             None => {
                 env.push(literal_env("PASSWAY_UPSTREAM_SOURCE", "static".into()));
@@ -245,7 +274,7 @@ impl PasswayIngressSpec {
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent(INGRESS_WORKLOAD_NAME.into()),
-                    ports: vec![TLS_PORT],
+                    ports: MeshExpose::anonymous_ports([TLS_PORT]),
                     allow_from: vec![],
                 },
                 // passway terminates TLS itself on the public :443 — this is NOT
@@ -298,6 +327,7 @@ mod tests {
             upstreams: vec!["yah-marketing.pdx:8080".into(), "yah-dashboard.pdx:8080".into()],
             upstream_tls: false,
             discover_from: None,
+            discover_ident: None,
             command: None,
         }
     }
@@ -387,6 +417,7 @@ mod tests {
     fn discover_from_selects_the_yubaba_upstream_source() {
         let mut s = sample_spec();
         s.discover_from = Some("http://100.64.0.2:7443".into());
+        s.discover_ident = Some("yah-marketing".into());
         let spec = lower(&s);
 
         assert_eq!(env_val(&spec, "PASSWAY_UPSTREAM_SOURCE"), Some("yubaba"));
@@ -394,6 +425,27 @@ mod tests {
             env_val(&spec, "PASSWAY_YUBABA_URL"),
             Some("http://100.64.0.2:7443")
         );
+    }
+
+    #[test]
+    fn discovery_mode_renders_the_workload_ident() {
+        // R844-B6: without this the deployed passway adopts every Ready
+        // record on the polled node, whatever workload it describes.
+        let mut s = sample_spec();
+        s.discover_from = Some("http://100.64.0.2:7443".into());
+        s.discover_ident = Some("yah-marketing".into());
+        let spec = lower(&s);
+
+        assert_eq!(
+            env_val(&spec, "PASSWAY_YUBABA_IDENT"),
+            Some("yah-marketing")
+        );
+    }
+
+    #[test]
+    fn static_mode_renders_no_workload_ident() {
+        let spec = lower(&sample_spec());
+        assert_eq!(env_val(&spec, "PASSWAY_YUBABA_IDENT"), None);
     }
 
     #[test]
@@ -440,7 +492,7 @@ mod tests {
     fn ha_diagnose_can_find_it_by_ident() {
         let spec = lower(&sample_spec());
         assert!(spec.expose.mesh.identity.0.to_lowercase().contains("passway"));
-        assert_eq!(spec.expose.mesh.ports, vec![443]);
+        assert_eq!(spec.expose.mesh.numbers(), vec![443]);
     }
 
     #[test]

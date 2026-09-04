@@ -64,9 +64,11 @@ anchor() { # path
 }
 anchor /usr/local/bin/yubaba
 anchor /usr/local/bin/kamaji
+anchor /usr/local/bin/yah-scryer
 anchor /etc/systemd/system/yubaba.slice
 anchor /etc/systemd/system/kamaji.service
 anchor /etc/systemd/system/yubaba.service
+anchor /etc/systemd/system/yah-scryer.service
 
 echo "== install (atomic, yubaba + kamaji as one pair) =="
 # Stage next to the target on the SAME filesystem, then rename. A rename within
@@ -80,6 +82,18 @@ install_atomic "$D/kamaji"         0755 /usr/local/bin/kamaji
 install_atomic "$D/yubaba.slice"   0644 /etc/systemd/system/yubaba.slice
 install_atomic "$D/kamaji.service" 0644 /etc/systemd/system/kamaji.service
 install_atomic "$D/yubaba.service" 0644 /etc/systemd/system/yubaba.service
+# yah-scryer rides the same tarball from 0.8.32 (R556-F6 gate (b), A049: each
+# node runs its own scryer). CONDITIONAL on the tarball actually carrying it so
+# a rollback to a pre-scryer release still succeeds — it leaves whatever scryer
+# is already installed in place rather than failing on a missing member. The
+# scryer's own durable state (/var/lib/yah/scryer, events.db) is never touched
+# here; the unit's StateDirectory owns it.
+HAS_SCRYER=0
+if [ -e "$D/yah-scryer" ]; then
+  HAS_SCRYER=1
+  install_atomic "$D/yah-scryer"         0755 /usr/local/bin/yah-scryer
+  install_atomic "$D/yah-scryer.service" 0644 /etc/systemd/system/yah-scryer.service
+fi
 
 echo "== assert by CONTENT, not by version string =="
 # `--version` prints the workspace version baked in at build time, which says
@@ -101,9 +115,19 @@ assert_installed_bytes() { # extracted installed
 }
 assert_installed_bytes "$D/yubaba" /usr/local/bin/yubaba
 assert_installed_bytes "$D/kamaji" /usr/local/bin/kamaji
+if [ "$HAS_SCRYER" = 1 ]; then
+  assert_installed_bytes "$D/yah-scryer" /usr/local/bin/yah-scryer
+fi
 
 echo "== restart supervision tree (kamaji then yubaba, W154 order) =="
 $SUDO systemctl daemon-reload
 $SUDO systemctl restart kamaji.service
 $SUDO systemctl restart yubaba.service
+# Scryer sits outside the W154 order — it neither drives nor is driven by the
+# pair (A049: located by yubaba, not driven by it), so it restarts last.
+# `enable` covers the first install; on later rolls it is a no-op.
+if [ "$HAS_SCRYER" = 1 ]; then
+  $SUDO systemctl enable yah-scryer.service
+  $SUDO systemctl restart yah-scryer.service
+fi
 echo "installed target=$VER yubaba=$(/usr/local/bin/yubaba --version 2>/dev/null) kamaji=$(/usr/local/bin/kamaji --version 2>/dev/null)"

@@ -266,7 +266,7 @@ pub fn lower_workload_spec(
     let container_port = ws
         .expose
         .mesh
-        .ports
+        .numbers()
         .first()
         .copied()
         .unwrap_or(DEFAULT_SSR_CONTAINER_PORT);
@@ -444,7 +444,7 @@ mod tests {
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent("ssr-runtime".into()),
-                    ports: vec![3000],
+                    ports: MeshExpose::anonymous_ports([3000]),
                     allow_from: vec![],
                 },
                 public: None,

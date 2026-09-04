@@ -80,6 +80,99 @@
 //! @yah:verify("cargo test -p agent-tools --lib vault (3/3 pass)")
 //! @yah:verify("cargo check --workspace clean")
 //!
+//!
+//! @yah:ticket(R856-F1, "CredentialSpec registry + verdict sidecar covering all 42 live slots")
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:at(2026-09-03T22:18:26Z)
+//! @yah:phase(P1)
+//! @yah:parent(R856)
+//! @yah:next("W337 §3 and §10.1. This is the highest-value item in the doc and the only phase with zero provider-integration risk — every later ticket reads from it.")
+//! @yah:next("Shape: CredentialSpec { slot, env, purpose, consumers, provider, mint } + Expiry::{Enforced(date), Declared(date), ReviewBy(date)} + the manual/automatable band (W337 §7). ReviewBy is the one a naive Option<expires_at> silently drops — a never-expiring token still gets a 1-year date meaning re-mint, not dies.")
+//! @yah:next("Verdict sidecar is a PLAIN file next to credentials.enc, never inside it: { slot, last_probe_at, verdict, expires_at, scopes, probe_error }. Verdicts are not secret and the desktop must render health without decrypting anything.")
+//! @yah:next("ABSORB THE OTHER TWO INVENTORIES IN THIS SAME CHANGE, or a fourth gets born: CLOUD_SECRETS (app/yah/cli/src/cloud.rs:9901, 7 slots) and cloud.creds_check (crates/yah/agent-tools/src/cloud_tools.rs:1571). creds_check is the AGENT-facing one — leaving it on its own list is how an agent tells the operator a revoked credential is fine.")
+//! @yah:next("Populating 42 slots is a day of dashboard archaeology. That is the work, not a preamble to it.")
+//! @yah:verify("The registry enumerates exactly the slots `yah keys list` returns (42 as of 2026-09-03), with no phantom entries and no unlisted ones")
+//! @yah:verify("cloud.creds_check and the `yah cloud secrets` table both read the registry — grep shows no second hardcoded slot list left in cloud.rs or cloud_tools.rs")
+//! @yah:verify("A ReviewBy(date) spec round-trips through the sidecar and renders distinctly from Enforced(date) — not collapsed into one Option<DateTime>")
+//! @yah:gotcha("CLOUD_SECRETS is already stale in BOTH directions — 3 of its 7 declared slots (hetzner-s3-access-key, hetzner-s3-secret-key, iroh-node-secret) do not exist in the vault at all, and iroh-node-secret concedes in its own comment that it is not yet consumed. Do not port the list verbatim; reconcile it against `yah keys list` first.")
+//! @yah:gotcha("There is no `anthropic` vault slot despite what several docs imply. The LLM slots are openai-api-key, openai-oauth, deepseek-api-key, groq-api-key, kimi-platform-api-key, openrouter-api-key, ollama.")
+//! @arch:see(.yah/docs/working/W337-credential-health-and-rotation.md)
+//! @yah:tier(Wizard)
+//! @yah:handoff("LANDED. New module oss/yah-base/crates/keys/src/spec.rs (~1100 lines) re-exported from fob's lib.rs: CredentialSpec { slot, env, purpose, consumers, provider, domain, band, provider_cap_days, expiry_kind, probe_from, mint, required, onepassword } + Provider/Domain/Band/ExpiryKind/ProbeFrom/MintHelp + the sidecar types Expiry/Verdict/HealthRecord/HealthSidecar. fob's Cargo.toml gained chrono 0.4 (serde) and serde 1 (derive), spelled out because oss/yah-base is an independent workspace.")
+//! @yah:handoff("REGISTRY = 45 specs, verified by diffing extracted slot literals against `yah keys list` under LC_ALL=C: all 42 live slots present, zero unlisted. The 3 extras are declared-but-unpopulated slots kept because each has a live fob::get_or_env call site — digitalocean-api-token (oss/yubaba/crates/cloud/src/envoy.rs:331), hetzner-s3-access-key and hetzner-s3-secret-key (oss/yubaba/crates/cloud/src/provider/hetzner.rs:142-143). DROPPED iroh-node-secret: grepped the slot name and IROH_NODE_SECRET across the whole tree and the only hits were the two inventories themselves plus its own comment conceding it is unconsumed. Test spec::tests::dropped_iroh_node_secret_is_absent pins that.")
+//! @yah:handoff("SIDECAR is a separate plain file credential-health.json in KeysStore::dir(), mode 0644, written by a new write_plain() (tmp+rename, NOT write_secure's 0600 — 0600 would block the desktop reader the sidecar exists for). read_health() is infallible: missing or corrupt yields an empty sidecar, so a damaged health file can never break `yah cloud secrets` or creds_check. Reading it decrypts nothing — proven by keys::tests::sidecar_is_readable_without_the_machine_key, which reads verdicts back from a store that has no machine.key and no credentials.enc. New testability seam KeysStore::at(dir) (open() unchanged) is what makes that test possible without writing to the developer's real vault (the trap app/yah/cli/src/camp.rs:708 documents).")
+//! @yah:handoff("EXPIRY IS THREE-VALUED, not Option<DateTime>. Expiry::{Enforced,Declared,ReviewBy,Unknown} with is_fatal() false for ReviewBy and render() emitting 're-mint by <date> (does not expire)' vs 'expires <date> (provider-enforced)'. Two tests cover the verify criterion: spec::tests::review_by_is_not_an_expiry and expiry_round_trips_through_the_sidecar_without_collapsing, plus a real-file round-trip through KeysStore in keys::tests::sidecar_round_trips_and_preserves_review_by.")
+//! @yah:handoff("TTL BANDS per W337 §7: Band::{Manual=365d, Automatable=90d}, effective_ttl_days() = min(band, provider_cap), ttl_capped_below_band() flags §7.3. npm-api-token is the sole flagged instance (Manual band, provider_cap_days=Some(90), grounded in the doc's npm-changelog reading), and a test asserts it is the ONLY flagged slot so a later careless cap cannot slip in unnoticed. `yah cloud secrets` renders the flag inline. Automatable band assigned to exactly 4 slots, each grounded: cloudflare-mesofact-static and cloudflare-r2-fleet-read-* (W295 line 546 — rotation automatable from the camp via cloudflare-legacy-yah), headscale-preauth-key (headscale-api-key mints per-machine keys), openai-oauth (refresh token).")
+//! @yah:handoff("BOTH CONSUMERS REPOINTED. app/yah/cli/src/cloud.rs: struct Secret + CLOUD_SECRETS deleted, handle_secrets now iterates fob::specs_in_domain(Domain::Infra) (22 slots vs the old stale 7) and gained rotation-band, health and mint lines; resolve_headscale_preauth_key now reads its slot/env pair off the registry instead of hardcoding it. The dead keys_supported field went with it — it was true for all seven despite its own doc comment, so the `[env-only]` tag it drove was unreachable. crates/yah/agent-tools/src/cloud_tools.rs: struct CredSlot + CRED_SLOTS deleted, creds_check reads the same registry filter plus the sidecar. Verified by grep: no second hardcoded slot list remains in either file (the surviving literals are single get_or_env call sites and clap default_values, not inventories).")
+//! @yah:handoff("The doc comment at cloud_tools.rs:1502 that justified the duplication ('so agent-tools doesn't gain a cloud crate dependency just for a name list') was rewritten rather than left asserting something false — the registry lives in fob, which agent-tools already depended on, so there was never a new edge to avoid.")
+//! @yah:handoff("MINT HELP populated for exactly 3 providers — Cloudflare, Hetzner, GitHub — ported verbatim from packages/yah/ui/src/components/shell/AgentsSection.tsx:57-105. Everything else is MintHelp::NONE. A test asserts npm-api-token and crates-io-token are NOT populated, so a future agent cannot quietly invent a mint URL. Full port is R856-F5.")
+//! @yah:handoff("PROBE_FROM carried as ProbeFrom::{Local, Workload(&'static str)} — &'static str rather than W337's String because the registry is a const; same information. Four slots are Workload: cloudflare-r2-fleet-read-* and cheers-cloud-admin-verify-key (yah-cloud-admin, per the W294 secret declarations) and noisetable-account-smtp-password (the exact §5 case — cloud-range SMTP blocks look like a bad password). Nothing consumes the field yet; F8 does.")
+//! @yah:handoff("PURPOSE + CONSUMERS populated per slot from grep, with file:line where a named const exists. Where nothing could be grounded the spec SAYS SO instead of guessing: exe-dev-api-token, mailgun-api-key, cloudflare-static-yah-dev, cloudflare-tunnel-token-mesh and the three noisetable-account-* slots each carry an explicit 'nothing in-tree reads this slot (grepped 2026-09-03)' with what was grepped. exe-dev-api-token is also marked Provider::Unknown with a warning not to assume exe.dev — W214's 'exe-dev' names a ticket tier, not a service.")
+//! @yah:handoff("Tree anchor at handoff: dbe6954b48a66734f6664f9474dc2dedb89bfa8d — the shared tree as I left it. Diff against it (`git diff dbe6954b48a66734f6664f9474dc2dedb89bfa8d..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:verify("cargo test --manifest-path oss/yah-base/crates/keys/Cargo.toml -> 36 passed, 0 failed (baseline before this change: 20 passed, 0 failed)")
+//! @yah:verify("cargo test -p yah-agent-tools -> 1221 passed, 0 failed, 1 ignored — identical to the baseline recorded before any edit")
+//! @yah:verify("cargo test -p yah --lib -> 1338 passed, 0 failed, 1 ignored; cargo build -p yah clean (warnings only, all pre-existing)")
+//! @yah:verify("Registry completeness re-checkable with: rg -o '^        slot: \"[a-z0-9-]+\"' oss/yah-base/crates/keys/src/spec.rs | sed 's/.*slot: \"//;s/\"//' | LC_ALL=C sort, then comm against `yah keys list`. Expect empty on the vault-not-in-registry side and exactly digitalocean-api-token / hetzner-s3-access-key / hetzner-s3-secret-key on the other.")
+//! @yah:verify("./target/debug/yah cloud secrets --quiet renders 22 infra slots with rotation/health/mint lines and reports '19 of 22 configured, 0 required missing'")
+//! @yah:gotcha("ExpiryKind::Unverified is the DEFAULT in the registry, deliberately, and it is not a synonym for ReviewBy. ReviewBy is a positive claim ('this credential does not expire at all'), so asserting it about a provider whose expiry policy nobody actually read would be wrong in the same direction as a green light on a dead key. Only npm-api-token and openai-oauth carry Enforced; the self-minted key material and the not-really-credential config slots (mesh-*, cloudflare-zone-id) carry ReviewBy. R856-F2/F6 should convert Unverified -> Enforced/Declared as each provider's docs get read, not before.")
+//! @yah:gotcha("DISCOVERED, NOT FIXED, out of this ticket's reconciliation mandate: crates/yah/runner/src/resolver/mod.rs:1136-1137 declares OPENAI_ADMIN_SLOT = 'openai-admin-key' / OPENAI_ADMIN_ENV, and line 1130 declares ANTHROPIC_ADMIN_ENV = 'ANTHROPIC_ADMIN_KEY'. Neither slot is in `yah keys list` nor in either absorbed inventory, so neither is in the registry. If they are real credential slots they need specs; if they are dead they should be deleted. Worth one grep by whoever takes F2.")
+//! @yah:gotcha("`yah cloud secrets` now lists 22 slots where it listed 7. That is the point (the old list was stale in both directions), but it is a visible output change for anyone with the old table memorised.")
+//! @yah:gotcha("`yah keys list` sorts with Rust byte ordering; plain `sort` under a non-C locale orders release-cosign-key / release-cosign-key-pw differently and makes `comm` report a phantom difference. Use LC_ALL=C when diffing the registry against the vault.")
+//! @yah:gotcha("CROSS-WORKSPACE: fob gained chrono+serde, and all four workspaces that consume it are consistent — oss/yah-base (--all-targets), oss/qed (-p yah-qed --locked) and oss/yubaba (-p fob --locked) all pass, and the yubaba/qed lockfiles already carried both deps so no lockfile edit was needed. NOTE the package id is `yah-qed`, not `qed` — `cargo check -p qed` fails with 'did not match any packages' and is NOT a real failure. `cargo check --manifest-path oss/yubaba/Cargo.toml -p yah-cloud` DOES fail, independently of fob: a live peer's uncommitted rewrite of oss/kamaji/crates/kamaji/src/ports.rs (+677/-171) renamed PortAllocator::resolve to resolve_one/resolve_set and the call site at oss/yubaba/crates/cloud/src/reconciler/mesofact_static.rs:634 still calls .resolve(). Left untouched — it belongs to that peer.")
+//! @yah:verify("INDEPENDENTLY VERIFIED 2026-09-03 (Glimmerstone, session:00f48ab8, anchor dbe6954b): all six claimed criteria hold. Counts reproduced exactly — fob 36/0, yah --lib 1338/0/1, yah-agent-tools 1221/0/1 (on re-run; see the flake gotcha), `./target/debug/yah cloud secrets --quiet` renders 22 infra slots and prints '19 of 22 configured, 0 required missing' verbatim from a freshly-rebuilt binary. Registry/vault comm diff under LC_ALL=C is empty on the vault-not-in-registry side and exactly digitalocean-api-token / hetzner-s3-access-key / hetzner-s3-secret-key on the other. No second inventory array survives in cloud.rs or cloud_tools.rs (remaining literals are clap default_values and one get_or_env). Expiry distribution is 27 Unverified / 16 ReviewBy / 2 Enforced / 0 Declared, and the registry contains NO date literals at all — dates exist only in the sidecar, so a fabricated expiry is structurally impossible. Expiry is adjacently-tagged serde (tag=kind, content=at), so ReviewBy cannot collapse into Enforced; both round-trip tests assert the distinction rather than passing vacuously. sidecar_is_readable_without_the_machine_key genuinely asserts !machine_key_path().exists() && !credentials_path().exists(). A 0644 test already existed (keys::tests::sidecar_is_0644_not_0600, lib.rs:1034) — it asserts 0644 on the sidecar AND 0600 on credentials.enc, so nothing needed adding. MintHelp is populated for exactly Cloudflare/Hetzner/GitHub; every other slot is the MintHelp::NONE const, which has no URL field set, so an invented dashboard URL is impossible by construction. One cosmetic deviation from 'verbatim': the ported Cloudflare nav_hint drops the TS source's trailing '— otherwise point a CNAME at the *.cfargotunnel.com hostname from your registrar' clause and renders arrows as -> instead of →. Both are removals/transliterations, not inventions. Nothing was fixed because nothing was broken.")
+//! @yah:gotcha("FLAKY TEST, not a regression: camp_tools::tests::camp_character_update_allows_class_subclass_mismatch failed once on a full `cargo test -p yah-agent-tools` (1220 passed / 1 failed) with 'subclass \"smoke-wizard\" not found — call camp.subclasses_list to discover valid ids' at camp_tools.rs:3347. It passes in isolation and the very next full-suite run was 1221/0/1. camp_tools.rs and every subclass/character/preroll source are unmodified in the tree, so this is order/parallelism-dependent shared state in the camp subclass registry, entirely unrelated to fob or credentials. If it bites someone again, that is the cause — do not chase it into R856.")
+//! @yah:handoff("INDEPENDENTLY VERIFIED by a second courier (not the implementer), 2026-09-03, at relay-leader request. All three ticket verify criteria hold. Counts reproduced in the foreground on a contended shared target dir: fob 36 passed/0 failed (baseline 20/0), yah --lib 1338/0/1 ignored, yah-agent-tools 1221/0/1 ignored, cargo build -p yah clean. A freshly rebuilt ./target/debug/yah cloud secrets --quiet renders 22 infra slots and prints '19 of 22 configured, 0 required missing' verbatim. The registry-vs-vault comm diff under LC_ALL=C came back exactly as predicted: nothing on the vault-not-in-registry side, exactly digitalocean-api-token / hetzner-s3-access-key / hetzner-s3-secret-key on the other. No surviving inventory array in either repointed file. The two expiry tests and the sidecar test were opened and confirmed substantive rather than vacuous, and Expiry serializes adjacently-tagged (tag=kind, content=at) so Enforced and ReviewBy cannot collapse. No fabricated dates: 27 Unverified / 16 ReviewBy / 2 Enforced / 0 Declared, and zero date literals in registry data. MintHelp is one of exactly four values by construction, so a NONE slot cannot carry an invented URL.")
+//! @yah:handoff("Tree anchor at handoff: dbe6954b48a66734f6664f9474dc2dedb89bfa8d — the shared tree as I left it. Diff against it (`git diff dbe6954b48a66734f6664f9474dc2dedb89bfa8d..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:next("R856-F2 is now unblocked and is the next dependency-wave ticket (T3 and F8 also key off F1). F2 should convert ExpiryKind::Unverified to Enforced/Declared per slot AS EACH PROVIDER'S LIVE DOCS ARE READ, never before — Unverified is the deliberate default and is not a synonym for ReviewBy. F2 should also resolve the discovered orphan pair recorded in this ticket's gotchas: crates/yah/runner/src/resolver/mod.rs:1130-1137 declares OPENAI_ADMIN_SLOT / OPENAI_ADMIN_ENV / ANTHROPIC_ADMIN_ENV for slots that exist in neither the vault nor the registry — spec them or delete them.")
+//! @yah:verify("CROSS-WORKSPACE RISK CHECKED AND CLEAR (the implementer had only built the root workspace). fob is consumed by nine dependents across four workspaces, and adding chrono+serde to it touches every lockfile. All four are consistent — `cargo check --locked` succeeded for oss/yah-base (--all-targets), oss/qed (-p yah-qed; note the package is yah-qed, not qed), and fob itself inside oss/yubaba. No lockfile needed updating.")
+//! @yah:gotcha("PRE-EXISTING, NOT FROM THIS TICKET, and it blocks `cargo check --manifest-path oss/yubaba/Cargo.toml -p yah-cloud` camp-wide: a live peer holds an uncommitted rewrite of oss/kamaji/crates/kamaji/src/ports.rs (+677/-171) renaming PortAllocator::resolve to resolve_one/resolve_set, and the call site at oss/yubaba/crates/cloud/src/reconciler/mesofact_static.rs:634 still uses the old name. Reproduced under --locked, and fob compiles fine in that same workspace, so it is independent of R856-F1. oss/yubaba/crates/cloud/src/reconciler/ingress.rs also changed mid-verification — someone is live in that crate. Left untouched per shared-tree doctrine.")
+//!
+//! @yah:ticket(R856-F7, "Tier-2 probed expiry where the provider exposes it, and tier-3 scope drift")
+//! @yah:at(2026-09-03T21:09:27Z)
+//! @yah:status(open)
+//! @yah:phase(P3)
+//! @yah:parent(R856)
+//! @yah:next("W337 §3 tiers 2-3 and §10.6. Tier 3 (scope drift) is the least available signal and the most valuable when present, because it is the ONLY tier that catches a break before the failing call.")
+//! @yah:next("Tier 2 upgrades Declared(date) to Enforced(date) where a provider introspection endpoint exposes it. Declared stays the floor everywhere else — this ticket narrows the unknown, it does not replace the registry answer.")
+//! @yah:next("Same rule as R856-F2: every endpoint and every scope-carrying header must be read from the provider live docs. A wrong endpoint here produces a confident green on a dead key.")
+//! @yah:verify("At least one provider reports Enforced(date) read from the provider itself, and the sidecar shows it superseding a prior Declared(date)")
+//! @yah:verify("A deliberately narrowed token reports ScopeInsufficient { missing } naming the actual missing scope, not a generic failure")
+//! @yah:gotcha("npm is the known-hard case and is already handled without this ticket: `npm token list` returns id, token prefix, created date and CIDR whitelist with NO expiry field — confirmed both by running it and against npm documented field list. Reading npm expiry needs the registry HTTP API and whether the granular-token endpoint exposes it is UNVERIFIED. Do not block this ticket on npm; declared-at-rotation already covers it.")
+//! @arch:see(.yah/docs/working/W337-credential-health-and-rotation.md)
+//! @yah:depends_on(R856-F2)
+//! @yah:tier(Wizard)
+//! @yah:next("SCOPE NARROWED 2026-09-03 by R856-T4: npm's probed expiry is NOT yours — it moved to R856-F2. Measured: `npm token list --json` returns `expiry` (RFC 3339) alongside `permissions`, `scopes`, `cidr`, `bypass_2fa`, `revoked`, so npm's tier-2 answer is one field on the same call F2's tier-1 auth probe already makes; parsing it here would mean parsing the same response twice, one phase apart. F7 keeps tier-2 probed expiry for the OTHER providers, plus tier-3 scope drift everywhere including npm. W337 §10 step 6 and §3.2 are both reworded to match — read §3.2's \"Ownership\" paragraph before starting. Trap recorded there: `--json` carries NO `id` field (`key` is `***`, `token` is the masked npm_XXXX...YYYY form), so a record cannot be joined to a vault slot by id — match on the masked token prefix.")
+//!
+//! @yah:ticket(R856-F9, "Overlap slots: slot / slot.next, so rotation is never atomic")
+//! @yah:at(2026-09-03T21:09:41Z)
+//! @yah:status(open)
+//! @yah:phase(P4)
+//! @yah:parent(R856)
+//! @yah:next("W337 §6 and §10.8. The strongest defence against rot is not detection, it is making rotation non-atomic. Consumers try current-then-next; rotation becomes mint -> write .next -> probe -> promote -> revoke old, with no window where the only live credential is unverified.")
+//! @yah:next("Where a provider permits two live keys this removes the outage shape from rotation entirely. Not every provider does — the CredentialSpec needs a flag for it, and slots without it fall back to the R856-F5 probe-before-write path.")
+//! @yah:next("Reuse the vault.lease (R219) vocabulary for time-boxing rather than inventing a second one — VaultLeaseEntry / VaultLeaseTable in crates/yah/agent-tools/src/tools.rs:435 already model \"credential valid for N seconds, then gone\".")
+//! @yah:verify("A full mint -> .next -> probe -> promote -> revoke cycle completes with a consumer reading successfully at every intermediate step")
+//! @yah:verify("A slot whose provider forbids two live keys refuses the overlap path and routes to `yah keys rotate` instead")
+//! @arch:see(.yah/docs/working/W337-credential-health-and-rotation.md)
+//! @yah:depends_on(R856-F5)
+//! @yah:tier(Wizard)
+//!
+//! @yah:ticket(R856-T11, "Clobber-recovery store for overwritten vault slots — NOT a `&lt;slot&gt;.prev` entry in the slot namespace")
+//! @yah:at(2026-09-03T22:29:32Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R856)
+//! @yah:next("WHY THIS EXISTS: R856-T10 removed the --overwrite guard from `yah keys set` (it lost send-once credentials: provider shows a token once at registration, the guard refuses because the slot holds a stale value, secret gone). A vaulted secret still has no version history, so an overwrite is still permanent. This ticket is the recovery half the guard used to stand in for.")
+//! @yah:next("DO NOT IMPLEMENT THIS AS `&lt;slot&gt;.prev` IN THE SLOT NAMESPACE — operator ruled that out on 2026-09-03, and the reason is not obvious. R856-F1 made `yah keys list` the authority the fob credential registry is diffed against, and it ships a test asserting the registry contains no slot the vault does not have and none it does not list. A `.prev` entry would read as an unlisted vault slot, break that invariant, and add a shadow row per rotated credential to the `yah cloud secrets` table. The clobber-recovery idea is sound; it needs a store that is NOT the slot namespace (a sidecar history file under the keys dir, encrypted with the same machine key, bounded depth, invisible to list_slots).")
+//! @yah:verify("`yah keys list` output is byte-identical before and after an overwrite that stashes a prior value — the R856-F1 registry-vs-vault diff test still passes")
+pub mod spec;
+
+pub use spec::{
+    parse_sidecar, render_sidecar, spec, specs_in_domain, Band, CredentialSpec, Domain, Expiry,
+    ExpiryKind, HealthRecord, HealthSidecar, MintHelp, ProbeFrom, Provider, Verdict,
+    CREDENTIAL_SPECS,
+};
+
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -97,6 +190,10 @@ const MACHINE_KEY_BYTES: usize = 32;
 const NONCE_BYTES: usize = 12;
 const MACHINE_KEY_FILE: &str = "machine.key";
 const CREDENTIALS_FILE: &str = "credentials.enc";
+/// Verdict sidecar (W337 §4). Deliberately a separate, unencrypted file: the
+/// desktop must be able to render credential health without touching
+/// plaintext, and nothing in it is secret.
+const HEALTH_FILE: &str = "credential-health.json";
 
 pub struct KeysStore {
     dir: PathBuf,
@@ -115,8 +212,70 @@ impl KeysStore {
         Ok(Self { dir })
     }
 
+    /// Open a store rooted at an explicit directory.
+    ///
+    /// [`Self::open`] resolves through `ProjectDirs` with no HOME override, so
+    /// anything that exercises a real round-trip in-process would write to the
+    /// developer's actual vault (see the note at `app/yah/cli/src/camp.rs:708`).
+    /// This is the seam that makes the sidecar testable; `open` is unchanged.
+    pub fn at(dir: impl Into<PathBuf>) -> Result<Self> {
+        let dir = dir.into();
+        ensure_dir_secure(&dir)?;
+        Ok(Self { dir })
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Path of the verdict sidecar. Plain JSON, mode 0644, alongside
+    /// `credentials.enc` but never inside it.
+    pub fn health_path(&self) -> PathBuf {
+        self.dir.join(HEALTH_FILE)
+    }
+
+    /// Read the verdict sidecar. Infallible by construction: a missing file,
+    /// an unreadable one, or malformed JSON all yield an empty sidecar, so a
+    /// damaged health file can never break `yah cloud secrets` or an agent's
+    /// `creds_check`. Decrypts nothing.
+    pub fn read_health(&self) -> spec::HealthSidecar {
+        match fs::read(self.health_path()) {
+            Ok(bytes) => spec::parse_sidecar(&bytes),
+            Err(_) => spec::HealthSidecar::default(),
+        }
+    }
+
+    /// Replace the verdict sidecar atomically at mode 0644.
+    pub fn write_health(&self, sidecar: &spec::HealthSidecar) -> Result<()> {
+        write_plain(&self.health_path(), &spec::render_sidecar(sidecar)?)
+    }
+
+    /// Read-modify-write one slot's health record.
+    pub fn record_health(&self, record: spec::HealthRecord) -> Result<()> {
+        let mut sidecar = self.read_health();
+        sidecar.upsert(record);
+        self.write_health(&sidecar)
+    }
+
+    /// Record one slot's expiry without disturbing the rest of its record.
+    ///
+    /// [`Self::record_health`] takes a whole [`spec::HealthRecord`] and
+    /// replaces the stored one, so using it to write a date would silently drop
+    /// whatever `verdict` / `scopes` / `last_probe_at` a probe had already
+    /// left there. Expiry and probe verdict arrive from different places at
+    /// different times — the date is read from the provider's token listing,
+    /// the verdict from an authenticated call — so the two writers must not
+    /// clobber each other. R856-T4 needed this to record npm's enforced
+    /// expiry before any probe venue exists (R856-F2/T3).
+    pub fn record_expiry(&self, slot: &str, expiry: spec::Expiry) -> Result<()> {
+        let mut sidecar = self.read_health();
+        let mut record = sidecar
+            .get(slot)
+            .cloned()
+            .unwrap_or_else(|| spec::HealthRecord::new(slot));
+        record.expires_at = Some(expiry);
+        sidecar.upsert(record);
+        self.write_health(&sidecar)
     }
 
     fn machine_key_path(&self) -> PathBuf {
@@ -522,6 +681,41 @@ fn write_secure(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Write `bytes` to `path` atomically with mode 0644 on Unix. Same tmp+rename
+/// discipline as [`write_secure`], deliberately *not* the same mode: the
+/// verdict sidecar is not secret, and 0600 would stop a non-root reader (the
+/// desktop, a health dashboard) from doing the one thing the sidecar exists
+/// for — reading credential health without decrypting anything.
+fn write_plain(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("path {} has no parent", path.display()))?;
+    let tmp = dir.join(format!(
+        ".{}.tmp",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("write")
+    ));
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o644);
+    }
+
+    {
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("open {}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all().ok();
+    }
+    fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,5 +996,148 @@ mod tests {
         let err = s.get_or_env("hetzner-api-token", ENV_VAR).unwrap_err().to_string();
         assert!(err.contains("decrypt"), "expected decrypt error, got: {err}");
         std::env::remove_var(ENV_VAR);
+    }
+
+    // ── W337 / R856-F1: verdict sidecar ────────────────────────────────────
+
+    #[test]
+    fn at_opens_an_explicit_dir_without_touching_project_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("vault");
+        let s = KeysStore::at(&nested).unwrap();
+        assert_eq!(s.dir(), nested);
+        assert!(nested.is_dir());
+    }
+
+    #[test]
+    fn sidecar_round_trips_and_preserves_review_by() {
+        use chrono::{TimeZone, Utc};
+
+        let tmp = TempDir::new().unwrap();
+        let s = KeysStore::at(tmp.path()).unwrap();
+        assert_eq!(s.read_health(), spec::HealthSidecar::default());
+
+        let t = Utc.with_ymd_and_hms(2026, 11, 11, 0, 0, 0).unwrap();
+        s.record_health(spec::HealthRecord {
+            expires_at: Some(spec::Expiry::Enforced(t)),
+            verdict: Some(spec::Verdict::Valid {
+                as_identity: Some("yah-ai".into()),
+            }),
+            last_probe_at: Some(t),
+            ..spec::HealthRecord::new("npm-api-token")
+        })
+        .unwrap();
+        s.record_health(spec::HealthRecord {
+            expires_at: Some(spec::Expiry::ReviewBy(t)),
+            ..spec::HealthRecord::new("release-cosign-key")
+        })
+        .unwrap();
+
+        let back = s.read_health();
+        assert_eq!(
+            back.get("npm-api-token").unwrap().expires_at,
+            Some(spec::Expiry::Enforced(t))
+        );
+        assert_eq!(
+            back.get("release-cosign-key").unwrap().expires_at,
+            Some(spec::Expiry::ReviewBy(t))
+        );
+        assert!(back.get("release-cosign-key").unwrap().expires_at.as_ref().unwrap().render().contains("re-mint"));
+    }
+
+    #[test]
+    fn record_expiry_preserves_the_probe_verdict() {
+        // R856-T4. The expiry and the verdict have different writers: the date
+        // is read off the provider's token listing, the verdict comes from an
+        // authenticated probe. If recording one clobbered the other, whichever
+        // ran second would blank the first — so `record_expiry` must merge
+        // rather than replace, which is exactly what `record_health` does not do.
+        use chrono::{TimeZone, Utc};
+
+        let tmp = TempDir::new().unwrap();
+        let s = KeysStore::at(tmp.path()).unwrap();
+        let probed = Utc.with_ymd_and_hms(2026, 9, 3, 0, 0, 0).unwrap();
+        s.record_health(spec::HealthRecord {
+            verdict: Some(spec::Verdict::Valid {
+                as_identity: Some("yah-human".into()),
+            }),
+            last_probe_at: Some(probed),
+            scopes: vec!["package:write".into()],
+            ..spec::HealthRecord::new("npm-api-token")
+        })
+        .unwrap();
+
+        let dies = Utc.with_ymd_and_hms(2026, 12, 1, 5, 42, 33).unwrap();
+        s.record_expiry("npm-api-token", spec::Expiry::Enforced(dies))
+            .unwrap();
+
+        let back = s.read_health();
+        let rec = back.get("npm-api-token").unwrap();
+        assert_eq!(rec.expires_at, Some(spec::Expiry::Enforced(dies)));
+        assert_eq!(
+            rec.verdict,
+            Some(spec::Verdict::Valid {
+                as_identity: Some("yah-human".into())
+            })
+        );
+        assert_eq!(rec.last_probe_at, Some(probed));
+        assert_eq!(rec.scopes, vec!["package:write".to_string()]);
+
+        // …and it still creates a record for a slot the sidecar has never seen.
+        s.record_expiry("crates-io-token", spec::Expiry::ReviewBy(dies))
+            .unwrap();
+        assert_eq!(
+            s.read_health().get("crates-io-token").unwrap().expires_at,
+            Some(spec::Expiry::ReviewBy(dies))
+        );
+    }
+
+    #[test]
+    fn sidecar_is_readable_without_the_machine_key() {
+        // The whole point of a separate plain file: the desktop renders
+        // credential health without decrypting anything.
+        let tmp = TempDir::new().unwrap();
+        let s = KeysStore::at(tmp.path()).unwrap();
+        s.record_health(spec::HealthRecord {
+            verdict: Some(spec::Verdict::Revoked),
+            ..spec::HealthRecord::new("crates-io-token")
+        })
+        .unwrap();
+        assert!(!s.machine_key_path().exists());
+        assert!(!s.credentials_path().exists());
+
+        let reader = KeysStore::at(tmp.path()).unwrap();
+        // No credentials.enc at all, so the secret side yields nothing…
+        assert_eq!(reader.get("crates-io-token").unwrap(), None);
+        // …while the sidecar still answers in full.
+        assert_eq!(
+            reader.read_health().get("crates-io-token").unwrap().verdict,
+            Some(spec::Verdict::Revoked)
+        );
+    }
+
+    #[test]
+    fn sidecar_is_0644_not_0600() {
+        let tmp = TempDir::new().unwrap();
+        let s = KeysStore::at(tmp.path()).unwrap();
+        s.write_health(&spec::HealthSidecar::default()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(s.health_path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o644, "verdict sidecar is not secret; 0600 would block the desktop reader");
+            // …and the secrets next to it are still 0600.
+            s.set("crates-io-token", "tok").unwrap();
+            let creds = fs::metadata(s.credentials_path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(creds, 0o600);
+        }
+    }
+
+    #[test]
+    fn corrupt_sidecar_does_not_break_the_read_path() {
+        let tmp = TempDir::new().unwrap();
+        let s = KeysStore::at(tmp.path()).unwrap();
+        fs::write(s.health_path(), b"{ this is not json").unwrap();
+        assert_eq!(s.read_health(), spec::HealthSidecar::default());
     }
 }

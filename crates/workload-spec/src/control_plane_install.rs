@@ -102,13 +102,16 @@ mod tests {
         // Atomic: stage-then-rename, never a direct write to the live path.
         assert!(s.contains("mv -f"), "install must be an atomic rename");
         assert!(s.contains(".roll-new.$$"), "install must stage to a temp name");
-        // Both binaries + all three unit files.
+        // All three binaries + all four unit files (scryer conditionally —
+        // see the dedicated test below).
         for target in [
             "/usr/local/bin/yubaba",
             "/usr/local/bin/kamaji",
+            "/usr/local/bin/yah-scryer",
             "/etc/systemd/system/yubaba.slice",
             "/etc/systemd/system/kamaji.service",
             "/etc/systemd/system/yubaba.service",
+            "/etc/systemd/system/yah-scryer.service",
         ] {
             assert!(s.contains(target), "script must install {target}");
         }
@@ -117,6 +120,33 @@ mod tests {
         let y = s.find("restart yubaba.service").unwrap();
         assert!(k < y, "kamaji must restart before yubaba");
         assert!(s.contains("daemon-reload"));
+    }
+
+    #[test]
+    fn scryer_install_is_conditional_on_the_tarball_carrying_it() {
+        // R556-F6 gate (b): yah-scryer joined the tarball at 0.8.32. A
+        // rollback to a pre-scryer release must still succeed — the script
+        // must gate every scryer action on the member existing rather than
+        // failing on it, and must leave an already-installed scryer alone.
+        let s = build_install_script("0.8.32", "u", "d", true);
+        assert!(
+            s.contains(r#"if [ -e "$D/yah-scryer" ]; then"#),
+            "scryer install must be gated on the tarball carrying the binary"
+        );
+        assert!(
+            s.contains(r#"assert_installed_bytes "$D/yah-scryer" /usr/local/bin/yah-scryer"#),
+            "installed scryer bytes must be content-asserted like the pair"
+        );
+        // First install has never been enabled; later rolls no-op.
+        assert!(s.contains("enable yah-scryer.service"));
+        // The scryer restart must come after the W154 pair restart — it is
+        // located by yubaba, not driven by it (A049), and must not perturb
+        // the kamaji→yubaba order.
+        assert!(
+            s.find("restart yubaba.service").unwrap()
+                < s.find("restart yah-scryer.service").unwrap(),
+            "scryer restarts after the supervision pair"
+        );
     }
 
     /// The script with every comment line removed — i.e. only the lines bash
@@ -142,6 +172,12 @@ mod tests {
         assert!(!s.contains("/var/lib/yah-cloud"), "must not touch state dir");
         assert!(!s.contains("raft"), "must not touch the raft log dir");
         assert!(!s.contains("rm -rf /"), "must not wipe system paths");
+        // Scryer's events.db is durable per-node state the same way — a roll
+        // replaces the binary + unit, never the store (R556-F6 gate (b)).
+        assert!(
+            !s.contains("/var/lib/yah/scryer"),
+            "must not touch the scryer event store"
+        );
     }
 
     #[test]
@@ -161,9 +197,11 @@ mod tests {
         for target in [
             "/usr/local/bin/yubaba",
             "/usr/local/bin/kamaji",
+            "/usr/local/bin/yah-scryer",
             "/etc/systemd/system/yubaba.slice",
             "/etc/systemd/system/kamaji.service",
             "/etc/systemd/system/yubaba.service",
+            "/etc/systemd/system/yah-scryer.service",
         ] {
             assert!(
                 s.contains(&format!("anchor {target}\n")),

@@ -949,7 +949,16 @@ fn workload_spec_to_crs(spec: &WorkloadSpec) -> ContainerRunSpec {
         }
     }
 
-    let ports: Vec<(u16, u16)> = spec.expose.mesh.ports.iter().map(|&p| (p, p)).collect();
+    // Sim tier publishes each declared container port on the identical host
+    // port. A name-only declaration (R844-F17) has no number to publish, so
+    // `numbers()` is the right read: it yields what was actually stated.
+    let ports: Vec<(u16, u16)> = spec
+        .expose
+        .mesh
+        .numbers()
+        .into_iter()
+        .map(|p| (p, p))
+        .collect();
 
     let volumes: Vec<(PathBuf, String)> = spec
         .volumes
@@ -1345,7 +1354,7 @@ mod tests {
     #[test]
     fn workload_spec_to_crs_maps_mesh_ports() {
         let mut spec = minimal_workload_spec("port-test");
-        spec.expose.mesh.ports = vec![8080, 9000];
+        spec.expose.mesh.ports = workload_spec::MeshExpose::anonymous_ports([8080, 9000]);
         let crs = workload_spec_to_crs(&spec);
         assert_eq!(crs.ports, vec![(8080, 8080), (9000, 9000)]);
     }

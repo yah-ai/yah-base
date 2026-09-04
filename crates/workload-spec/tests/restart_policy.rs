@@ -82,7 +82,7 @@ fn for_forge_sets_conventional_fields() {
         Some("true"),
         "for_forge must set annotations[yah.forge]=true"
     );
-    assert_eq!(spec.expose.mesh.ports, vec![8080]);
+    assert_eq!(spec.expose.mesh.numbers(), vec![8080]);
 }
 
 /// A forge run's cgroup ceiling is deliberately roomy; its placement request

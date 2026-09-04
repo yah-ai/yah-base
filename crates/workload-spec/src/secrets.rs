@@ -75,9 +75,18 @@ pub enum SecretError {
     #[error("cluster KEK unavailable: {reason}")]
     Kek { reason: String },
 
-    /// I/O error reading the secret file.
-    #[error("I/O error reading {path}: {source}")]
+    /// I/O error on a secret file. `op` is the operation that failed, as a
+    /// present participle (`"reading"`, `"writing"`, `"creating"`, …).
+    ///
+    /// R848: the message used to hardcode "reading" while yubaba's *writer*
+    /// (`deploy::secret_mount::write_secret_file`) reused the variant for its
+    /// writes. Yubaba surfaces this `Display` form in the 422 deploy-rejection
+    /// body, so an EACCES writing the tmpfs file read as a resolver failure and
+    /// sent the operator to the cluster KEK instead of to the file being
+    /// written two lines down. Naming the operation is the whole fix.
+    #[error("I/O error {op} {path}: {source}")]
     Io {
+        op: &'static str,
         path: PathBuf,
         #[source]
         source: std::io::Error,

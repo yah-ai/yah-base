@@ -180,7 +180,7 @@ fn minimal_spec() -> WorkloadSpec {
         expose: ExposeSpec {
             mesh: MeshExpose {
                 identity: MeshIdent("test-svc".into()),
-                ports: vec![8080],
+                ports: MeshExpose::anonymous_ports([8080]),
                 allow_from: vec![],
             },
             public: None,
@@ -329,14 +329,14 @@ fn depends_on_resolved_via_batch() {
 #[test]
 fn unknown_cf_zone_returns_semantic_error() {
     let mut spec = minimal_spec();
-    spec.expose.mesh.ports.push(443);
+    spec.expose.mesh.ports.push(443.into());
     spec.expose.public = Some(PublicExpose {
         hostname: "api.example.com".into(),
         port: 443,
         tls: PublicTls::CfManaged,
     });
     // 443 must be in mesh ports for shape to pass
-    spec.expose.mesh.ports = vec![8080, 443];
+    spec.expose.mesh.ports = MeshExpose::anonymous_ports([8080, 443]);
 
     let ctx = FakeContext::builder()
         .image("docker.io", "library/alpine", "3.19")
@@ -359,7 +359,7 @@ fn unknown_cf_zone_returns_semantic_error() {
 #[test]
 fn known_cf_zone_passes() {
     let mut spec = minimal_spec();
-    spec.expose.mesh.ports = vec![8080, 443];
+    spec.expose.mesh.ports = MeshExpose::anonymous_ports([8080, 443]);
     spec.expose.public = Some(PublicExpose {
         hostname: "api.example.com".into(),
         port: 443,

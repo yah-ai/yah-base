@@ -215,7 +215,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
+ "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -458,13 +461,15 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fob"
-version = "0.8.30"
+version = "0.8.32"
 dependencies = [
  "aes-gcm",
  "anyhow",
  "argon2",
+ "chrono",
  "directories",
  "rand 0.8.6",
+ "serde",
  "serde_json",
  "tempfile",
 ]
@@ -2303,7 +2308,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "yah-local-driver"
-version = "0.8.30"
+version = "0.8.32"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2322,7 +2327,7 @@ dependencies = [
 
 [[package]]
 name = "yah-mesofact-bundle"
-version = "0.8.30"
+version = "0.8.32"
 dependencies = [
  "blake3",
  "serde",
@@ -2335,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "yah-object-store"
-version = "0.8.30"
+version = "0.8.32"
 dependencies = [
  "fob",
  "hex",
@@ -2348,7 +2353,7 @@ dependencies = [
 
 [[package]]
 name = "yah-tenant-move"
-version = "0.8.30"
+version = "0.8.32"
 dependencies = [
  "thiserror 1.0.69",
  "yah-object-store",
@@ -2357,7 +2362,7 @@ dependencies = [
 
 [[package]]
 name = "yah-tenant-pointer"
-version = "0.8.30"
+version = "0.8.32"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -2367,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "yah-workload-spec"
-version = "0.8.30"
+version = "0.8.32"
 dependencies = [
  "aes-gcm",
  "anyhow",

@@ -14,8 +14,10 @@
 //!   to `<state_dir>/worker.js` on the host and bind-mount it into the
 //!   container at `/work/worker.js`.
 //! - Container CMD: `bun /app/miniflare-sim.mjs`, configured via env
-//!   (`MF_PORT`, `MF_HOST`, `ASSET_ORIGIN`, `WORKER_MODE`, `SSR_ORIGIN`,
-//!   `SSR_PREFIXES`). `MF_HOST=0.0.0.0` so the published port is reachable.
+//!   (`PORT`/`PORT_HTTP`, `MF_HOST`, `ASSET_ORIGIN`, `WORKER_MODE`,
+//!   `SSR_ORIGIN`, `SSR_PREFIXES`). `MF_HOST=0.0.0.0` so the published port is
+//!   reachable. The port is spelled `PORT` since R844-T13 — one contract across
+//!   every yah supervisor — not the retired `MF_PORT`.
 //! - Readiness: host-side HTTP probe on the published port (the
 //!   `[miniflare-sim] ready` stdout signal is still emitted but not consumed
 //!   — `docker run -d` detaches before logs would be readable).
@@ -65,8 +67,8 @@ pub struct MiniflareSpec {
     /// `"miniflare"`). Ignored when [`network`] is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_alias: Option<String>,
-    /// Host port published to the container's `MF_PORT`. The operator hits
-    /// `http://localhost:<port>` exactly as they do today.
+    /// Host port published to the container's `PORT` (and `PORT_HTTP`). The
+    /// operator hits `http://localhost:<port>` exactly as they do today.
     pub port: u16,
     /// Compiled Worker JS content. Written to `state_dir/worker.js` and
     /// bind-mounted into the container at [`WORKER_SCRIPT_CONTAINER_PATH`].
@@ -148,22 +150,7 @@ pub async fn ensure_miniflare_running(
         .await
         .with_context(|| format!("pulling {}", spec.image))?;
 
-    let ssr_prefixes_json =
-        serde_json::to_string(&spec.ssr_prefixes).unwrap_or_else(|_| "[]".to_string());
-    let mut env = BTreeMap::new();
-    // MF_PORT inside the container == published port outside so the worker
-    // self-reports the correct URL in its stdout `ready on http://…` line.
-    env.insert("MF_PORT".into(), spec.port.to_string());
-    // Bind to 0.0.0.0 so the published port is reachable from the host.
-    env.insert("MF_HOST".into(), "0.0.0.0".into());
-    env.insert("MF_SCRIPT".into(), WORKER_SCRIPT_CONTAINER_PATH.into());
-    env.insert("ASSET_ORIGIN".into(), spec.asset_origin.clone());
-    env.insert("WORKER_MODE".into(), spec.worker_mode.clone());
-    env.insert("SSR_ORIGIN".into(), spec.ssr_origin.clone());
-    env.insert("SSR_PREFIXES".into(), ssr_prefixes_json);
-    for (k, v) in &spec.extra_env {
-        env.insert(k.clone(), v.clone());
-    }
+    let env = miniflare_env(spec);
 
     let network_aliases = match (&spec.network, &spec.network_alias) {
         (Some(_), Some(alias)) => vec![alias.clone()],
@@ -242,6 +229,36 @@ async fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
     }
 }
 
+/// The container's environment. Split out of [`ensure_miniflare_running`] so the
+/// port contract is assertable without a container runtime.
+fn miniflare_env(spec: &MiniflareSpec) -> BTreeMap<String, String> {
+    let ssr_prefixes_json =
+        serde_json::to_string(&spec.ssr_prefixes).unwrap_or_else(|_| "[]".to_string());
+    let mut env = BTreeMap::new();
+    // The port inside the container == the published port outside, so the worker
+    // self-reports the correct URL in its stdout `ready on http://…` line.
+    //
+    // `PORT` + `PORT_HTTP` is the one env contract every yah supervisor answers
+    // through (R844-T13), and this is the retired `MF_PORT`. Spelled literally
+    // rather than through `kamaji::ports::port_env`, which is where the contract
+    // lives: yah-base sits *below* kamaji in the publish DAG (yah-base <-
+    // {qed, kamaji} <- yubaba), so depending on it here would invert that. Two
+    // strings, pinned by `miniflare_env_spells_the_one_port_contract`.
+    env.insert("PORT".into(), spec.port.to_string());
+    env.insert("PORT_HTTP".into(), spec.port.to_string());
+    // Bind to 0.0.0.0 so the published port is reachable from the host.
+    env.insert("MF_HOST".into(), "0.0.0.0".into());
+    env.insert("MF_SCRIPT".into(), WORKER_SCRIPT_CONTAINER_PATH.into());
+    env.insert("ASSET_ORIGIN".into(), spec.asset_origin.clone());
+    env.insert("WORKER_MODE".into(), spec.worker_mode.clone());
+    env.insert("SSR_ORIGIN".into(), spec.ssr_origin.clone());
+    env.insert("SSR_PREFIXES".into(), ssr_prefixes_json);
+    for (k, v) in &spec.extra_env {
+        env.insert(k.clone(), v.clone());
+    }
+    env
+}
+
 /// Probe miniflare's published port until any non-5xx response comes back.
 /// Returning 4xx is fine — that's the Worker telling us "no route", which
 /// still proves workerd booted.
@@ -290,6 +307,23 @@ mod tests {
             ready_timeout: Duration::from_secs(30),
             extra_env: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn miniflare_env_spells_the_one_port_contract() {
+        // R844-T13: `PORT` and `PORT_HTTP` are the same number, and the retired
+        // `MF_PORT` is not produced. This crate cannot call
+        // `kamaji::ports::port_env` (publish DAG), so the spelling is asserted
+        // here instead of inherited.
+        let mut spec = fixture();
+        spec.port = 4399;
+        let env = miniflare_env(&spec);
+        assert_eq!(env.get("PORT").map(String::as_str), Some("4399"));
+        assert_eq!(env.get("PORT_HTTP").map(String::as_str), Some("4399"));
+        assert!(
+            !env.contains_key("MF_PORT"),
+            "MF_PORT is retired as a producer: {env:?}"
+        );
     }
 
     #[test]
