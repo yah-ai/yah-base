@@ -24,11 +24,39 @@
 //! the not-actually-a-credential config slots carry `ReviewBy`, since nothing
 //! third-party can expire them.
 //!
-//! Likewise `MintHelp` is populated for exactly three providers — the three
-//! that had grounded dashboard URLs and scope lists in
-//! `packages/yah/ui/src/components/shell/AgentsSection.tsx`. Every other slot
-//! gets [`MintHelp::NONE`]. A wrong mint URL is worse than an absent one; the
-//! full port is R856-F5.
+//! Likewise `MintHelp` is populated for exactly three providers — Cloudflare,
+//! Hetzner and GitHub. Every other slot gets [`MintHelp::NONE`]. A wrong mint
+//! URL is worse than an absent one: it sends an operator to a dashboard that
+//! cannot mint the credential they came for.
+//!
+//! **That is the finished state of the port, not a gap.** R856-F5 completed it,
+//! and completing it meant discovering that the corpus it was porting *from* is
+//! three entries: `ProviderHelpRail`'s `ACTIVE_PROVIDERS` in
+//! `packages/yah/ui/src/components/shell/AgentsSection.tsx` grounded Cloudflare,
+//! Hetzner and GitHub and nothing else, so those three are now here verbatim
+//! (including the Cloudflare CNAME fallback clause F1 truncated) and the TS
+//! literals are gone — the rail reads this registry over `api_key_mint_help`.
+//! The other 46 slots are left `NONE` because inventing a dashboard URL for
+//! them would be fabrication, and [`is_populated`](MintHelp::is_populated) is
+//! what lets every surface say "no mint help recorded" instead of guessing.
+//! Filling them in is dashboard archaeology, one grounded provider at a time.
+//!
+//! **Mint help is per-SLOT, not per-provider**, and F5 narrowed it back to that
+//! after F1 had attached `MINT_CLOUDFLARE` to all ten Cloudflare slots and
+//! `MINT_HETZNER` to all three Hetzner ones. Eleven of those fourteen are not
+//! minted where the help said: an R2 SigV4 pair
+//! (`cloudflare-r2-{access-key-id,secret-key}` and the fleet-read pair) comes
+//! from R2 -> Manage R2 API Tokens, a connector token
+//! (`cloudflare-tunnel-token{,-mesh}`) from the tunnel that owns it, and the
+//! Hetzner Object Storage pair (`hetzner-s3-{access,secret}-key`) from a
+//! project's Object Storage credentials — none of them from the API-tokens page
+//! the help links, and none needing the scope list it prints. Even the three
+//! sibling Cloudflare API tokens (`cloudflare-legacy-yah`,
+//! `cloudflare-mesofact-static`, `cloudflare-static-yah-dev`) want different
+//! scopes than the infra token's Tunnel/Connectivity/R2 set. Sending an
+//! operator to the wrong page mid-rotation is the failure the "wrong is worse
+//! than absent" rule names, so those eleven now say nothing until someone reads
+//! the actual dashboard.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -44,6 +72,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Provider {
+    Anthropic,
     Cloudflare,
     CratesIo,
     DeepSeek,
@@ -70,6 +99,7 @@ pub enum Provider {
 impl Provider {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Provider::Anthropic => "anthropic",
             Provider::Cloudflare => "cloudflare",
             Provider::CratesIo => "crates-io",
             Provider::DeepSeek => "deepseek",
@@ -197,6 +227,59 @@ pub enum ProbeFrom {
     AllowlistedNetwork,
 }
 
+/// Whether the provider permits two of this credential to be live at once
+/// (W337 §6) — the precondition for the overlap path, where rotation runs
+/// `mint -> stage -> probe -> promote -> revoke old` and no step leaves the
+/// only live credential unverified.
+///
+/// [`Overlap::Unproven`] is the default and is not a placeholder. On a provider
+/// that replaces rather than adds, minting the replacement *kills the live
+/// credential at mint time* — the outage this whole design exists to remove —
+/// and the overlap path would have talked the operator into it. So the default
+/// routes to `yah keys rotate`'s probe-before-write path (R856-F5), and only a
+/// measurement moves a slot off it.
+///
+/// Both decided variants carry their evidence as a `&'static str`, because
+/// "some agent believed it" is not something a later reader can re-check. The
+/// string is what a future reader re-runs to confirm or falsify the claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Overlap {
+    /// Measured: two or more credentials of this kind were live at the same
+    /// instant on the same account.
+    Permitted(&'static str),
+    /// Measured: the provider allows exactly one, so minting a replacement
+    /// revokes the incumbent. The overlap path must refuse these loudly rather
+    /// than merely omit them, since "not measured" and "measured, and no" want
+    /// different messages in front of an operator.
+    Forbidden(&'static str),
+    /// Nobody has established it either way. Refuses the overlap path.
+    Unproven,
+}
+
+/// Cloudflare API tokens. Read off this host's `credential-health.json`, which
+/// is the sweep's own record rather than anybody's recollection: the pass at
+/// `2026-09-04T23:55:19Z` returned `valid` for three *distinct* token ids —
+/// `623b42a4`, `28091f06`, `2e976eaf` — against one account, all in the same
+/// sweep. Three live at once is more than the two overlap needs.
+///
+/// Scoped to the four API-token slots deliberately. The R2 access keys, the
+/// tunnel tokens and `cloudflare-zone-id` are different credential *kinds* at
+/// the same provider, and nothing here measured those.
+const OVERLAP_CLOUDFLARE_API_TOKEN: Overlap = Overlap::Permitted(
+    "measured 2026-09-04: one `yah keys sweep` pass verified three distinct Cloudflare token ids \
+     (623b42a4, 28091f06, 2e976eaf) as status=active on the same account, simultaneously",
+);
+
+/// npm granular access tokens. `npm token list --json` (the same read-only call
+/// [`ProbeFrom::AllowlistedNetwork`]'s tier-1 probe already makes) returned
+/// three records with `revoked: null` and future `expiry` — `publish`
+/// (2026-12-01), `yah2` (2026-11-11), `yah` (2026-11-11) — on 2026-09-04.
+const OVERLAP_NPM_TOKEN: Overlap = Overlap::Permitted(
+    "measured 2026-09-04: `npm token list --json` returned three unrevoked tokens (publish, yah2, \
+     yah) with future expiries on the same account",
+);
+
 /// Everything a human needs to mint a replacement. Populated only where it
 /// could be grounded — see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -238,7 +321,31 @@ pub struct CredentialSpec {
     pub provider_cap_days: Option<u32>,
     pub expiry_kind: ExpiryKind,
     pub probe_from: ProbeFrom,
+    /// Whether `yah keys overlap` may stage a second live credential for this
+    /// slot (W337 §6, R856-F9). See [`Overlap`] for why the default refuses.
+    pub overlap: Overlap,
     pub mint: MintHelp,
+    /// Scopes the consumers need, **in the vocabulary the provider's own probe
+    /// response reports** — the tier-3 drift baseline (W337 §3, R856-F7).
+    ///
+    /// Deliberately *not* [`MintHelp::scopes`], and the two must not be
+    /// conflated. `mint.scopes` is dashboard vocabulary for a human clicking
+    /// checkboxes (`"Account: Cloudflare Tunnel: Edit"`, `"Read & Write"`);
+    /// this is machine vocabulary a prober can compare (`"write:packages"`,
+    /// `"package:write"`). They coincide for GitHub and cannot for Cloudflare
+    /// or Hetzner, so one field cannot carry both without manufacturing drift
+    /// on every slot whose dashboard label is prose.
+    ///
+    /// Empty means **no drift check**, which is the honest default in two
+    /// distinct situations kept deliberately indistinguishable here because
+    /// neither yields a comparison: the provider exposes no scopes to a
+    /// self-probe (measured 2026-09-04 — Cloudflare's `/tokens/verify` returns
+    /// only `id`/`status`/`expires_on` and reading `/accounts/{a}/tokens/{id}`
+    /// is 403 `9109`; Hetzner has no such route at all, 404 `not_found`;
+    /// crates.io's `/api/v1/me/tokens` is website-session-only), or nobody has
+    /// read what this slot's consumers actually need. Populating it from
+    /// memory would fail a live credential over a scope no consumer asks for.
+    pub required_scopes: &'static [&'static str],
     /// Blocks the core cloud commands outright when missing.
     pub required: bool,
     /// 1Password item that holds the authoritative copy, where one exists.
@@ -264,6 +371,22 @@ impl CredentialSpec {
             None => false,
         }
     }
+
+    /// True only for a slot measured to tolerate two live credentials. Both
+    /// [`Overlap::Forbidden`] and [`Overlap::Unproven`] answer false — they
+    /// differ in what the operator is told, never in what is allowed.
+    pub const fn permits_overlap(&self) -> bool {
+        matches!(self.overlap, Overlap::Permitted(_))
+    }
+
+    /// The measurement behind a decided [`Overlap`], for a message an operator
+    /// can act on. `None` for [`Overlap::Unproven`], where there is none.
+    pub const fn overlap_evidence(&self) -> Option<&'static str> {
+        match self.overlap {
+            Overlap::Permitted(why) | Overlap::Forbidden(why) => Some(why),
+            Overlap::Unproven => None,
+        }
+    }
 }
 
 /// Look up one slot. `None` for a slot the registry does not describe — which
@@ -278,9 +401,11 @@ pub fn specs_in_domain(domain: Domain) -> impl Iterator<Item = &'static Credenti
 }
 
 // ---------------------------------------------------------------------------
-// Mint help — ported verbatim from the desktop rail's ProviderHelp entries
-// (packages/yah/ui/src/components/shell/AgentsSection.tsx:57-105). Three
-// providers is all that file grounds; R856-F5 ports the rest.
+// Mint help — the canonical copy. Ported verbatim from the desktop rail's
+// ProviderHelp entries, which are now gone from TypeScript: `ProviderHelpRail`
+// reads these three over the `api_key_mint_help` Tauri command, and `yah keys
+// rotate` prints the same strings. Three providers is all that rail ever
+// grounded (R856-F5).
 // ---------------------------------------------------------------------------
 
 const MINT_CLOUDFLARE: MintHelp = MintHelp {
@@ -294,7 +419,8 @@ const MINT_CLOUDFLARE: MintHelp = MintHelp {
     nav_hint: Some(
         "Create a Custom Token with Account permissions: Cloudflare Tunnel -> Edit, \
          Connectivity Directory -> Admin, Cloudflare R2 -> Edit. Zone DNS is only needed \
-         if your domains are Cloudflare-managed.",
+         if your domains are Cloudflare-managed — otherwise point a CNAME at the \
+         *.cfargotunnel.com hostname from your registrar.",
     ),
 };
 
@@ -311,8 +437,16 @@ const MINT_GITHUB: MintHelp = MintHelp {
     ),
     dashboard_label: Some("github.com -> Settings -> Developer settings -> Tokens (classic)"),
     scopes: &["write:packages", "read:packages"],
+    /* R856-F7 corrected "write:packages (it implies read:packages)": it does
+    not. GitHub's scope table indents nested scopes under their parent
+    (`admin:org` > `write:org` > `read:org`) and the three package scopes are
+    top-level siblings, so both must be ticked to get both. The live token
+    holds `write:packages` and `delete:packages` with no `read:packages` —
+    which is fine, because the ghcr packages are public and nothing here pulls
+    with credentials. The URL above already requests both explicitly. */
     nav_hint: Some(
-        "Generate a classic token with write:packages (it implies read:packages). If the \
+        "Generate a classic token with write:packages (tick read:packages too if you will pull \
+         private images — it is a sibling scope, not implied). If the \
          yah-ai org enforces SAML SSO, click 'Configure SSO' on the new token and authorize \
          it for yah-ai. The ghcr login user is your GitHub username; this token is the password.",
     ),
@@ -331,6 +465,76 @@ const MINT_GITHUB: MintHelp = MintHelp {
 /// live `fob::get_or_env` call site. `iroh-node-secret` was dropped: it had no
 /// consumer anywhere in the tree and conceded as much in its own comment.
 pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
+    /* The four Anthropic/OpenAI-admin entries below are the only specs in this
+    registry with no corresponding entry in `yah keys list`, and that is
+    deliberate: each is read by a live `fob::get_or_env` call site, so the slot
+    is real and merely unpopulated on this host. R856-F1 filed the admin pair as
+    an orphan ("spec them or delete them"); R856-F2 grepped the consumers, found
+    them live, and specced them. They are `required: false`, so `yah keys
+    doctor` counts them as absent without raising a finding. */
+    CredentialSpec {
+        slot: "anthropic-admin-key",
+        env: Some("ANTHROPIC_ADMIN_KEY"),
+        purpose: "Anthropic ADMIN API key for the organization usage/cost endpoints, distinct \
+                  from the completion key. Read only by `fetch_usage`; a missing one degrades \
+                  usage reporting and nothing else",
+        consumers: &["crates/yah/runner/src/resolver/anthropic.rs:114 (fetch_usage)"],
+        provider: Provider::Anthropic,
+        domain: Domain::Model,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
+        slot: "anthropic-api-key",
+        env: Some("ANTHROPIC_API_KEY"),
+        purpose: "Anthropic completion API key. Unpopulated on this host — the camp drives Claude \
+                  through the subscription rail, not a raw API key — but the desktop, the UI \
+                  provider panel and the party connection registry all manage the slot",
+        consumers: &[
+            "crates/yah/runner/src/resolver/mod.rs:1122 (ANTHROPIC_SLOT)",
+            "app/yah/desktop/src/onboarding.rs:43",
+            "crates/yah/party/src/party.rs:5981",
+        ],
+        provider: Provider::Anthropic,
+        domain: Domain::Model,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
+        slot: "anthropic-oauth",
+        env: Some("ANTHROPIC_OAUTH_TOKEN"),
+        purpose: "Anthropic OAuth bearer token backing the subscription rail. Automatable in the \
+                  same sense as `openai-oauth`: the refresh half re-mints it without a human",
+        consumers: &[
+            "crates/yah/runner/src/resolver/mod.rs:1125 (ANTHROPIC_OAUTH_SLOT)",
+            "app/yah/desktop/src/api_keys.rs:630",
+        ],
+        provider: Provider::Anthropic,
+        domain: Domain::Model,
+        band: Band::Automatable,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
     CredentialSpec {
         slot: "cheers-cloud-admin-verify-key",
         env: None,
@@ -348,7 +552,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Workload("yah-cloud-admin"),
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -364,7 +570,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -379,7 +587,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -401,9 +611,16 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         domain: Domain::Infra,
         band: Band::Manual,
         provider_cap_days: None,
-        expiry_kind: ExpiryKind::Unverified,
+        /* R856-F2, measured 2026-09-04: `/accounts/<id>/tokens/verify` returns
+        `status: active` with **no** `expires_on`, i.e. no TTL was set at mint.
+        Cloudflare offers one and the operator declined it, so the token does
+        not expire and the date is a re-mint reminder — `ReviewBy`, not
+        `Declared`. Re-minting it with a TTL would make this `Declared`. */
+        expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: OVERLAP_CLOUDFLARE_API_TOKEN,
         mint: MINT_CLOUDFLARE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -422,9 +639,15 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         domain: Domain::Infra,
         band: Band::Manual,
         provider_cap_days: None,
-        expiry_kind: ExpiryKind::Unverified,
+        /* R856-F2, measured 2026-09-04: this is the one Cloudflare slot whose
+        `/tokens/verify` result carries an `expires_on`. Cloudflare's TTL is
+        operator-chosen at mint, so `Declared`; the date itself is read off the
+        probe and lands in the sidecar rather than here. */
+        expiry_kind: ExpiryKind::Declared,
         probe_from: ProbeFrom::Local,
-        mint: MINT_CLOUDFLARE,
+        overlap: OVERLAP_CLOUDFLARE_API_TOKEN,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -444,9 +667,13 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         domain: Domain::Infra,
         band: Band::Automatable,
         provider_cap_days: None,
-        expiry_kind: ExpiryKind::Unverified,
+        // R856-F2, measured 2026-09-04: verifies active with no `expires_on`.
+        // Same reading as `cloudflare-api-token`.
+        expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
-        mint: MINT_CLOUDFLARE,
+        overlap: OVERLAP_CLOUDFLARE_API_TOKEN,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -461,6 +688,11 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
             "oss/qed/crates/scryer/src/long_tier.rs",
             "oss/yubaba/crates/cloud/src/reconciler/r2_publish.rs",
             "scripts/publish-desktop.sh",
+            // R856-F6: the yah-cli-release / yah-desktop-release `on_success`
+            // publish leg. Found by grep while scoping the preflight gate — the
+            // recipes upload to R2 through this, so it has to be selectable by
+            // `yah keys doctor --for app/yah/cli/src/qed_publish.rs`.
+            "app/yah/cli/src/qed_publish.rs:810 (R2_ACCESS_KEY_SLOT)",
         ],
         provider: Provider::Cloudflare,
         domain: Domain::Infra,
@@ -468,7 +700,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
-        mint: MINT_CLOUDFLARE,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -488,7 +722,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Workload("yah-cloud-admin"),
-        mint: MINT_CLOUDFLARE,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -507,7 +743,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Workload("yah-cloud-admin"),
-        mint: MINT_CLOUDFLARE,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -520,6 +758,8 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
             "oss/qed/crates/scryer/src/long_tier.rs",
             "oss/yubaba/crates/cloud/src/reconciler/r2_publish.rs",
             "scripts/publish-desktop.sh",
+            // R856-F6, see the sibling access-key slot.
+            "app/yah/cli/src/qed_publish.rs:818 (R2_SECRET_KEY_SLOT)",
         ],
         provider: Provider::Cloudflare,
         domain: Domain::Infra,
@@ -527,7 +767,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
-        mint: MINT_CLOUDFLARE,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -537,15 +779,21 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         purpose: "Cloudflare token named for the yah.dev static site. Measured 2026-08-09 \
                   (.yah/infra/providers/cloudflare.toml:32): it returns [10000] on \
                   /accounts/<id>/workers/scripts, so it carries no Workers grants. No in-tree \
-                  consumer reads this slot",
+                  consumer reads this slot. R856-F2 measured 2026-09-04 that it verifies as \
+                  token id 623b42a4… — the SAME credential `cloudflare-api-token` holds. Two \
+                  slots, one secret, one death date: the redundancy is an illusion (W337 §1)",
         consumers: &[],
         provider: Provider::Cloudflare,
         domain: Domain::Infra,
         band: Band::Manual,
         provider_cap_days: None,
-        expiry_kind: ExpiryKind::Unverified,
+        // R856-F2, measured 2026-09-04: verifies active with no `expires_on`.
+        // Same reading as `cloudflare-api-token` — because it is the same token.
+        expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
-        mint: MINT_CLOUDFLARE,
+        overlap: OVERLAP_CLOUDFLARE_API_TOKEN,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -565,7 +813,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
-        mint: MINT_CLOUDFLARE,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: Some("Cloudflare Tunnel — yah-cloud"),
     },
@@ -582,7 +832,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
-        mint: MINT_CLOUDFLARE,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -601,7 +853,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -618,7 +872,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -636,9 +892,18 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         domain: Domain::Publish,
         band: Band::Manual,
         provider_cap_days: None,
-        expiry_kind: ExpiryKind::Unverified,
+        /* R856-F2, read 2026-09-04: crates.io's token page offers endpoint
+        scopes, crate scopes and an expiry, defaulting new tokens to 90 days
+        with "no expiration" and custom dates both available
+        (<https://blog.rust-lang.org/2023/06/23/improved-api-tokens-for-crates-io/>).
+        Operator-chosen, so `Declared`. The *date* cannot be probed: every
+        `/api/v1/me*` route is session-cookie-only, so it has to be entered by
+        hand with `yah keys record-expiry`. */
+        expiry_kind: ExpiryKind::Declared,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -654,7 +919,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -670,7 +937,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -686,7 +955,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -703,7 +974,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -721,9 +994,36 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         domain: Domain::Publish,
         band: Band::Manual,
         provider_cap_days: None,
-        expiry_kind: ExpiryKind::Unverified,
+        /* R856-F2, measured 2026-09-04. The live credential in this slot is a
+        *classic* PAT — `GET /user` answers with an `x-oauth-scopes` header,
+        which fine-grained tokens do not carry — and it has no expiration set.
+        GitHub's docs say a classic PAT may be created with no expiration, and
+        that it instead "automatically removes personal access tokens that
+        haven't been used in a year"
+        (<https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens>).
+        A credential that does not expire but must be re-minted is exactly
+        `ReviewBy`. Note it is `ReviewBy` for *this* credential, not for GitHub:
+        re-minting with an expiry date would make the slot `Declared`. */
+        expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MINT_GITHUB,
+        /* R856-F7. Exactly what a consumer *names in source*: `ghcr.rs:223`
+        tells the operator this slot "needs write:packages", and `GET /user`
+        reports that scope back verbatim in `x-oauth-scopes` (measured
+        2026-09-04: `delete:packages, repo, workflow, write:packages`).
+
+        `read:packages` is NOT listed, and that absence is the measurement
+        rather than an oversight: GitHub's scope table indents nested scopes
+        under their parent (`admin:org` > `write:org` > `read:org`) and the
+        three package scopes are all top-level siblings, so `write:packages`
+        does not imply `read:packages`. The live token confirms it — it holds
+        write and delete without read. Listing `read:packages` here would fail
+        a working credential; the ghcr packages are public, so no consumer
+        needs it. `repo` and `workflow` are held but unrequired: no consumer
+        names them, and asserting a requirement nobody read is the same class
+        of error as a green light on a dead key. */
+        required_scopes: &["write:packages"],
         required: false,
         onepassword: None,
     },
@@ -738,7 +1038,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -760,7 +1062,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: Some("Headscale API — yah-cloud"),
     },
@@ -780,7 +1084,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: Some("Headscale preauth — yah-cloud"),
     },
@@ -797,9 +1103,19 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         domain: Domain::Infra,
         band: Band::Manual,
         provider_cap_days: None,
+        /* R856-F2 read Hetzner's live docs on 2026-09-04 and STAYS `Unverified`
+        on purpose. Both `getting-started/using-api` and
+        `getting-started/generating-api-token` are silent on lifetime, and the
+        mint UI offers only Read / Read&Write — no TTL field. That is an absence
+        of a statement, not a statement that tokens never expire, so calling it
+        `ReviewBy` would assert a policy nobody read. Recorded here so the next
+        agent does not repeat the search: settling this needs Hetzner support or
+        an observed expiry, not more doc-reading. */
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MINT_HETZNER,
+        required_scopes: &[],
         required: true,
         onepassword: Some("Hetzner Cloud API — yah-cloud"),
     },
@@ -816,7 +1132,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
-        mint: MINT_HETZNER,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: Some("Hetzner Object Storage — yah-cloud"),
     },
@@ -832,7 +1150,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
-        mint: MINT_HETZNER,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: Some("Hetzner Object Storage — yah-cloud"),
     },
@@ -847,7 +1167,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -863,7 +1185,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -883,7 +1207,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -902,7 +1228,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -922,7 +1250,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -939,7 +1269,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Workload("noisetable-account"),
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -955,7 +1287,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Workload("noisetable-account"),
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -974,7 +1308,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Workload("noisetable-account"),
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -995,7 +1331,24 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: Some(90),
         expiry_kind: ExpiryKind::Enforced,
         probe_from: ProbeFrom::AllowlistedNetwork,
+        overlap: OVERLAP_NPM_TOKEN,
         mint: MintHelp::NONE,
+        /* R856-F7. npm's `--json` record answers tier 3 on two *different*
+        axes and the prober flattens both, so the vocabulary distinguishes
+        them: `permissions` is what the token may do (`{"name":"package",
+        "action":"write"}` -> `package:write`), `scopes` is what it may do it
+        *to* (`{"name":"mesofact","type":"org"}` -> `scope:org:mesofact`).
+
+        Both are load-bearing and only one is obvious. A token narrowed from
+        `package:write` to `package:read` fails the publish loudly; a token
+        that keeps `package:write` but loses `scope:org:mesofact` passes every
+        presence check, passes the auth probe, and dies at `npm publish` — the
+        exact silent narrowing this tier exists to catch. `@mesofact` is the
+        only npm org this tree publishes (four `packages/mesofact-…`; the
+        `@yah` ones are workspace-internal), so it is the one org scope
+        grounded enough to require. Measured 2026-09-04: the live token holds
+        `package:write`, `org:write`, and org scopes `mesofact` + `yah-ai`. */
+        required_scopes: &["package:write", "scope:org:mesofact"],
         required: false,
         onepassword: None,
     },
@@ -1011,7 +1364,28 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
+        slot: "openai-admin-key",
+        env: Some("OPENAI_ADMIN_KEY"),
+        purpose: "OpenAI ADMIN API key for the usage/billing endpoints, distinct from the \
+                  completion key. Read only by `fetch_usage`; a missing one degrades usage \
+                  reporting and nothing else",
+        consumers: &["crates/yah/runner/src/resolver/openai.rs:85 (fetch_usage)"],
+        provider: Provider::OpenAi,
+        domain: Domain::Model,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -1026,7 +1400,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -1046,7 +1422,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Enforced,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -1064,7 +1442,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::Unverified,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -1084,7 +1464,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -1103,7 +1485,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -1124,7 +1508,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -1139,7 +1525,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -1159,7 +1547,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         provider_cap_days: None,
         expiry_kind: ExpiryKind::ReviewBy,
         probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
         mint: MintHelp::NONE,
+        required_scopes: &[],
         required: false,
         onepassword: None,
     },
@@ -1357,6 +1747,30 @@ mod tests {
         assert!(spec("iroh-node-secret").is_none());
     }
 
+    /// R856-F1 found four slots declared in `resolver/mod.rs` that appear in
+    /// neither `yah keys list` nor this registry, and asked F2 to spec them or
+    /// delete them. F2 grepped: each has a live `fob::get_or_env` call site, so
+    /// they are unpopulated, not dead. The opposite of `iroh-node-secret` —
+    /// which is why both tests live here, one on each side of the line.
+    #[test]
+    fn declared_but_unpopulated_slots_are_specced_rather_than_deleted() {
+        for slot in [
+            "anthropic-admin-key",
+            "anthropic-api-key",
+            "anthropic-oauth",
+            "openai-admin-key",
+        ] {
+            let s = spec(slot).unwrap_or_else(|| panic!("{slot} must be specced"));
+            assert!(
+                !s.consumers.is_empty(),
+                "{slot} is only in the registry because something reads it"
+            );
+            // Absent from the vault on this host; a required slot would make
+            // `yah keys doctor` raise a finding for a credential nobody wants.
+            assert!(!s.required, "{slot} must not be required");
+        }
+    }
+
     #[test]
     fn npm_is_the_live_provider_cap_conflict() {
         let npm = spec("npm-api-token").unwrap();
@@ -1374,6 +1788,65 @@ mod tests {
             .map(|s| s.slot)
             .collect();
         assert_eq!(flagged, vec!["npm-api-token"]);
+    }
+
+    /// W337 §6 / R856-F9. The default has to be the refusing one: on a provider
+    /// that replaces rather than adds, minting the overlap value kills the live
+    /// credential, which is the outage the design exists to remove. So this
+    /// test asserts the *shape* of the registry — a small grounded set, and
+    /// everything else refusing — rather than a slot list that would have to be
+    /// edited every time a measurement lands.
+    #[test]
+    fn overlap_is_permitted_only_where_it_was_measured() {
+        let permitted: Vec<&str> = CREDENTIAL_SPECS
+            .iter()
+            .filter(|s| s.permits_overlap())
+            .map(|s| s.slot)
+            .collect();
+        assert_eq!(
+            permitted,
+            vec![
+                "cloudflare-api-token",
+                "cloudflare-legacy-yah",
+                "cloudflare-mesofact-static",
+                "cloudflare-static-yah-dev",
+                "npm-api-token",
+            ]
+        );
+        for spec in CREDENTIAL_SPECS {
+            if spec.permits_overlap() {
+                let why = spec.overlap_evidence().expect("a decision carries evidence");
+                assert!(
+                    why.contains("measured"),
+                    "{}: a Permitted flag must name the measurement, not a belief — got {why:?}",
+                    spec.slot
+                );
+            } else {
+                assert!(
+                    !spec.permits_overlap(),
+                    "{}: an unmeasured slot must refuse the overlap path",
+                    spec.slot
+                );
+            }
+        }
+    }
+
+    /// `Forbidden` and `Unproven` both refuse; they differ only in what an
+    /// operator is told. Nothing may collapse them into one bool at the source.
+    #[test]
+    fn forbidden_and_unproven_both_refuse_but_stay_distinguishable() {
+        let unproven = CredentialSpec {
+            overlap: Overlap::Unproven,
+            ..*spec("github-pat").unwrap()
+        };
+        let forbidden = CredentialSpec {
+            overlap: Overlap::Forbidden("measured: the provider revokes the incumbent"),
+            ..*spec("github-pat").unwrap()
+        };
+        assert!(!unproven.permits_overlap());
+        assert!(!forbidden.permits_overlap());
+        assert_eq!(unproven.overlap_evidence(), None);
+        assert!(forbidden.overlap_evidence().is_some());
     }
 
     #[test]
@@ -1460,6 +1933,84 @@ mod tests {
         // Nothing grounded these; an invented mint URL is worse than none.
         assert!(!spec("npm-api-token").unwrap().mint.is_populated());
         assert!(!spec("crates-io-token").unwrap().mint.is_populated());
+    }
+
+    /// The port's acceptance criterion (R856-F5). The TypeScript rail grounded
+    /// exactly these three SLOTS, so exactly these three are populated. Both
+    /// directions are failures: a fourth slot appearing without a grounded
+    /// dashboard URL, and the per-provider fan-out this replaced — which pointed
+    /// an operator rotating an R2 SigV4 key at the API-tokens page that cannot
+    /// mint one.
+    #[test]
+    fn exactly_the_three_ported_providers_carry_mint_help() {
+        let populated: Vec<&str> = CREDENTIAL_SPECS
+            .iter()
+            .filter(|s| s.mint.is_populated())
+            .map(|s| s.slot)
+            .collect();
+        assert_eq!(
+            populated,
+            ["cloudflare-api-token", "github-pat", "hetzner-api-token"],
+            "add a slot here only with a dashboard URL read from the provider"
+        );
+    }
+
+    /// The tier-3 baseline is only usable if it stays in the provider's own
+    /// machine vocabulary (R856-F7). The failure this guards is somebody
+    /// copying `mint.scopes` across — `"Account: Cloudflare Tunnel: Edit"` and
+    /// `"Read & Write"` are dashboard checkbox labels, and comparing one to an
+    /// `x-oauth-scopes` header manufactures a `ScopeInsufficient` on a working
+    /// credential. No provider's scope token contains a space or a comma.
+    #[test]
+    fn required_scopes_are_machine_vocabulary_not_dashboard_prose() {
+        for spec in CREDENTIAL_SPECS {
+            for scope in spec.required_scopes {
+                assert!(
+                    !scope.contains(' ') && !scope.contains(','),
+                    "{}: {scope:?} reads like a dashboard label, not a scope the probe \
+                     response will contain",
+                    spec.slot
+                );
+            }
+        }
+    }
+
+    /// Both directions are failures. A slot losing its baseline silently
+    /// disables the only tier that catches a break *before* the failing call;
+    /// a slot gaining one that nobody grounded fails a live credential over a
+    /// scope no consumer asks for.
+    #[test]
+    fn exactly_the_grounded_slots_carry_a_scope_baseline() {
+        let with_baseline: Vec<&str> = CREDENTIAL_SPECS
+            .iter()
+            .filter(|s| !s.required_scopes.is_empty())
+            .map(|s| s.slot)
+            .collect();
+        assert_eq!(
+            with_baseline,
+            ["github-pat", "npm-api-token"],
+            "these are the only two providers measured to report scopes back to a self-probe; \
+             add a slot here only after reading both what the provider returns and what a \
+             consumer names in source"
+        );
+        assert_eq!(
+            spec("github-pat").unwrap().required_scopes,
+            ["write:packages"],
+            "read:packages is a sibling scope, not implied — requiring it fails the live token"
+        );
+    }
+
+    /// The rail rendered a nav hint, a breadcrumb and scope pills; a port that
+    /// silently dropped one would degrade the desktop surface it replaced.
+    #[test]
+    fn every_ported_entry_kept_all_four_fields() {
+        for slot in ["cloudflare-api-token", "github-pat", "hetzner-api-token"] {
+            let mint = spec(slot).unwrap().mint;
+            assert!(mint.dashboard_url.is_some(), "{slot}: no dashboard url");
+            assert!(mint.dashboard_label.is_some(), "{slot}: no breadcrumb");
+            assert!(mint.nav_hint.is_some(), "{slot}: no nav hint");
+            assert!(!mint.scopes.is_empty(), "{slot}: no scopes");
+        }
     }
 
     #[test]

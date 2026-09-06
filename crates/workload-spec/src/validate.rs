@@ -14,8 +14,9 @@ use regex::Regex;
 use thiserror::Error;
 
 use crate::{
-    EnvValue, EnvVar, ImageRef, MachineId, MeshIdent, MeshLookup, RestartPolicy, SecretRef,
-    SecretTarget, StaticAssetWorkload, VolumeSource, WorkloadSpec,
+    EnvValue, EnvVar, ImageRef, LifecycleArchetype, MachineId, MeshIdent, MeshLookup,
+    RestartPolicy, SecretRef, SecretTarget, StaticAssetWorkload, Supply, VolumeSource,
+    WorkloadSpec, DURABILITY_SUBJECTS_ANNOTATION, DURABILITY_TIER_ANNOTATION,
 };
 
 // ── Field paths ───────────────────────────────────────────────────────────────
@@ -48,6 +49,10 @@ pub enum FieldPath {
     Image,
     /// `depends_on[index]` — mesh ident is not a known deployed workload.
     DependsOn(usize),
+    /// `requires[index]` — a malformed requirement (R860-T1): a `supply` /
+    /// `provides` mismatch, a provider whose spec names a different identity,
+    /// a nested `self` supply, or a repeated / self-naming ident.
+    Requires(usize),
     /// `expose.public.hostname` — hostname is not in an owned CF zone.
     Hostname,
     /// `resources` — machine lacks sufficient capacity.
@@ -56,6 +61,10 @@ pub enum FieldPath {
     AssetAlias(String),
     /// `asset[index].<sub>` — e.g. `Asset(0, "source")` for the XOR rule.
     Asset(usize, &'static str),
+    /// `annotations["<key>"]` — a declaration carried as an annotation rather
+    /// than a field, because `WorkloadSpec` crosses a positional postcard wire
+    /// (R590-B3). `yah.durability.tier` is the first.
+    Annotation(&'static str),
 }
 
 impl fmt::Display for FieldPath {
@@ -75,10 +84,12 @@ impl fmt::Display for FieldPath {
             FieldPath::RestartPolicy => write!(f, "restart_policy"),
             FieldPath::Image => write!(f, "image"),
             FieldPath::DependsOn(i) => write!(f, "depends_on[{i}]"),
+            FieldPath::Requires(i) => write!(f, "requires[{i}]"),
             FieldPath::Hostname => write!(f, "expose.public.hostname"),
             FieldPath::Resources => write!(f, "resources"),
             FieldPath::AssetAlias(key) => write!(f, "aliases[{key}]"),
             FieldPath::Asset(i, sub) => write!(f, "asset[{i}].{sub}"),
+            FieldPath::Annotation(key) => write!(f, "annotations[\"{key}\"]"),
         }
     }
 }
@@ -286,6 +297,103 @@ fn check_mesh_ports(
     Ok(())
 }
 
+/// Validates `requires` (R860-T1 / W338): the `supply` / `provides` pairing,
+/// the identity a self-provisioned provider claims, the depth bound on the
+/// recursion, and ident uniqueness.
+///
+/// The depth bound is the load-bearing rule. `Requirement::provides` makes
+/// `WorkloadSpec` recursive, and a provider that may itself self-provision
+/// turns "a workload plus its sidecars" into an unbounded tree that placement
+/// would have to flatten before it could schedule anything. One level is what
+/// the design asks for, so one level is what is representable.
+fn check_requires(spec: &WorkloadSpec) -> Result<(), ShapeError> {
+    let mut seen: Vec<&str> = Vec::new();
+
+    for (i, req) in spec.requires.iter().enumerate() {
+        let path = || FieldPath::Requires(i);
+        let ident = req.ident.0.as_str();
+
+        if ident == spec.expose.mesh.identity.0 {
+            return Err(ShapeError::Field {
+                path: path(),
+                reason: format!(
+                    "requires its own identity {ident:?}; a workload cannot be \
+                     its own provider"
+                ),
+            });
+        }
+        if seen.contains(&ident) {
+            return Err(ShapeError::Field {
+                path: path(),
+                reason: format!(
+                    "ident {ident:?} is declared twice; one requirement per \
+                     provider, since a second entry could only contradict the \
+                     first's locality or supply"
+                ),
+            });
+        }
+        seen.push(ident);
+
+        match (req.supply, &req.provides) {
+            (Supply::SelfProvision, None) => {
+                return Err(ShapeError::Field {
+                    path: path(),
+                    reason: format!(
+                        "supply = \"self\" on {ident:?} but no `provides` spec; \
+                         a self-provisioned requirement is the one that carries \
+                         its provider, so there is nothing to stand up"
+                    ),
+                });
+            }
+            (Supply::Wait, Some(_)) => {
+                return Err(ShapeError::Field {
+                    path: path(),
+                    reason: format!(
+                        "supply = \"wait\" on {ident:?} but a `provides` spec is \
+                         present; a waiting requirement names a provider someone \
+                         else declares, so this spec would have no owner — set \
+                         supply = \"self\" to deploy it here"
+                    ),
+                });
+            }
+            (Supply::Wait, None) => {}
+            (Supply::SelfProvision, Some(provided)) => {
+                if provided.expose.mesh.identity.0 != ident {
+                    return Err(ShapeError::Field {
+                        path: path(),
+                        reason: format!(
+                            "`provides` declares expose.mesh.identity {:?} but the \
+                             requirement names {ident:?}; the provider keeps its \
+                             own mesh identity and it has to be the one this \
+                             requirement asks for (its `name` is {:?})",
+                            provided.expose.mesh.identity.0, provided.name
+                        ),
+                    });
+                }
+                if let Some(nested) = provided
+                    .requires
+                    .iter()
+                    .find(|r| matches!(r.supply, Supply::SelfProvision))
+                {
+                    return Err(ShapeError::Field {
+                        path: path(),
+                        reason: format!(
+                            "`provides` spec {ident:?} itself requires {:?} with \
+                             supply = \"self\"; composition is bounded at one \
+                             level, so a provider may only wait on things it \
+                             does not deploy — hoist that requirement up to this \
+                             spec's own `requires`",
+                            nested.ident.0
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Run shape validation — sync, no I/O.
@@ -306,6 +414,10 @@ fn check_mesh_ports(
 /// - `expose.public.port`: must appear in `expose.mesh.ports`.
 /// - `secrets[*].target`: file paths must be absolute; env-var names must
 ///   match `^[A-Z_][A-Z0-9_]*$`.
+/// - `requires[*]`: `supply = "self"` carries a `provides` spec and
+///   `supply = "wait"` does not; a `provides` spec declares the identity its
+///   requirement names; a `provides` spec carries no `self` supply of its own
+///   (depth 1); idents are unique and none is the spec's own (R860-T1).
 ///
 /// Soft checks (produce warnings, not errors):
 /// - `expose.mesh.ports[*]`: a name with no number — nothing allocates from the
@@ -393,6 +505,10 @@ pub fn shape(spec: &WorkloadSpec) -> Result<Vec<ShapeWarning>, ShapeError> {
     // expose.mesh.ports[*]: names well-formed, nothing declared twice (R844-F17)
     check_mesh_ports(&spec.expose.mesh, &mut warnings)?;
 
+    // requires[*]: supply/provides pairing, provider identity, depth bound,
+    // ident uniqueness (R860-T1)
+    check_requires(spec)?;
+
     // expose.public.port must appear in expose.mesh.ports
     if let Some(public) = &spec.expose.public {
         if !spec.expose.mesh.declares_number(public.port) {
@@ -448,6 +564,72 @@ pub fn shape(spec: &WorkloadSpec) -> Result<Vec<ShapeWarning>, ShapeError> {
                     .into(),
             });
         }
+    }
+
+    // yah.durability.*: a malformed declaration is hard, and a stateful
+    // workload with no declaration at all is soft (R850-P4).
+    //
+    // The asymmetry is deliberate. Refusing every undeclared appliance would
+    // fail every spec in the tree on the day the annotation shipped; reading a
+    // *malformed* one as "undeclared" would let `tier = "streem"` mean "no
+    // backups" silently, which is the failure this whole surface exists to
+    // stop. See `WorkloadSpec::durability`.
+    let durability = spec
+        .durability()
+        .map_err(|e| ShapeError::Field {
+            path: FieldPath::Annotation(DURABILITY_TIER_ANNOTATION),
+            reason: e.to_string(),
+        })?;
+    // R850-F1: a bytes-shipping tier's subjects are volume-relative, so there
+    // has to be exactly one volume for them to be relative *to*. Zero means the
+    // declaration names files that will never exist; two or more means the
+    // hydrate helper would have to guess which host directory to restore into,
+    // and a wrong guess writes somebody's database over somebody else's.
+    if let Some(d) = durability.as_ref().filter(|d| d.tier.ships_bytes()) {
+        let named: Vec<&str> = spec
+            .volumes
+            .iter()
+            .filter_map(|v| match &v.source {
+                VolumeSource::Named { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        if named.len() != 1 {
+            return Err(ShapeError::Field {
+                path: FieldPath::Annotation(DURABILITY_SUBJECTS_ANNOTATION),
+                reason: format!(
+                    "{DURABILITY_TIER_ANNOTATION} = \"{}\" declares subjects {:?}, which are \
+                     relative to a named volume, but this spec declares {} named volumes{}; \
+                     a tier that ships bytes needs exactly one",
+                    d.tier,
+                    d.subjects,
+                    named.len(),
+                    if named.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", named.join(", "))
+                    }
+                ),
+            });
+        }
+    }
+
+    if durability.is_none()
+        && spec.effective_archetype() == LifecycleArchetype::Appliance
+        && spec
+            .volumes
+            .iter()
+            .any(|v| matches!(v.source, VolumeSource::Named { .. }))
+    {
+        warnings.push(ShapeWarning {
+            path: FieldPath::Annotation(DURABILITY_TIER_ANNOTATION),
+            message: format!(
+                "appliance with a yubaba-managed named volume declares no durability \
+                 tier, so that volume is the only copy of its state and losing the node \
+                 loses it; declare {DURABILITY_TIER_ANNOTATION} = \"none\" if that is \
+                 intended, or a real tier if it is not"
+            ),
+        });
     }
 
     // soft: healthcheck.initial_delay >= stop_policy.grace_period * 2

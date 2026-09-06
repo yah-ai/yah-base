@@ -1308,6 +1308,7 @@ mod tests {
             volumes: vec![],
             resources: ResourceLimits { memory_mb: 256, cpu_millis: 512, ephemeral_storage_mb: 256 },
             depends_on: vec![],
+            requires: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
             archetype: None,

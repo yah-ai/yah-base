@@ -102,12 +102,14 @@ mod tests {
         // Atomic: stage-then-rename, never a direct write to the live path.
         assert!(s.contains("mv -f"), "install must be an atomic rename");
         assert!(s.contains(".roll-new.$$"), "install must stage to a temp name");
-        // All three binaries + all four unit files (scryer conditionally —
-        // see the dedicated test below).
+        // Every binary + all four unit files (scryer and the passway pair
+        // conditionally — see the dedicated tests below).
         for target in [
             "/usr/local/bin/yubaba",
             "/usr/local/bin/kamaji",
             "/usr/local/bin/yah-scryer",
+            "/usr/local/bin/passway",
+            "/usr/local/bin/passway-demux",
             "/etc/systemd/system/yubaba.slice",
             "/etc/systemd/system/kamaji.service",
             "/etc/systemd/system/yubaba.service",
@@ -147,6 +149,46 @@ mod tests {
                 < s.find("restart yah-scryer.service").unwrap(),
             "scryer restarts after the supervision pair"
         );
+    }
+
+    #[test]
+    fn passway_installs_conditionally_and_never_restarts_the_front_door() {
+        // R870-B2: passway + passway-demux joined the tarball at 0.8.33, giving
+        // the sovereign front door its first distribution path. Same
+        // conditional shape as scryer, so a rollback to a pre-0.8.33 release
+        // still succeeds.
+        let s = build_install_script("0.8.33", "u", "d", true);
+        assert!(
+            s.contains(r#"if [ -e "$D/passway" ]; then"#),
+            "passway install must be gated on the tarball carrying the binary"
+        );
+        for bin in ["passway", "passway-demux"] {
+            assert!(
+                s.contains(&format!(
+                    r#"assert_installed_bytes "$D/{bin}"       /usr/local/bin/{bin}"#
+                )) || s.contains(&format!(
+                    r#"assert_installed_bytes "$D/{bin}" /usr/local/bin/{bin}"#
+                )),
+                "installed {bin} bytes must be content-asserted like the pair"
+            );
+        }
+        // THE LOAD-BEARING NEGATIVE. passway cannot hot-swap a cert (tls.rs
+        // "The reload gap"), so `systemctl restart` on a door drops in-flight
+        // connections on public :443. A roll stages the bytes; the operator
+        // chooses when to take the blip. If someone later adds a restart here,
+        // every fleet roll starts cutting live traffic on yah.dev — and it
+        // would look like an obvious omission being fixed.
+        let exec = executable_lines(&s);
+        for unit in [
+            "passway.service",
+            "passway-test.service",
+            "passway-demux.service",
+        ] {
+            assert!(
+                !exec.contains(unit),
+                "a roll must not name {unit} — see R870-T3 for the graceful path"
+            );
+        }
     }
 
     /// The script with every comment line removed — i.e. only the lines bash
@@ -198,6 +240,8 @@ mod tests {
             "/usr/local/bin/yubaba",
             "/usr/local/bin/kamaji",
             "/usr/local/bin/yah-scryer",
+            "/usr/local/bin/passway",
+            "/usr/local/bin/passway-demux",
             "/etc/systemd/system/yubaba.slice",
             "/etc/systemd/system/kamaji.service",
             "/etc/systemd/system/yubaba.service",

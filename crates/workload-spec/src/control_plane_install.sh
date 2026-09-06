@@ -1,6 +1,8 @@
 # shellcheck shell=bash
-# Canonical control-plane (yubaba + kamaji) roll: fetch → verify → anchor →
-# install → assert → restart.
+# Canonical control-plane roll: fetch → verify → anchor → install → assert →
+# restart. yubaba + kamaji are the supervised pair; yah-scryer (0.8.32) and
+# passway + passway-demux (0.8.33) ride the same tarball, each conditional on
+# the tarball carrying it so a rollback to an older release still succeeds.
 #
 # THIS FILE IS THE ONE COPY. Three callers consume these exact bytes:
 #   1. `build_install_script` (control_plane_install.rs) include_str!s it for the
@@ -65,6 +67,8 @@ anchor() { # path
 anchor /usr/local/bin/yubaba
 anchor /usr/local/bin/kamaji
 anchor /usr/local/bin/yah-scryer
+anchor /usr/local/bin/passway
+anchor /usr/local/bin/passway-demux
 anchor /etc/systemd/system/yubaba.slice
 anchor /etc/systemd/system/kamaji.service
 anchor /etc/systemd/system/yubaba.service
@@ -94,6 +98,28 @@ if [ -e "$D/yah-scryer" ]; then
   install_atomic "$D/yah-scryer"         0755 /usr/local/bin/yah-scryer
   install_atomic "$D/yah-scryer.service" 0644 /etc/systemd/system/yah-scryer.service
 fi
+# passway + passway-demux ride the same tarball from 0.8.33 (R870-B2). Before
+# this they had NO distribution path at all — the live doors were hand-cross-
+# built and scp'd (R853-T2) — so a fleet roll could not carry an ingress fix.
+# Conditional for the same reason as scryer: a rollback to a pre-0.8.33 release
+# must still succeed.
+#
+# NO UNIT IS INSTALLED AND NOTHING IS RESTARTED, deliberately, and both halves
+# matter. The unit name is not knowable from here: the two live origins run
+# passway.service (south) and passway-test.service (east) against per-node env
+# files, so there is nothing this script could name. And a restart is not free —
+# passway cannot hot-swap (tls.rs "The reload gap": TlsSettings is static), so
+# `systemctl restart` DROPS IN-FLIGHT CONNECTIONS on a public front door. The
+# install is a rename, so a running door keeps serving from its open inode and
+# picks the new bytes up on the operator's next restart. Staging bytes without
+# cutting live traffic is the correct default for the :443 tier; R870-T3 is
+# wiring the graceful PASSWAY_UPGRADE handoff that makes a restart safe.
+HAS_PASSWAY=0
+if [ -e "$D/passway" ]; then
+  HAS_PASSWAY=1
+  install_atomic "$D/passway"       0755 /usr/local/bin/passway
+  install_atomic "$D/passway-demux" 0755 /usr/local/bin/passway-demux
+fi
 
 echo "== assert by CONTENT, not by version string =="
 # `--version` prints the workspace version baked in at build time, which says
@@ -118,6 +144,10 @@ assert_installed_bytes "$D/kamaji" /usr/local/bin/kamaji
 if [ "$HAS_SCRYER" = 1 ]; then
   assert_installed_bytes "$D/yah-scryer" /usr/local/bin/yah-scryer
 fi
+if [ "$HAS_PASSWAY" = 1 ]; then
+  assert_installed_bytes "$D/passway"       /usr/local/bin/passway
+  assert_installed_bytes "$D/passway-demux" /usr/local/bin/passway-demux
+fi
 
 echo "== restart supervision tree (kamaji then yubaba, W154 order) =="
 $SUDO systemctl daemon-reload
@@ -129,5 +159,10 @@ $SUDO systemctl restart yubaba.service
 if [ "$HAS_SCRYER" = 1 ]; then
   $SUDO systemctl enable yah-scryer.service
   $SUDO systemctl restart yah-scryer.service
+fi
+if [ "$HAS_PASSWAY" = 1 ]; then
+  echo "  passway + passway-demux bytes are STAGED, not live — this roll deliberately"
+  echo "  does not restart the front door (see the install block above). Restart the"
+  echo "  node's own passway unit when a :443 blip is acceptable."
 fi
 echo "installed target=$VER yubaba=$(/usr/local/bin/yubaba --version 2>/dev/null) kamaji=$(/usr/local/bin/kamaji --version 2>/dev/null)"

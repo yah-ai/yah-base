@@ -170,6 +170,7 @@ fn minimal_spec() -> WorkloadSpec {
             ephemeral_storage_mb: 64,
         },
         depends_on: vec![],
+        requires: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Always,
         archetype: None,

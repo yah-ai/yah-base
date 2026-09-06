@@ -19,7 +19,7 @@ path = "src/lib.rs"
 
 [dependencies]
 thiserror = "1"
-yah-object-store = { path = "../object-store", version = "0.8.32" }
+yah-object-store = { path = "../object-store", version = "0.8.33" }
 # Path-only, deliberately: yah-tenant-pointer is `publish = false`, so there is
 # no `0.8.29` of it on any registry for a version requirement to resolve
 # against. The two crates flip to published together or not at all.

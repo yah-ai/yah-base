@@ -68,6 +68,13 @@ fn main() {
     emit!(OperatorExpose);
     emit!(ExposeSpec);
 
+    // R860-T1: the requirement vocabulary. Requirement.provides makes this
+    // mutually recursive with WorkloadSpec, so the order is arbitrary — the
+    // declarations reference each other by name either way.
+    emit!(Locality);
+    emit!(Supply);
+    emit!(Requirement);
+
     emit!(WorkloadSpec);
 
     // The two on-disk forms of `kind = "container"` (R783-F1 / W324). Leaves

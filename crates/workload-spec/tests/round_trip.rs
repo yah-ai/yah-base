@@ -3,6 +3,58 @@ use std::path::PathBuf;
 
 use workload_spec::*;
 
+/// A minimal provider spec, for hanging off a `supply = "self"` requirement
+/// (R860-T1). Its `expose.mesh.identity` is the identity that requirement
+/// names — each member of a group keeps its own (W338).
+fn sidecar_spec() -> WorkloadSpec {
+    WorkloadSpec {
+        schema_version: SchemaVersion::V1,
+        name: "noisetable-db-replicator".into(),
+        image: ImageRef {
+            registry: "ghcr.io".into(),
+            repository: "yah/litestream".into(),
+            tag: "v0.3.13".into(),
+            digest: "sha256:beef0123cafe".into(),
+        },
+        tier: TierTag("private".into()),
+        tenant: TenantId("ss".into()),
+        namespace: NamespaceId("noisetable".into()),
+        replicas: 1,
+        command: None,
+        entrypoint: None,
+        workdir: None,
+        user: None,
+        env: vec![],
+        secrets: vec![],
+        volumes: vec![],
+        resources: ResourceLimits {
+            memory_mb: 64,
+            cpu_millis: 128,
+            ephemeral_storage_mb: 32,
+        },
+        depends_on: vec![],
+        requires: vec![],
+        healthcheck: None,
+        restart_policy: RestartPolicy::Always,
+        archetype: Some(LifecycleArchetype::Server),
+        stop_policy: StopPolicy {
+            signal: 15,
+            grace_period: Millis::from_secs(5),
+        },
+        expose: ExposeSpec {
+            mesh: MeshExpose {
+                identity: MeshIdent("noisetable-db-replicator.pdx".into()),
+                ports: MeshExpose::anonymous_ports([]),
+                allow_from: vec![],
+            },
+            public: None,
+            operator: None,
+        },
+        labels: HashMap::new(),
+        annotations: HashMap::new(),
+    }
+}
+
 /// Representative spec with every field family populated.
 fn full_spec() -> WorkloadSpec {
     WorkloadSpec {
@@ -82,6 +134,23 @@ fn full_spec() -> WorkloadSpec {
             ephemeral_storage_mb: 256,
         },
         depends_on: vec![MeshIdent("noisetable-db.pdx".into())],
+        // R860-T1: both requirement axes, and the `provides` box that makes
+        // WorkloadSpec recursive — so the round-trips below carry a nested
+        // spec through JSON *and* postcard rather than only the flat shape.
+        requires: vec![
+            Requirement {
+                ident: MeshIdent("noisetable-cache.pdx".into()),
+                locality: Locality::PreferLocal,
+                supply: Supply::Wait,
+                provides: None,
+            },
+            Requirement {
+                ident: MeshIdent("noisetable-db-replicator.pdx".into()),
+                locality: Locality::Local,
+                supply: Supply::SelfProvision,
+                provides: Some(Box::new(sidecar_spec())),
+            },
+        ],
         healthcheck: Some(Healthcheck {
             probe: HealthProbe::HttpGet {
                 path: "/healthz".into(),
@@ -459,6 +528,7 @@ fn minimal_spec_round_trips_through_json_and_postcard() {
         volumes: vec![],
         resources: ResourceLimits { memory_mb: 64, cpu_millis: 256, ephemeral_storage_mb: 64 },
         depends_on: vec![],
+        requires: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Always,
         archetype: None,

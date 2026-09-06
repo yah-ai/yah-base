@@ -269,6 +269,10 @@ fn translate_service(
             ephemeral_storage_mb: 512,
         },
         depends_on,
+        // compose has no locality/supply concept, so an import can only ever
+        // produce the `anywhere` + `wait` edges `depends_on` already carries
+        // (R860-T1).
+        requires: vec![],
         healthcheck: None,
         restart_policy,
         archetype: None,

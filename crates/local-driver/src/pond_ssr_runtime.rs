@@ -434,6 +434,7 @@ mod tests {
                 ephemeral_storage_mb: 256,
             },
             depends_on: vec![],
+            requires: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
             archetype: None,

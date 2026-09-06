@@ -22,7 +22,7 @@ hex = "0.4"
 percent-encoding = "2"
 
 # Share the SigV4 helpers with cloud/hetzner/local_docker via local-driver.
-local-driver = { package = "yah-local-driver", path = "../local-driver", version = "0.8.32" }
+local-driver = { package = "yah-local-driver", path = "../local-driver", version = "0.8.33" }
 
 # Vault-backed constructor pulls cloudflare-r2-* slots.
-fob = { path = "../keys", version = "0.8.32" }
+fob = { path = "../keys", version = "0.8.33" }

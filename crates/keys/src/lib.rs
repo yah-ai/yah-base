@@ -82,8 +82,9 @@
 //!
 //!
 //! @yah:ticket(R856-F1, "CredentialSpec registry + verdict sidecar covering all 42 live slots")
+//! @yah:status(review)
 //! @yah:assignee(agent:bundle-anthropic-glimmerstone)
-//! @yah:at(2026-09-03T22:18:26Z)
+//! @yah:at(2026-09-04T21:12:43Z)
 //! @yah:phase(P1)
 //! @yah:parent(R856)
 //! @yah:next("W337 §3 and §10.1. This is the highest-value item in the doc and the only phase with zero provider-integration risk — every later ticket reads from it.")
@@ -126,10 +127,12 @@
 //! @yah:next("R856-F2 is now unblocked and is the next dependency-wave ticket (T3 and F8 also key off F1). F2 should convert ExpiryKind::Unverified to Enforced/Declared per slot AS EACH PROVIDER'S LIVE DOCS ARE READ, never before — Unverified is the deliberate default and is not a synonym for ReviewBy. F2 should also resolve the discovered orphan pair recorded in this ticket's gotchas: crates/yah/runner/src/resolver/mod.rs:1130-1137 declares OPENAI_ADMIN_SLOT / OPENAI_ADMIN_ENV / ANTHROPIC_ADMIN_ENV for slots that exist in neither the vault nor the registry — spec them or delete them.")
 //! @yah:verify("CROSS-WORKSPACE RISK CHECKED AND CLEAR (the implementer had only built the root workspace). fob is consumed by nine dependents across four workspaces, and adding chrono+serde to it touches every lockfile. All four are consistent — `cargo check --locked` succeeded for oss/yah-base (--all-targets), oss/qed (-p yah-qed; note the package is yah-qed, not qed), and fob itself inside oss/yubaba. No lockfile needed updating.")
 //! @yah:gotcha("PRE-EXISTING, NOT FROM THIS TICKET, and it blocks `cargo check --manifest-path oss/yubaba/Cargo.toml -p yah-cloud` camp-wide: a live peer holds an uncommitted rewrite of oss/kamaji/crates/kamaji/src/ports.rs (+677/-171) renaming PortAllocator::resolve to resolve_one/resolve_set, and the call site at oss/yubaba/crates/cloud/src/reconciler/mesofact_static.rs:634 still uses the old name. Reproduced under --locked, and fob compiles fine in that same workspace, so it is independent of R856-F1. oss/yubaba/crates/cloud/src/reconciler/ingress.rs also changed mid-verification — someone is live in that crate. Left untouched per shared-tree doctrine.")
+//! @yah:handoff("Relay-leader sign-off request. The registry + sidecar landed and were independently re-verified by a second courier (not the implementer) against anchor dbe6954b; all six ticket verify criteria hold and are recorded above. Moving to review so the dependency gate treats F1 as terminal — F2, T3 and F8 all key off it and were withheld as 'waiting on R856-F1 (not yet terminal)'.")
 //!
 //! @yah:ticket(R856-F7, "Tier-2 probed expiry where the provider exposes it, and tier-3 scope drift")
-//! @yah:at(2026-09-03T21:09:27Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:at(2026-09-05T01:59:32Z)
 //! @yah:phase(P3)
 //! @yah:parent(R856)
 //! @yah:next("W337 §3 tiers 2-3 and §10.6. Tier 3 (scope drift) is the least available signal and the most valuable when present, because it is the ONLY tier that catches a break before the failing call.")
@@ -142,10 +145,14 @@
 //! @yah:depends_on(R856-F2)
 //! @yah:tier(Wizard)
 //! @yah:next("SCOPE NARROWED 2026-09-03 by R856-T4: npm's probed expiry is NOT yours — it moved to R856-F2. Measured: `npm token list --json` returns `expiry` (RFC 3339) alongside `permissions`, `scopes`, `cidr`, `bypass_2fa`, `revoked`, so npm's tier-2 answer is one field on the same call F2's tier-1 auth probe already makes; parsing it here would mean parsing the same response twice, one phase apart. F7 keeps tier-2 probed expiry for the OTHER providers, plus tier-3 scope drift everywhere including npm. W337 §10 step 6 and §3.2 are both reworded to match — read §3.2's \"Ownership\" paragraph before starting. Trap recorded there: `--json` carries NO `id` field (`key` is `***`, `token` is the masked npm_XXXX...YYYY form), so a record cannot be joined to a vault slot by id — match on the masked token prefix.")
+//! @yah:handoff("LANDED 2026-09-04. Tier 2: GitHub's `GitHub-Authentication-Token-Expiration` header is read off the tier-1 `GET /user` response (both observed formats parse, an unrecognised third goes quiet rather than wrong); an absent header records NOTHING, since `ReviewBy` is the positive claim \"never expires\" and the registry already carries it for github-pat. Cloudflare's `expires_on` was reclassified `Declared` -> `Enforced`: W337 §7.1's axis is provenance (read from the provider) not who picked the number, and under F2's reading tier 2 could never upgrade anything but npm. Hetzner (`GET /v1/tokens` 404) and crates.io (`/api/v1/me/tokens` 403, cookie-only) expose no introspection — measured, not assumed. Tier 3: new `CredentialSpec::required_scopes` (machine vocabulary, deliberately NOT `MintHelp::scopes` which is dashboard prose), `scope_guarded()` applied at both venues — the sweep in `collect_with` and the write gate in `gate()`, which finally reaches the `ScopeInsufficient` arm F5 wrote. npm's prober now reads both axes (`permissions` + `scopes`, target axis prefixed `scope:`), because a token keeping `package:write` but losing org `mesofact` passes auth, presence and expiry and dies at publish. Only two of five probed providers expose scopes at all; only two slots carry a baseline (github-pat `write:packages`, npm-api-token `package:write` + `scope:org:mesofact`), and empty means no drift check — never a red. GitHub's package scopes are siblings, not nested: MINT_GITHUB's \"write:packages implies read:packages\" nav hint was wrong and is corrected. Files: app/yah/cli/src/keys_doctor.rs, oss/yah-base/crates/keys/src/spec.rs, W337 §3 + §7.1.")
+//! @yah:verify("Both verify criteria hold. (1) `yah keys doctor` reports cloudflare-legacy-yah `expires 2029-04-20 (provider-enforced)` and the sidecar record flipped kind `declared` -> `enforced`, superseding the prior declared date. (2) `a_narrowed_incoming_token_is_refused_by_name_before_it_overwrites_a_good_one` asserts the gate refuses with detail `missing scopes: scope:org:mesofact` — the actual scope, not a generic failure. `cargo test -p yah --lib keys_doctor` green (61 tests); rustfmt divergence on keys_doctor.rs is 15, identical to the committed baseline, and spec.rs is 0.")
+//! @yah:gotcha("The implementing session (session:8bccad3b) died on limits mid-verification; a second session finished it. Two defects from that session were found and fixed on pickup, both from edits landing at the wrong anchor: (1) `a_narrowed_incoming_token…`'s `#[test]` was inserted such that the function carried TWO `#[test]` attributes and inherited `a_slot_with_no_prober…`'s doc comment — it compiled and ran, but registered 62 descriptors for 61 tests; (2) the W337 §7.1 prose block landed between the `Declared` and `ReviewBy` bullets, splitting the three-kind list in two. Worth a reviewer's glance at any other insertion from that session.")
 //!
 //! @yah:ticket(R856-F9, "Overlap slots: slot / slot.next, so rotation is never atomic")
-//! @yah:at(2026-09-03T21:09:41Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-09-05T03:00:08Z)
 //! @yah:phase(P4)
 //! @yah:parent(R856)
 //! @yah:next("W337 §6 and §10.8. The strongest defence against rot is not detection, it is making rotation non-atomic. Consumers try current-then-next; rotation becomes mint -> write .next -> probe -> promote -> revoke old, with no window where the only live credential is unverified.")
@@ -156,20 +163,43 @@
 //! @arch:see(.yah/docs/working/W337-credential-health-and-rotation.md)
 //! @yah:depends_on(R856-F5)
 //! @yah:tier(Wizard)
+//! @yah:handoff("LANDED, but NOT as the ticket's own wording. The brief said \"support slot and slot.next\"; a `<slot>.next` vault entry is exactly the shape the operator ruled out on 2026-09-03 for its mirror `<slot>.prev` (R856-T11), because R856-F1 made `yah keys list` the authority the fob registry is diffed against and a dotted sibling would read as an unlisted vault slot plus a shadow row per rotated credential in `yah cloud secrets`. What shipped is a slot-ADJACENT sidecar outside the slot namespace: new module oss/yah-base/crates/keys/src/adjacent.rs (AdjacentStore/AdjacentRecord/AdjacentValue, parse_adjacent/render_adjacent, MAX_PREVIOUS=3, ADJACENT_VERSION=1) persisted to `credentials-adjacent.enc` in KeysStore::dir(), AES-256-GCM under the SAME machine key at 0600 — unlike the health sidecar, which stays plain 0644 because verdicts are not secret and this file's contents are.")
+//! @yah:handoff("STORE API on KeysStore (oss/yah-base/crates/keys/src/lib.rs): adjacent_path / read_adjacent / write_adjacent, stage_overlap(slot,value,ttl_secs) -> lease_id, overlap + overlap_at, candidates + candidates_at (the consumer accessor — current-then-overlap, deduped, and strictly additive: an unreadable sidecar still yields the current value), promote_overlap + promote_overlap_at, discard_overlap, stash_previous, previous. Constants OVERLAP_DEFAULT_TTL_SECS=24h, OVERLAP_MAX_TTL_SECS=30d. Refactored read_creds/write_creds onto new private read_encrypted/write_encrypted so credentials.enc and the sidecar cannot drift into two at-rest formats. Promote writes the VAULT FIRST then the sidecar on purpose: a crash between them leaves the value both promoted and staged (idempotent on re-promote), the reverse order would drop it. An expired lease DEMOTES the staged value into `previous` rather than deleting it — a staged credential may be send-once, and the lease's job is only to stop `candidates` handing out a stale second key.")
+//! @yah:handoff("THE FLAG, and what it is grounded on. New CredentialSpec.overlap: Overlap::{Permitted(&str), Forbidden(&str), Unproven} (spec.rs), plus permits_overlap() / overlap_evidence(). Both decided variants CARRY THEIR EVIDENCE as a string, because \"some agent believed it\" is not re-checkable. Default Unproven on all 49 specs. Only two measurements moved slots off it, both taken 2026-09-04: (1) CLOUDFLARE — this host's credential-health.json shows one sweep at 2026-09-04T23:55:19Z returning valid for THREE DISTINCT token ids (623b42a4, 28091f06, 2e976eaf) on one account simultaneously; applied to the four API-token slots cloudflare-api-token / cloudflare-legacy-yah / cloudflare-mesofact-static / cloudflare-static-yah-dev only, NOT to the R2 keys, tunnel tokens or zone-id, which are different credential kinds nothing measured. (2) NPM — `npm token list --json` (read-only, the same call the tier-1 probe makes) returned three unrevoked tokens with future expiries (publish 2026-12-01, yah2 and yah 2026-11-11). GitHub, Hetzner and crates.io were deliberately left Unproven: GitHub exposes no list API for classic PATs, and the vault holds only one live token for each of the other two, so there was nothing to measure. Guessing there would have been the one guess that costs an outage.")
+//! @yah:handoff("CLI + policy (app/yah/cli/src/keys_doctor.rs, cli.rs): OverlapRoute::{Overlap{evidence}, Rotate{why}} + overlap_route(slot) turn the registry flag into a message — Forbidden and Unproven both refuse but say different things, which is why the flag is a 3-variant enum and not a bool. overlap_begin(_with) / overlap_promote(_with) / overlap_status / overlap_abort, wired as `yah keys overlap {begin,promote,status,abort}` next to Sweep/Rotate. The policy gate lives ONLY in this layer, not in KeysStore: the store is the general primitive R856-T11 reuses for clobber recovery on slots that can never overlap. One deliberate asymmetry with `rotate`: begin stages an UNVALIDATED value without prompting, because staging cannot clobber a live credential by construction; promote inherits rotate's rule that only a positive refusal blocks and re-probes the staged value, since that probe guards the moment the slot actually flips, possibly hours after begin's.")
+//! @yah:handoff("VERIFIED. `cargo test -p fob --manifest-path oss/yah-base/Cargo.toml` 55 pass / 0 fail (baseline 42, +13: 5 in adjacent.rs, 6 in lib.rs, 2 in spec.rs). `cargo test -p yah --lib keys_doctor` 69 pass / 0 fail (baseline 61, +8). Criterion 1 is keys_doctor::tests::a_consumer_reads_a_live_value_at_every_step_of_an_overlap_cycle (full mint->stage->probe->promote->revoke against cloudflare-legacy-yah, asserting store.candidates() yields a provider-honoured value after EVERY step) plus the store-level twin fob::tests::a_consumer_reads_successfully_at_every_step_of_the_cycle. Criterion 2 is a_slot_without_a_measured_overlap_refuses_and_routes_to_rotate (github-pat: exit 1, nothing staged, sidecar not even created) and forbidden_and_unproven_refuse_with_different_sentences, which also pins overlap_route against every registry slot's own flag. Criterion 3 is staging_an_overlap_leaves_keys_list_byte_identical + keys_list_is_byte_identical_with_an_overlap_in_flight. Also ran `cargo xtask install` per app/yah/cli/CLAUDE.md (installed ~/.local/bin/yah, sha256 7fa0687a…, PATH resolves there) and smoke-tested the read-only verbs against the REAL vault: status prints the grounded evidence for cloudflare-api-token, the refusal sentence for github-pat, `yah keys list` md5 unchanged, and no credentials-adjacent.enc was created by a status or a refusal.")
+//! @yah:handoff("DISCOVERED WORK, done in this pass, not filed: .yah/docs/working/W337-credential-health-and-rotation.md §6 still told the next reader to \"support `slot` and `slot.next`\" — the shape the operator ruled out. Leaving it would have sent whoever reads the design doc straight back into the invariant break. Corrected in place with an as-built note naming the sidecar, the Overlap enum, the default-refuses argument and the two measurements. The doc's own wording was the only thing changed; §10 step 8 ordering is untouched.")
+//! @yah:gotcha("R856-T11 (clobber recovery) can take the primitive as-is: KeysStore::stash_previous / previous already exist, bounded at fob::adjacent::MAX_PREVIOUS, in the same sidecar, outside the slot namespace. What is deliberately NOT wired is stash-on-overwrite — `KeysStore::set` does not call stash_previous, and fob::tests::stash_previous_is_available_and_bounded_without_being_wired_into_set pins that so this ticket cannot pre-empt T11's decision about which write paths stash. Turning it on is a one-line change in `set` plus whatever T11 concludes about `yah keys recover`.")
+//! @yah:gotcha("Nothing on the credential-RESOLUTION path calls KeysStore::candidates yet — fob::get_or_env and every consumer still read the single current value, which is correct today (the overlap value only matters when the current one is dead, and the cycle never leaves it dead). If a future ticket wants a consumer to fail over to the staged value automatically, candidates() is the accessor to move it to; do NOT reintroduce name-mangling of the slot string.")
+//! @yah:assumes("The Cloudflare and npm overlap measurements are of the PROVIDER's behaviour on this account, read on 2026-09-04. Both are re-runnable (`yah keys sweep` / `npm token list --json`) and the evidence string in each Overlap::Permitted says how. Neither is a claim about a plan tier other than this account's.")
+//! @yah:handoff("CALLS MADE RATHER THAN ASKED: (1) 3-variant Overlap enum carrying evidence strings instead of a bool, so \"measured, and no\" and \"nobody checked\" reach the operator as different sentences. (2) Lease magnitudes 24h default / 30d cap — vault.lease's VOCABULARY is reused (lease_id, expires_at, ttl_secs, prune-then-write) but not its 1h ceiling, which is sized for a bash subprocess, not for a rotation an operator finishes by hand. (3) Expired leases demote rather than delete. (4) Promote is non-interactive about the expiry date (`--expires` or the derived default via rotation_expiry) where `rotate` prompts — begin already had the operator's attention and a second prompt hours later is where an in-flight rotation gets abandoned. (5) Nothing was committed; the working tree carries the change.")
 //!
 //! @yah:ticket(R856-T11, "Clobber-recovery store for overwritten vault slots — NOT a `&lt;slot&gt;.prev` entry in the slot namespace")
-//! @yah:at(2026-09-03T22:29:32Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-09-05T04:23:32Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R856)
 //! @yah:next("WHY THIS EXISTS: R856-T10 removed the --overwrite guard from `yah keys set` (it lost send-once credentials: provider shows a token once at registration, the guard refuses because the slot holds a stale value, secret gone). A vaulted secret still has no version history, so an overwrite is still permanent. This ticket is the recovery half the guard used to stand in for.")
 //! @yah:next("DO NOT IMPLEMENT THIS AS `&lt;slot&gt;.prev` IN THE SLOT NAMESPACE — operator ruled that out on 2026-09-03, and the reason is not obvious. R856-F1 made `yah keys list` the authority the fob credential registry is diffed against, and it ships a test asserting the registry contains no slot the vault does not have and none it does not list. A `.prev` entry would read as an unlisted vault slot, break that invariant, and add a shadow row per rotated credential to the `yah cloud secrets` table. The clobber-recovery idea is sound; it needs a store that is NOT the slot namespace (a sidecar history file under the keys dir, encrypted with the same machine key, bounded depth, invisible to list_slots).")
 //! @yah:verify("`yah keys list` output is byte-identical before and after an overwrite that stashes a prior value — the R856-F1 registry-vs-vault diff test still passes")
+//! @yah:handoff("LANDED on F9's store — nothing was redesigned. R856-F9 had already built the primitive (credentials-adjacent.enc, stash_previous/previous, MAX_PREVIOUS=3, outside the slot namespace) and deliberately left it unwired. T11 wires it and adds the surface. (a) KeysStore::set now retains what it displaces, via a new private stash_superseded/retain_superseded pair in oss/yah-base/crates/keys/src/lib.rs. (b) New `yah keys recover <slot> [--restore N]`, implemented as keys_doctor::recover_list / recover_restore and wired as KeysCommands::Recover next to Overlap/Rotate/Sweep. (c) New KeysStore::restore_previous(slot, index) -> masked string. The `<slot>.prev` shape stays ruled out and nothing here resurrects it.")
+//! @yah:handoff("THE STASH RULE, and the two-sided invariant that was NOT in the brief. stash_superseded skips a no-op rewrite (same value re-set) so a repeated Settings save cannot churn a 3-deep ring, and skips a first write. It also runs BEFORE the vault write — the value at risk is the incumbent, which lives in the vault, so the write that can destroy it goes last (promote_overlap_at orders the two the other way for the mirror reason: there the at-risk value is the staged one, which lives in the sidecar). And it CANNOT FAIL THE WRITE: a stash error is warned and swallowed, because refusing to store a credential over an unwritable recovery file would resurrect the exact R856-T10 failure this replaces. Beyond the brief: the rule is two-sided — the displaced value ENTERS the history and the incoming value LEAVES it. A test I wrote for A -> B -> A caught that a one-sided rule leaves A both current and retained, which is a restore that does nothing while occupying one of only three slots. push_previous also dedupes by value for the same reason. That invariant made restore_previous's own bookkeeping redundant: it now has no retention logic at all, it just calls set.")
+//! @yah:handoff("DISCOVERED WORK, fixed in this pass, and a deviation from the brief's letter worth reading. The brief said \"set is the single choke point every overwrite goes through\". It is not: KeysStore::import_map writes the whole creds map directly, so `yah keys import --strategy merge` over a live slot was a permanent clobber with no recovery — the exact failure T11 exists for, on a path the wiring would have missed. Rather than route import through set (which would let a partial import leave the vault half-merged), import_map now calls the same stash_superseded helper itself, so there is one RULE even though there are two writers. MergeStrategy::Skip never overwrites so it never retains. Covered by fob::tests::an_import_that_overwrites_a_live_slot_is_as_recoverable_as_a_set.")
+//! @yah:handoff("MASKING. No recovery verb prints a credential. AdjacentValue::masked() renders `<first 8 chars>... (N chars)`, and the width is not arbitrary — 8 is the join key this codebase already uses, since npm publishes each token as `npm_XXXX...YYYY` and keys_doctor::npm_record_for matches a vault value to a provider record on its first 8 characters (W337 §3.2). Reusing it means a `yah keys recover` listing reads straight across against `npm token list --json` output, and for npm those 8 characters are not a disclosure at all — npm publishes them itself to any read-only token list. No suffix is shown (npm's own masked form has one; there is no join value in it here and it is strictly more of the secret). NARROWED at sign-off: 8 was a fixed width with a 12-char floor under it, which rendered `abcdefgh... (12 chars)` — two thirds of the secret plus its exact length — for anything short, and the npm rationale covers a 40-char minted token, not whatever an operator puts in a slot. 8 is now a CEILING under MASK_MAX_FRACTION=4: show min(len/4, 8), drop the prefix below 4 shown chars (len < 16), and in that short case report `<hidden, under 16 chars>` rather than the exact count, since for a human-chosen secret the length is the disclosure. npm and GitHub both mint 40, so every real provider token still gets the full 8-char join prefix. The method lives on AdjacentValue, not in the CLI, so the safe rendering is the nearest one to hand and reaching for `.value` in display code reads as deliberate. restore_previous returns the mask, never the value — the credential moves vault-to-vault and never crosses stdout.")
+//! @yah:handoff("VERIFIED. `cargo test -p fob --manifest-path oss/yah-base/Cargo.toml` 62 pass / 0 fail (F9 baseline 55, +7). `cargo test -p yah --lib keys_doctor` 75 pass / 0 fail (F9 baseline 69, +6). ACCEPTANCE CRITERION covered on both sides: fob::tests::keys_list_is_byte_identical_across_an_overwrite_that_stashes and keys_doctor::tests::keys_list_is_byte_identical_across_a_stashing_overwrite, the latter also re-asserting the R856-F1 registry-vs-vault direction (every slot the vault lists is one fob::spec describes, which a `.prev` entry would break) and checking no listed slot contains `.prev` or `.next`. The F9 pinning test was FLIPPED, not deleted, as instructed: fob::tests::stash_previous_is_available_and_bounded_without_being_wired_into_set is now stash_previous_is_wired_into_set_and_stays_bounded, asserting a first write retains nothing and an overwrite retains what it displaced. Also ran `cargo xtask install` per app/yah/cli/CLAUDE.md and smoke-tested `yah keys recover` read-only against the real vault.")
+//! @yah:gotcha("`yah keys delete` still destroys a value permanently — it does NOT stash. Deliberate and out of scope: T11's mandate is the OVERWRITE that R856-T10 made unconditional, and delete is an explicitly-named destructive verb rather than an accident of pasting. MergeStrategy::Replace has the same shape: it retains values it overwrites, but slots the incoming set omits are DROPPED and not retained. Both are one call to stash_superseded away if a later ticket wants them.")
+//! @yah:gotcha("Recovery is deliberately NOT gated on the credential registry. `recover_list` / `recover_restore` never call fob::spec, unlike `rotate` and `overlap` which need one — so an ad-hoc slot written by `yah keys set foo bar` is recoverable too. That is the slot with the least other protection, so gating it on a registry entry would withhold the safety net from exactly the case that needs it most. Slot names are still charset-validated through KeysStore::validate_provider.")
+//! @yah:gotcha("History only exists going forward. A slot last written before T11 landed has nothing retained, and `yah keys recover` says so and exits 1 rather than implying the safety net was always there. The retention ring is 3 deep per slot (fob::adjacent::MAX_PREVIOUS), so the fourth overwrite evicts the oldest — recovery is a short-window undo, not an archive, and every retained entry is a live secret on disk the provider may never have been told to revoke.")
+//! @yah:verify("Live smoke against the REAL vault after `cargo xtask install` (sha256 6781ecbd..., PATH resolves there): `yah keys recover github-pat` prints the no-history message and exits 1; `yah keys list` md5 is 54d3638e7988a9eaf1ca22b370dd9165, identical to the value measured during R856-F9 before any of this landed; and no credentials-adjacent.enc was created, since nothing overwrote a real slot. `--restore` was deliberately NOT exercised against the real vault — that path is covered by tests on a tempdir store.")
+//! @yah:handoff("MID-RUN INCIDENT worth recording, since it briefly broke the camp. A python heredoc I used to append the T11 test block over-escaped a newline and wrote a literal two-character `\\n` into app/yah/cli/src/keys_doctor.rs:4331, which made the file fail to PARSE and took `cargo check --workspace` red for everyone. @Ashguard:polaris (R860-T1) caught it, correctly did not edit my in-flight file, and pinged; fixed with Edit inside ~2 minutes and confirmed back to them. Lesson for the next agent appending a test block here: splice with a real newline or use Edit, and re-run the suite before moving on — a parse error in this file is camp-wide, not local. Separately, three of my verification runs failed inside oss/yubaba/crates/cloud/src/config.rs (repel_archetype -> repel_archetypes, then admission_spec gaining a second parameter) — a peer's in-flight W338 placement-group refactor, not mine and not touched; the suite went green once they landed.")
+//! @yah:verify("cargo test -p fob --manifest-path oss/yah-base/Cargo.toml -> 62 pass / 0 fail (F9 baseline 55). cargo test -p yah --lib keys_doctor -> 75 pass / 0 fail (F9 baseline 69).")
+pub mod adjacent;
 pub mod spec;
 
+pub use adjacent::{AdjacentRecord, AdjacentStore, AdjacentValue};
 pub use spec::{
     parse_sidecar, render_sidecar, spec, specs_in_domain, Band, CredentialSpec, Domain, Expiry,
-    ExpiryKind, HealthRecord, HealthSidecar, MintHelp, ProbeFrom, Provider, Verdict,
+    ExpiryKind, HealthRecord, HealthSidecar, MintHelp, Overlap, ProbeFrom, Provider, Verdict,
     CREDENTIAL_SPECS,
 };
 
@@ -179,6 +209,7 @@ use aes_gcm::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
+use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use rand::RngCore;
 use serde_json::{Map, Value};
@@ -194,6 +225,12 @@ const CREDENTIALS_FILE: &str = "credentials.enc";
 /// desktop must be able to render credential health without touching
 /// plaintext, and nothing in it is secret.
 const HEALTH_FILE: &str = "credential-health.json";
+/// Slot-adjacent store (W337 §6). Encrypted, unlike [`HEALTH_FILE`], because
+/// what it holds *is* credential material — and separate from
+/// [`CREDENTIALS_FILE`] because anything inside that one is a vault slot, and
+/// `yah keys list` is the authority the credential registry is diffed against.
+/// See `adjacent` for the full argument.
+const ADJACENT_FILE: &str = "credentials-adjacent.enc";
 
 pub struct KeysStore {
     dir: PathBuf,
@@ -331,24 +368,53 @@ impl KeysStore {
             .map_err(|e| anyhow!("AES key construction failed: {e}"))
     }
 
-    fn read_creds(&self) -> Result<Map<String, Value>> {
-        let path = self.credentials_path();
+    /// Read and decrypt one `[nonce | ciphertext+tag]` file under this store's
+    /// machine key. `Ok(None)` for a file that is not there — the caller
+    /// decides whether absence is "empty" or an error.
+    ///
+    /// Shared by `credentials.enc` and the slot-adjacent sidecar (R856-F9) so
+    /// the two cannot drift into different at-rest formats.
+    fn read_encrypted(&self, path: &Path, what: &str) -> Result<Option<Vec<u8>>> {
         if !path.exists() {
-            return Ok(Map::new());
+            return Ok(None);
         }
         let mut blob = Vec::new();
-        File::open(&path)
+        File::open(path)
             .with_context(|| format!("open {}", path.display()))?
             .read_to_end(&mut blob)?;
         if blob.len() < NONCE_BYTES + 16 {
-            bail!("credentials blob at {} is truncated", path.display());
+            bail!("{what} blob at {} is truncated", path.display());
         }
         let (nonce_bytes, ciphertext) = blob.split_at(NONCE_BYTES);
         let nonce = Nonce::from_slice(nonce_bytes);
-        let plaintext = self
+        let plaintext = self.cipher()?.decrypt(nonce, ciphertext).map_err(|_| {
+            anyhow!(
+                "decrypt failed — wrong machine key, or {} corrupted",
+                path.display()
+            )
+        })?;
+        Ok(Some(plaintext))
+    }
+
+    /// Encrypt `plaintext` under this store's machine key and write it at 0600.
+    fn write_encrypted(&self, path: &Path, plaintext: &[u8]) -> Result<()> {
+        let mut nonce_bytes = [0u8; NONCE_BYTES];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = self
             .cipher()?
-            .decrypt(nonce, ciphertext)
-            .map_err(|_| anyhow!("decrypt failed — wrong machine key, or credentials.enc corrupted"))?;
+            .encrypt(nonce, plaintext)
+            .map_err(|_| anyhow!("encryption failed"))?;
+        let mut blob = Vec::with_capacity(NONCE_BYTES + ciphertext.len());
+        blob.extend_from_slice(&nonce_bytes);
+        blob.extend_from_slice(&ciphertext);
+        write_secure(path, &blob)
+    }
+
+    fn read_creds(&self) -> Result<Map<String, Value>> {
+        let Some(plaintext) = self.read_encrypted(&self.credentials_path(), "credentials")? else {
+            return Ok(Map::new());
+        };
         let parsed: Value = serde_json::from_slice(&plaintext)
             .context("decrypted credentials JSON is malformed")?;
         match parsed {
@@ -360,27 +426,94 @@ impl KeysStore {
     fn write_creds(&self, creds: &Map<String, Value>) -> Result<()> {
         let plaintext =
             serde_json::to_vec(&Value::Object(creds.clone())).context("serialize creds")?;
-        let mut nonce_bytes = [0u8; NONCE_BYTES];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = self
-            .cipher()?
-            .encrypt(nonce, plaintext.as_ref())
-            .map_err(|_| anyhow!("encryption failed"))?;
-        let mut blob = Vec::with_capacity(NONCE_BYTES + ciphertext.len());
-        blob.extend_from_slice(&nonce_bytes);
-        blob.extend_from_slice(&ciphertext);
-        write_secure(&self.credentials_path(), &blob)
+        self.write_encrypted(&self.credentials_path(), &plaintext)
     }
 
+    /// Write `token` into `provider`, stashing whatever it displaces (R856-T11).
+    ///
+    /// Unconditional, as R856-T10 made it: the `--overwrite` guard that used to
+    /// live here destroyed the credentials it was meant to protect, because a
+    /// provider that shows a token exactly once at registration hands it to
+    /// this function and a refusal loses it forever. What replaces the guard is
+    /// recovery rather than refusal — the displaced value goes to the
+    /// slot-adjacent store, bounded at [`adjacent::MAX_PREVIOUS`], where
+    /// `yah keys recover` can put it back.
     pub fn set(&self, provider: &str, token: &str) -> Result<()> {
         validate_provider(provider)?;
         if !self.machine_key_path().exists() {
             self.init(false)?;
         }
         let mut creds = self.read_creds()?;
+        let superseded = creds
+            .get(provider)
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        self.stash_superseded(provider, token, superseded.as_deref());
         creds.insert(provider.to_string(), Value::String(token.to_string()));
         self.write_creds(&creds)
+    }
+
+    /// The one place that decides whether a write is a recoverable clobber.
+    ///
+    /// Two things are deliberate and neither is obvious.
+    ///
+    /// **It runs before the vault write.** The value at risk is the incumbent,
+    /// which lives in the vault, so the write that can destroy it goes last.
+    /// (`promote_overlap_at` orders the two the other way for the mirror
+    /// reason: there the value at risk is the *staged* one, which lives in the
+    /// sidecar, so the sidecar clear goes last.) A crash in between leaves a
+    /// history entry for a value that is still current — harmless and
+    /// self-correcting, where the other order would lose the credential.
+    ///
+    /// **It cannot fail the write.** A stash error is warned about and
+    /// swallowed: refusing to store a credential because a *recovery* file was
+    /// unwritable would resurrect the exact R856-T10 failure this store was
+    /// built to replace. Recovery is a safety net, and a safety net that can
+    /// stop the trapeze is worse than none.
+    ///
+    /// Skips a no-op rewrite entirely (the same value re-set would otherwise
+    /// evict real history through a bounded ring).
+    ///
+    /// **The invariant it maintains is two-sided**, which is why it is not a
+    /// bare call to [`Self::stash_previous`]: the displaced value enters the
+    /// history *and* the incoming value leaves it. A credential that is current
+    /// is not "previous", so offering it in `yah keys recover` would be a
+    /// restore that does nothing while occupying one of the few retention
+    /// slots. It matters on more paths than it looks: A -> B -> A, a
+    /// `restore_previous` (which is exactly that), and a promotion of a staged
+    /// value a lease expiry had already demoted.
+    fn stash_superseded(&self, slot: &str, incoming: &str, current: Option<&str>) {
+        if current == Some(incoming) {
+            return;
+        }
+        if let Err(e) = self.retain_superseded(slot, incoming, current) {
+            eprintln!("warning: could not retain the superseded value for {slot}: {e:#}");
+        }
+    }
+
+    /// [`Self::stash_superseded`]'s fallible half, as one read-modify-write so
+    /// the push and the forget cannot land separately.
+    fn retain_superseded(&self, slot: &str, incoming: &str, current: Option<&str>) -> Result<()> {
+        let mut store = self.read_adjacent()?;
+        let mut changed = false;
+        {
+            let record = store.entry(slot);
+            if let Some(old) = current {
+                record.push_previous(adjacent::AdjacentValue {
+                    value: old.to_string(),
+                    lease_id: mint_lease_id(),
+                    written_at: Utc::now(),
+                    expires_at: None,
+                });
+                changed = true;
+            }
+            changed |= record.forget_previous(incoming);
+        }
+        store.compact();
+        if changed {
+            self.write_adjacent(&store)?;
+        }
+        Ok(())
     }
 
     pub fn get(&self, provider: &str) -> Result<Option<String>> {
@@ -420,6 +553,274 @@ impl KeysStore {
         }
         Ok(removed)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Slot-adjacent store (W337 §6, R856-F9)
+// ---------------------------------------------------------------------------
+
+/// Default overlap lease. A rotation is an operator action with a manual tail —
+/// stage, probe, redeploy consumers, confirm, only then revoke at the provider —
+/// so the horizon is a working day rather than `vault.lease`'s minutes.
+pub const OVERLAP_DEFAULT_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Ceiling on an overlap lease. Past this, a "rotation in flight" is really an
+/// abandoned one, and a second live credential nobody is tracking is the state
+/// this whole design exists to avoid leaving behind.
+pub const OVERLAP_MAX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+impl KeysStore {
+    /// Path of the slot-adjacent sidecar. Encrypted under the same machine key
+    /// as `credentials.enc` and at the same 0600, because unlike the *health*
+    /// sidecar its contents are credential material.
+    pub fn adjacent_path(&self) -> PathBuf {
+        self.dir.join(ADJACENT_FILE)
+    }
+
+    /// Read the slot-adjacent sidecar. A missing file is an empty store; a
+    /// malformed decrypted body is too (see [`adjacent::parse_adjacent`]). A
+    /// *decrypt* failure propagates — that is the same real signal
+    /// [`Self::get`] would raise, and swallowing it would hide a broken vault.
+    pub fn read_adjacent(&self) -> Result<adjacent::AdjacentStore> {
+        match self.read_encrypted(&self.adjacent_path(), "slot-adjacent")? {
+            Some(plaintext) => Ok(adjacent::parse_adjacent(&plaintext)),
+            None => Ok(adjacent::AdjacentStore::default()),
+        }
+    }
+
+    /// Replace the slot-adjacent sidecar. Deletes the file outright once the
+    /// store is empty, so a completed rotation leaves nothing behind.
+    pub fn write_adjacent(&self, store: &adjacent::AdjacentStore) -> Result<()> {
+        if store.slots.is_empty() && self.adjacent_path().exists() {
+            fs::remove_file(self.adjacent_path())
+                .with_context(|| format!("removing {}", self.adjacent_path().display()))?;
+            return Ok(());
+        }
+        if store.slots.is_empty() {
+            return Ok(());
+        }
+        if !self.machine_key_path().exists() {
+            self.init(false)?;
+        }
+        let plaintext = adjacent::render_adjacent(store).context("serialize slot-adjacent store")?;
+        self.write_encrypted(&self.adjacent_path(), &plaintext)
+    }
+
+    /// Stage an incoming value next to `slot` under a lease of `ttl_secs`,
+    /// clamped to [`OVERLAP_MAX_TTL_SECS`]. Returns the lease id.
+    ///
+    /// Writes nothing to the slot itself, which is the entire point: staging is
+    /// the step that *cannot* clobber a live credential. A value already staged
+    /// is superseded and demoted to `previous` rather than dropped.
+    ///
+    /// This is the general primitive. Whether a given slot is *allowed* to use
+    /// the overlap path is a registry question ([`CredentialSpec::permits_overlap`])
+    /// enforced by the CLI, not here — R856-T11 will reuse this same store for
+    /// clobber recovery on slots that can never overlap.
+    pub fn stage_overlap(&self, slot: &str, value: &str, ttl_secs: u64) -> Result<String> {
+        validate_provider(slot)?;
+        let now = Utc::now();
+        let ttl = ttl_secs.clamp(1, OVERLAP_MAX_TTL_SECS);
+        let lease_id = mint_lease_id();
+        let mut store = self.read_adjacent()?;
+        store.prune(now);
+        let record = store.entry(slot);
+        if let Some(superseded) = record.next.take() {
+            record.push_previous(adjacent::AdjacentValue {
+                expires_at: None,
+                ..superseded
+            });
+        }
+        record.next = Some(adjacent::AdjacentValue {
+            value: value.to_string(),
+            lease_id: lease_id.clone(),
+            written_at: now,
+            expires_at: Some(now + chrono::Duration::seconds(ttl as i64)),
+        });
+        self.write_adjacent(&store)?;
+        Ok(lease_id)
+    }
+
+    /// The live staged value for `slot`, or `None` when nothing is staged or
+    /// the lease has run out.
+    pub fn overlap(&self, slot: &str) -> Result<Option<adjacent::AdjacentValue>> {
+        self.overlap_at(slot, Utc::now())
+    }
+
+    /// [`Self::overlap`] against an explicit clock.
+    pub fn overlap_at(
+        &self,
+        slot: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<adjacent::AdjacentValue>> {
+        validate_provider(slot)?;
+        Ok(self
+            .read_adjacent()?
+            .get(slot)
+            .and_then(|r| r.next.clone())
+            .filter(|v| v.is_live(now)))
+    }
+
+    /// Values a consumer should try for `slot`, **current first**, then any
+    /// live overlap value (W337 §6). Deduplicated, so a slot whose staged value
+    /// has already been promoted yields one candidate rather than two.
+    ///
+    /// The overlap half is strictly additive: if the sidecar cannot be read at
+    /// all, this still returns the current value rather than failing. A staging
+    /// area must never be able to break credential resolution.
+    pub fn candidates(&self, slot: &str) -> Result<Vec<String>> {
+        self.candidates_at(slot, Utc::now())
+    }
+
+    /// [`Self::candidates`] against an explicit clock.
+    pub fn candidates_at(&self, slot: &str, now: DateTime<Utc>) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        if let Some(current) = self.get(slot)? {
+            out.push(current);
+        }
+        if let Ok(Some(staged)) = self.overlap_at(slot, now) {
+            if !out.contains(&staged.value) {
+                out.push(staged.value);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Promote the staged value into the slot: the old slot value moves to
+    /// `previous`, the staged value becomes current, the lease is cleared.
+    /// `Ok(false)` when nothing live is staged.
+    ///
+    /// **Order is deliberate.** The vault write lands *first*, then the sidecar
+    /// update. A crash between them leaves the new value both promoted and
+    /// still staged, which a second `promote` resolves idempotently; the
+    /// reverse order would drop the staged value on the floor with nothing
+    /// holding it.
+    ///
+    /// The displaced credential is retained by [`Self::set`] under the one
+    /// stash rule (R856-T11), not by a second rule here: a promotion *is* an
+    /// overwrite, and giving it its own retention logic is how two rules drift
+    /// apart. Because the vault write happens before the sidecar is rewritten,
+    /// the entry `set` pushed has to be carried across — hence the re-read.
+    pub fn promote_overlap(&self, slot: &str) -> Result<bool> {
+        self.promote_overlap_at(slot, Utc::now())
+    }
+
+    /// [`Self::promote_overlap`] against an explicit clock.
+    pub fn promote_overlap_at(&self, slot: &str, now: DateTime<Utc>) -> Result<bool> {
+        validate_provider(slot)?;
+        let mut store = self.read_adjacent()?;
+        store.prune(now);
+        let Some(staged) = store.get(slot).and_then(|r| r.next.clone()) else {
+            self.write_adjacent(&store)?;
+            return Ok(false);
+        };
+
+        // Writes the vault and stashes the credential this promotion displaces.
+        self.set(slot, &staged.value)
+            .with_context(|| format!("promoting the staged value into {slot}"))?;
+
+        /* Re-read rather than mutating the copy taken above: `set` just wrote
+        the stash into this same file, and writing the stale copy back would
+        erase the retention that is the entire point of routing through it.
+        `push_previous` dedupes by value, so the staged value cannot end up in
+        `previous` twice even if a lease-expiry demote already put it there. */
+        let mut store = self.read_adjacent()?;
+        store.prune(now);
+        let record = store.entry(slot);
+        record.next = None;
+        store.compact();
+        self.write_adjacent(&store)?;
+        Ok(true)
+    }
+
+    /// Abandon an in-flight overlap. The staged value is demoted to `previous`
+    /// rather than destroyed — see [`adjacent::AdjacentStore::prune`] for why.
+    /// `Ok(false)` when nothing was staged.
+    pub fn discard_overlap(&self, slot: &str) -> Result<bool> {
+        validate_provider(slot)?;
+        let mut store = self.read_adjacent()?;
+        let record = store.entry(slot);
+        let Some(staged) = record.next.take() else {
+            store.compact();
+            self.write_adjacent(&store)?;
+            return Ok(false);
+        };
+        record.push_previous(adjacent::AdjacentValue {
+            expires_at: None,
+            ..staged
+        });
+        self.write_adjacent(&store)?;
+        Ok(true)
+    }
+
+    /// Retain a superseded value for `slot`, newest first, bounded by
+    /// [`adjacent::MAX_PREVIOUS`].
+    ///
+    /// The primitive R856-T11's clobber recovery needs. Nothing calls it from
+    /// [`Self::set`] today — turning a plain overwrite into a stashing one is
+    /// that ticket's decision to make, not this one's.
+    pub fn stash_previous(&self, slot: &str, value: &str) -> Result<()> {
+        validate_provider(slot)?;
+        let mut store = self.read_adjacent()?;
+        store.entry(slot).push_previous(adjacent::AdjacentValue {
+            value: value.to_string(),
+            lease_id: mint_lease_id(),
+            written_at: Utc::now(),
+            expires_at: None,
+        });
+        self.write_adjacent(&store)
+    }
+
+    /// Superseded values retained for `slot`, newest first.
+    pub fn previous(&self, slot: &str) -> Result<Vec<adjacent::AdjacentValue>> {
+        validate_provider(slot)?;
+        Ok(self
+            .read_adjacent()?
+            .get(slot)
+            .map(|r| r.previous.clone())
+            .unwrap_or_default())
+    }
+
+    /// Put a retained value back into `slot` (R856-T11). `index` is into
+    /// [`Self::previous`], newest first, as `yah keys recover` prints it.
+    ///
+    /// Reversible by construction, and with no retention logic of its own: the
+    /// restore goes through [`Self::set`], whose one rule already both retains
+    /// the credential it displaces and drops the restored entry from the
+    /// history (it is no longer *previous* — it is current). Running `recover`
+    /// twice returns the slot to where it started rather than filling the ring
+    /// with copies of two values.
+    ///
+    /// Returns the restored value's masked form, never the value: this is the
+    /// one operation that moves a secret and it does so without handing it
+    /// back to the caller to print.
+    pub fn restore_previous(&self, slot: &str, index: usize) -> Result<String> {
+        validate_provider(slot)?;
+        let retained = self.previous(slot)?;
+        let entry = retained.get(index).ok_or_else(|| {
+            anyhow!(
+                "{slot} has {} retained value{} — there is no #{index}",
+                retained.len(),
+                if retained.len() == 1 { "" } else { "s" }
+            )
+        })?;
+
+        self.set(slot, &entry.value)
+            .with_context(|| format!("restoring a retained value into {slot}"))?;
+        Ok(entry.masked())
+    }
+}
+
+/// `overlap-<hex>` — the same shape `vault.lease` mints, minus the agent-tools
+/// request-id plumbing this crate has no business depending on.
+fn mint_lease_id() -> String {
+    let mut bytes = [0u8; 6];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut out = String::from("overlap-");
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// Read `slot` from the canonical vault, falling back to `env_var`. Lenient
@@ -493,6 +894,13 @@ impl KeysStore {
     /// Write an imported slot map into this vault.
     ///
     /// Returns the number of slots actually written.
+    ///
+    /// R856-T11: this is the *second* overwrite path, and it does not route
+    /// through [`Self::set`] — it writes the whole map in one pass so a partial
+    /// import cannot leave the vault half-merged. It therefore calls
+    /// [`Self::stash_superseded`] itself rather than reimplementing the rule,
+    /// so `yah keys import --strategy merge` over a live slot is as recoverable
+    /// as `yah keys set` is. `Skip` never overwrites, so it never stashes.
     pub fn import_map(
         &self,
         incoming: &Map<String, Value>,
@@ -501,15 +909,23 @@ impl KeysStore {
         if !self.machine_key_path().exists() {
             self.init(false)?;
         }
+        let existing = self.read_creds()?;
         let mut creds = match strategy {
             MergeStrategy::Replace => Map::new(),
-            _ => self.read_creds()?,
+            _ => existing.clone(),
         };
         let mut count = 0usize;
         for (k, v) in incoming {
             validate_provider(k)?;
             match strategy {
                 MergeStrategy::Merge | MergeStrategy::Replace => {
+                    if let Some(new) = v.as_str() {
+                        self.stash_superseded(
+                            k,
+                            new,
+                            existing.get(k).and_then(|old| old.as_str()),
+                        );
+                    }
                     creds.insert(k.clone(), v.clone());
                     count += 1;
                 }
@@ -1139,5 +1555,362 @@ mod tests {
         let s = KeysStore::at(tmp.path()).unwrap();
         fs::write(s.health_path(), b"{ this is not json").unwrap();
         assert_eq!(s.read_health(), spec::HealthSidecar::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // Slot-adjacent store (R856-F9)
+    // -----------------------------------------------------------------------
+
+    /// R856-F9's third acceptance criterion, and the reason the overlap value
+    /// is not a `<slot>.next` vault entry: the slot namespace `yah keys list`
+    /// prints — the authority the credential registry is diffed against — must
+    /// not move at all.
+    #[test]
+    fn staging_an_overlap_leaves_keys_list_byte_identical() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_in(tmp.path());
+        s.set("github-pat", "the-live-one").unwrap();
+        s.set("npm-api-token", "npm_live").unwrap();
+        let before = s.list().unwrap();
+
+        s.stage_overlap("github-pat", "the-incoming-one", OVERLAP_DEFAULT_TTL_SECS)
+            .unwrap();
+
+        assert_eq!(s.list().unwrap(), before, "the slot namespace moved");
+        assert_eq!(
+            s.get("github-pat").unwrap().as_deref(),
+            Some("the-live-one"),
+            "staging must never touch the live value"
+        );
+        assert!(
+            s.adjacent_path().exists(),
+            "the staged value has to be somewhere"
+        );
+    }
+
+    /// The lifecycle the ticket asks for, at the store layer: a consumer
+    /// resolving through `candidates` reads a usable value at every step, and
+    /// the window where the only live credential is unverified never opens.
+    #[test]
+    fn a_consumer_reads_successfully_at_every_step_of_the_cycle() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_in(tmp.path());
+        s.set("cloudflare-api-token", "old").unwrap();
+
+        // 1. minted, nothing staged yet.
+        assert_eq!(s.candidates("cloudflare-api-token").unwrap(), vec!["old"]);
+
+        // 2. staged. Both are live at the provider; current still answers first.
+        s.stage_overlap("cloudflare-api-token", "new", OVERLAP_DEFAULT_TTL_SECS)
+            .unwrap();
+        assert_eq!(
+            s.candidates("cloudflare-api-token").unwrap(),
+            vec!["old", "new"]
+        );
+
+        // 3. promoted.
+        assert!(s.promote_overlap("cloudflare-api-token").unwrap());
+        assert_eq!(
+            s.get("cloudflare-api-token").unwrap().as_deref(),
+            Some("new")
+        );
+        assert_eq!(s.candidates("cloudflare-api-token").unwrap(), vec!["new"]);
+
+        // 4. the superseded value is recoverable until the operator has
+        //    revoked it at the provider.
+        let previous = s.previous("cloudflare-api-token").unwrap();
+        assert_eq!(previous.len(), 1);
+        assert_eq!(previous[0].value, "old");
+    }
+
+    #[test]
+    fn an_expired_lease_stops_being_a_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_in(tmp.path());
+        s.set("github-pat", "live").unwrap();
+        s.stage_overlap("github-pat", "staged", 1).unwrap();
+
+        let later = Utc::now() + chrono::Duration::seconds(120);
+        assert_eq!(s.candidates_at("github-pat", later).unwrap(), vec!["live"]);
+        assert!(s.overlap_at("github-pat", later).unwrap().is_none());
+        // Promoting an expired lease is a no-op, not a silent clobber.
+        assert!(!s.promote_overlap_at("github-pat", later).unwrap());
+        assert_eq!(s.get("github-pat").unwrap().as_deref(), Some("live"));
+    }
+
+    #[test]
+    fn the_adjacent_sidecar_is_encrypted_and_0600() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_in(tmp.path());
+        s.set("github-pat", "live").unwrap();
+        s.stage_overlap("github-pat", "SUPER-SECRET-VALUE", 600)
+            .unwrap();
+
+        let raw = fs::read(s.adjacent_path()).unwrap();
+        assert!(
+            !raw.windows(18).any(|w| w == b"SUPER-SECRET-VALUE"),
+            "the staged credential is sitting in plaintext on disk"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(s.adjacent_path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    /// Aborting is not deletion. The staged value may be send-once, so it is
+    /// demoted into the recovery history and the file only disappears once
+    /// there is genuinely nothing left.
+    #[test]
+    fn discarding_an_overlap_retains_the_value_and_eventually_removes_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_in(tmp.path());
+        s.set("github-pat", "live").unwrap();
+        s.stage_overlap("github-pat", "abandoned", 600).unwrap();
+
+        assert!(s.discard_overlap("github-pat").unwrap());
+        assert!(s.overlap("github-pat").unwrap().is_none());
+        assert_eq!(s.previous("github-pat").unwrap()[0].value, "abandoned");
+        assert_eq!(s.candidates("github-pat").unwrap(), vec!["live"]);
+
+        assert!(!s.discard_overlap("github-pat").unwrap());
+
+        // Clearing the history clears the file.
+        let mut adj = s.read_adjacent().unwrap();
+        adj.slots.clear();
+        s.write_adjacent(&adj).unwrap();
+        assert!(!s.adjacent_path().exists());
+    }
+
+    /// R856-F9 left this test asserting that `set` did *not* stash, because the
+    /// decision was T11's to make. T11 made it: every genuine overwrite is now
+    /// retained, so the same test pins the same decision, inverted.
+    #[test]
+    fn stash_previous_is_wired_into_set_and_stays_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_in(tmp.path());
+        s.set("github-pat", "one").unwrap();
+        assert!(
+            s.previous("github-pat").unwrap().is_empty(),
+            "a first write displaces nothing, so it must retain nothing"
+        );
+
+        s.set("github-pat", "two").unwrap();
+        assert_eq!(
+            s.previous("github-pat")
+                .unwrap()
+                .iter()
+                .map(|v| v.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one"],
+            "an overwrite must retain what it displaced — this is the whole ticket"
+        );
+
+        for v in ["a", "b", "c", "d", "e"] {
+            s.stash_previous("github-pat", v).unwrap();
+        }
+        let previous = s.previous("github-pat").unwrap();
+        assert_eq!(previous.len(), adjacent::MAX_PREVIOUS);
+        assert_eq!(previous[0].value, "e");
+    }
+
+    /// R856-T11's acceptance criterion. The recovery history is a sidecar, not
+    /// a `<slot>.prev` entry, so the slot namespace `yah keys list` prints —
+    /// the authority the R856-F1 registry diff is taken against — cannot move.
+    #[test]
+    fn keys_list_is_byte_identical_across_an_overwrite_that_stashes() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_in(tmp.path());
+        s.set("github-pat", "first").unwrap();
+        s.set("npm-api-token", "npm_first").unwrap();
+        let before = s.list().unwrap();
+
+        s.set("github-pat", "second").unwrap();
+        s.set("npm-api-token", "npm_second").unwrap();
+        s.set("github-pat", "third").unwrap();
+
+        assert_eq!(s.list().unwrap(), before, "the slot namespace moved");
+        assert!(
+            before.iter().all(|slot| !slot.contains(".prev")),
+            "the retained values leaked into the slot namespace"
+        );
+        // …and the history is really there, so this is not passing by doing
+        // nothing at all.
+        assert_eq!(s.previous("github-pat").unwrap().len(), 2);
+    }
+
+    /// A no-op rewrite must not consume a slot in a bounded ring — otherwise
+    /// re-saving the same value from a Settings panel three times silently
+    /// evicts the one credential somebody needed back.
+    #[test]
+    fn re_setting_the_same_value_retains_nothing_and_evicts_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_in(tmp.path());
+        s.set("github-pat", "old").unwrap();
+        s.set("github-pat", "new").unwrap();
+
+        for _ in 0..5 {
+            s.set("github-pat", "new").unwrap();
+        }
+
+        let previous = s.previous("github-pat").unwrap();
+        assert_eq!(previous.len(), 1, "a no-op rewrite churned the history");
+        assert_eq!(previous[0].value, "old");
+    }
+
+    /// A -> B -> A must leave one entry per distinct value. The ring is three
+    /// deep, so a duplicate does not merely look untidy: it evicts the oldest
+    /// value, which may be the only copy of something left.
+    #[test]
+    fn a_value_that_comes_back_occupies_one_entry_not_two() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_in(tmp.path());
+        s.set("github-pat", "a").unwrap();
+        s.set("github-pat", "b").unwrap();
+        s.set("github-pat", "a").unwrap();
+
+        let previous = s.previous("github-pat").unwrap();
+        assert_eq!(
+            previous.iter().map(|v| v.value.as_str()).collect::<Vec<_>>(),
+            vec!["b"],
+            "'a' is current, so it is not history; 'b' is the only displaced value"
+        );
+    }
+
+    /// Restoring is reversible: it goes through `set`, so it retains what it
+    /// displaces, and the restored value stops being history because it is
+    /// current again.
+    #[test]
+    fn restoring_is_reversible_and_does_not_leave_the_value_in_two_places() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_in(tmp.path());
+        s.set("github-pat", "the-good-one").unwrap();
+        s.set("github-pat", "the-clobber").unwrap();
+
+        let masked = s.restore_previous("github-pat", 0).unwrap();
+        assert!(
+            !masked.contains("the-good-one"),
+            "restore handed back the secret it was asked to move: {masked}"
+        );
+        assert_eq!(
+            s.get("github-pat").unwrap().as_deref(),
+            Some("the-good-one")
+        );
+        assert_eq!(
+            s.previous("github-pat")
+                .unwrap()
+                .iter()
+                .map(|v| v.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["the-clobber"],
+            "the restored value must leave the history, and the clobber must enter it"
+        );
+
+        // And back again.
+        s.restore_previous("github-pat", 0).unwrap();
+        assert_eq!(s.get("github-pat").unwrap().as_deref(), Some("the-clobber"));
+    }
+
+    #[test]
+    fn restoring_an_index_that_is_not_there_fails_without_touching_the_slot() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_in(tmp.path());
+        s.set("github-pat", "live").unwrap();
+        let err = s.restore_previous("github-pat", 0).unwrap_err().to_string();
+        assert!(err.contains("0 retained values"), "{err}");
+        assert_eq!(s.get("github-pat").unwrap().as_deref(), Some("live"));
+    }
+
+    /// `yah keys import --strategy merge` is the *other* overwrite path and it
+    /// does not route through `set`, so it wires the same rule itself.
+    #[test]
+    fn an_import_that_overwrites_a_live_slot_is_as_recoverable_as_a_set() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_in(tmp.path());
+        s.set("github-pat", "the-live-one").unwrap();
+        s.set("npm-api-token", "npm_untouched").unwrap();
+
+        let mut incoming = Map::new();
+        incoming.insert("github-pat".into(), Value::String("from-the-file".into()));
+        s.import_map(&incoming, MergeStrategy::Merge).unwrap();
+
+        assert_eq!(
+            s.previous("github-pat").unwrap()[0].value,
+            "the-live-one",
+            "an import clobbered a live credential with no way back"
+        );
+        assert!(
+            s.previous("npm-api-token").unwrap().is_empty(),
+            "a slot the import did not touch must retain nothing"
+        );
+
+        // Skip never overwrites, so it never retains.
+        let mut second = Map::new();
+        second.insert("npm-api-token".into(), Value::String("ignored".into()));
+        s.import_map(&second, MergeStrategy::Skip).unwrap();
+        assert!(s.previous("npm-api-token").unwrap().is_empty());
+        assert_eq!(
+            s.get("npm-api-token").unwrap().as_deref(),
+            Some("npm_untouched")
+        );
+    }
+
+    /// A masked rendering is for printing; it must not be a credential.
+    #[test]
+    fn a_masked_value_shows_a_join_prefix_and_never_the_rest() {
+        let v = adjacent::AdjacentValue {
+            value: "npm_B0Q8xxxxxxxxxxxxxxxxxxxxxxxxxxxxFF7x".into(),
+            lease_id: "overlap-test".into(),
+            written_at: Utc::now(),
+            expires_at: None,
+        };
+        let masked = v.masked();
+        assert!(masked.starts_with("npm_B0Q8"), "{masked}");
+        assert!(!masked.contains("FF7x"), "the suffix is more secret, not less");
+        assert!(
+            masked.contains(&format!("{} chars", v.value.chars().count())),
+            "{masked}"
+        );
+
+        // Too short to mask meaningfully: show nothing at all, and not the
+        // length either — for a secret this short the count is the disclosure.
+        let short = adjacent::AdjacentValue {
+            value: "abc123".into(),
+            ..v.clone()
+        };
+        assert_eq!(short.masked(), "<hidden, under 16 chars>");
+    }
+
+    /// The eight-character join prefix is a ceiling, not a width. npm justifies
+    /// eight characters of a 40-character token; nothing justifies eight of a
+    /// twelve-character one, so the prefix is bounded by a fraction of the
+    /// value and falls away entirely once there is no join value left in it.
+    #[test]
+    fn a_masked_value_never_shows_more_than_a_quarter_of_itself() {
+        let at = |value: &str| adjacent::AdjacentValue {
+            value: value.into(),
+            lease_id: "mask-ratio".into(),
+            written_at: Utc::now(),
+            expires_at: None,
+        };
+
+        // The old floor was 12, which showed 8 of 12 characters plus the count.
+        assert_eq!(at("abcdefghijkl").masked(), "<hidden, under 16 chars>");
+        assert_eq!(at("abcdefghijklmno").masked(), "<hidden, under 16 chars>");
+
+        // At the bound the prefix reappears, still a quarter of the value.
+        assert_eq!(at("abcdefghijklmnop").masked(), "abcd... (16 chars)");
+        assert_eq!(
+            at(&"x".repeat(28)).masked(),
+            format!("{}... (28 chars)", "x".repeat(7))
+        );
+
+        // And it stops growing at the npm join width no matter how long the
+        // value gets, so a 400-character value discloses no more than a 40.
+        for len in [32usize, 40, 64, 400] {
+            let m = at(&"y".repeat(len)).masked();
+            assert_eq!(m, format!("{}... ({len} chars)", "y".repeat(8)), "{m}");
+        }
     }
 }

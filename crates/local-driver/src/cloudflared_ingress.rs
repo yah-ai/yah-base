@@ -187,6 +187,7 @@ impl CloudflaredIngressSpec {
                 ephemeral_storage_mb: 128,
             },
             depends_on: vec![],
+            requires: vec![],
             healthcheck: Some(Healthcheck {
                 probe: HealthProbe::HttpGet {
                     path: READY_PATH.into(),
