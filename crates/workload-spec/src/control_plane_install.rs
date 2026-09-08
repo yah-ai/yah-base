@@ -183,10 +183,70 @@ mod tests {
             "passway.service",
             "passway-test.service",
             "passway-demux.service",
+            "passway-http-router.service",
         ] {
             assert!(
                 !exec.contains(unit),
                 "a roll must not name {unit} — see R870-T3 for the graceful path"
+            );
+        }
+    }
+
+    #[test]
+    fn the_http_router_rides_its_own_conditional_not_the_passway_pairs() {
+        // R870-F1: the :80 tier joined at 0.8.34, one release AFTER the passway
+        // pair. Gating it on HAS_PASSWAY would make this script fail against
+        // every 0.8.33 tarball — which is exactly the rollback path the
+        // conditional shape exists to keep working.
+        let s = build_install_script("0.8.34", "u", "d", true);
+        assert!(
+            s.contains(r#"if [ -e "$D/passway-http-router" ]; then"#),
+            "the :80 tier must be gated on its own tarball member"
+        );
+        assert!(
+            s.contains(
+                r#"assert_installed_bytes "$D/passway-http-router" /usr/local/bin/passway-http-router"#
+            ),
+            "installed http-router bytes must be content-asserted like the pair"
+        );
+        assert!(
+            s.contains("anchor /usr/local/bin/passway-http-router"),
+            "there must be a way back from a :80 roll"
+        );
+    }
+
+    #[test]
+    fn the_graceful_upgrade_helper_rides_the_roll_but_its_dropin_does_not() {
+        // R870-T3. The helper is the ExecReload= that makes a cert rotation a
+        // process swap: fleet-wide, no node state, so it installs like a binary
+        // and gets the same rollback anchor and content assertion.
+        let s = build_install_script("0.8.34", "u", "d", true);
+        assert!(
+            s.contains(r#"if [ -e "$D/passway-graceful-upgrade" ]; then"#),
+            "the helper must be gated on its own tarball member, like the :80 tier"
+        );
+        assert!(
+            s.contains(
+                r#"assert_installed_bytes "$D/passway-graceful-upgrade" /usr/local/bin/passway-graceful-upgrade"#
+            ),
+            "installed helper bytes must be content-asserted"
+        );
+        assert!(
+            s.contains("anchor /usr/local/bin/passway-graceful-upgrade"),
+            "there must be a way back from a helper roll"
+        );
+        // The DROP-IN that arms it is node state: it lands in
+        // /etc/systemd/system/<unit>.service.d/ and the unit name differs per
+        // door. Naming it in an `echo` is how an operator learns the reload verb
+        // exists; writing it would put a roll in the business of rewriting a
+        // live door's unit configuration.
+        for line in executable_lines(&s)
+            .lines()
+            .filter(|l| l.contains("passway-graceful-upgrade.conf"))
+        {
+            assert!(
+                line.trim_start().starts_with("echo "),
+                "the script may print the drop-in's name, never install it: {line}"
             );
         }
     }

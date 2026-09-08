@@ -69,6 +69,8 @@ anchor /usr/local/bin/kamaji
 anchor /usr/local/bin/yah-scryer
 anchor /usr/local/bin/passway
 anchor /usr/local/bin/passway-demux
+anchor /usr/local/bin/passway-http-router
+anchor /usr/local/bin/passway-graceful-upgrade
 anchor /etc/systemd/system/yubaba.slice
 anchor /etc/systemd/system/kamaji.service
 anchor /etc/systemd/system/yubaba.service
@@ -120,6 +122,30 @@ if [ -e "$D/passway" ]; then
   install_atomic "$D/passway"       0755 /usr/local/bin/passway
   install_atomic "$D/passway-demux" 0755 /usr/local/bin/passway-demux
 fi
+# passway-http-router — the :80 tier (R870-F1) — joined at 0.8.34, one release
+# AFTER the passway pair, so it gets its OWN conditional rather than riding
+# HAS_PASSWAY. Rolling a 0.8.33 tarball with this script must still succeed, and
+# it would not if a missing member were assumed present because a sibling was.
+HAS_HTTP_ROUTER=0
+if [ -e "$D/passway-http-router" ]; then
+  HAS_HTTP_ROUTER=1
+  install_atomic "$D/passway-http-router" 0755 /usr/local/bin/passway-http-router
+fi
+# passway-graceful-upgrade (R870-T3) — the ExecReload= that turns a cert
+# rotation into a process swap instead of a connection-dropping restart. A
+# SCRIPT, so its own conditional again rather than riding a sibling's.
+#
+# The script is fleet-wide and carries no node state, which is why it rides the
+# roll. The DROP-IN that arms it
+# (app/yah/cli/resources/passway-graceful-upgrade.conf) deliberately does NOT:
+# it lands in /etc/systemd/system/<unit>.service.d/, the per-node unit name
+# differs between doors, and this script must never touch a door's unit
+# configuration — the same rule that keeps passway.service out of the tarball.
+HAS_UPGRADE_HELPER=0
+if [ -e "$D/passway-graceful-upgrade" ]; then
+  HAS_UPGRADE_HELPER=1
+  install_atomic "$D/passway-graceful-upgrade" 0755 /usr/local/bin/passway-graceful-upgrade
+fi
 
 echo "== assert by CONTENT, not by version string =="
 # `--version` prints the workspace version baked in at build time, which says
@@ -148,6 +174,12 @@ if [ "$HAS_PASSWAY" = 1 ]; then
   assert_installed_bytes "$D/passway"       /usr/local/bin/passway
   assert_installed_bytes "$D/passway-demux" /usr/local/bin/passway-demux
 fi
+if [ "$HAS_HTTP_ROUTER" = 1 ]; then
+  assert_installed_bytes "$D/passway-http-router" /usr/local/bin/passway-http-router
+fi
+if [ "$HAS_UPGRADE_HELPER" = 1 ]; then
+  assert_installed_bytes "$D/passway-graceful-upgrade" /usr/local/bin/passway-graceful-upgrade
+fi
 
 echo "== restart supervision tree (kamaji then yubaba, W154 order) =="
 $SUDO systemctl daemon-reload
@@ -162,7 +194,20 @@ if [ "$HAS_SCRYER" = 1 ]; then
 fi
 if [ "$HAS_PASSWAY" = 1 ]; then
   echo "  passway + passway-demux bytes are STAGED, not live — this roll deliberately"
-  echo "  does not restart the front door (see the install block above). Restart the"
-  echo "  node's own passway unit when a :443 blip is acceptable."
+  echo "  does not restart the front door (see the install block above)."
+  if [ "$HAS_UPGRADE_HELPER" = 1 ]; then
+    echo "  To activate WITHOUT a blip, on a door carrying"
+    echo "  /etc/systemd/system/<unit>.service.d/passway-graceful-upgrade.conf:"
+    echo "    systemctl reload <unit>     # R870-T3: process swap, listeners handed over"
+    echo "  Without that drop-in the only verb is \`systemctl restart\`, which drops"
+    echo "  every in-flight connection on :443."
+  else
+    echo "  Restart the node's own passway unit when a :443 blip is acceptable."
+  fi
+fi
+if [ "$HAS_HTTP_ROUTER" = 1 ]; then
+  echo "  passway-http-router bytes are STAGED, not live, for the same reason — and"
+  echo "  a :80 restart is the cheap one: it terminates nothing, holds no cert, and"
+  echo "  the traffic it drops is redirects a client immediately retries."
 fi
 echo "installed target=$VER yubaba=$(/usr/local/bin/yubaba --version 2>/dev/null) kamaji=$(/usr/local/bin/kamaji --version 2>/dev/null)"
