@@ -292,6 +292,103 @@ pub fn assemble_self_bundle_with(
     Ok(manifest)
 }
 
+/// Assemble a bundle from ALREADY-COLLECTED content files — the multi-component
+/// counterpart to [`assemble_self_bundle_with`]/[`assemble_vanilla_bundle`],
+/// which each collect `files` themselves from a single `(project_root,
+/// out_dir)` pair. R870-B11: a service with several mounted components merges
+/// each component's [`collect_component_files`] output into one `files` list
+/// before calling this, so the whole service becomes ONE bundle instead of one
+/// per component — the defect this exists to fix (two components silently
+/// overwriting the same deployed workload, one bundle at a time).
+///
+/// Picks vanilla vs self-contained the same way the single-component path
+/// does: no `serve_bins` names the stock `mesofact/<runtime_version>` runtime;
+/// any `serve_bins` makes it self-contained (`runtime = "self"`).
+pub fn assemble_bundle_from_files(
+    dest: &Path,
+    name: &str,
+    runtime_version: &str,
+    mut files: Vec<BundleFile>,
+    serve_bins: &[(String, ServeBinSource)],
+    sidecar_bins: &[(String, String, PathBuf)],
+    built_against: Option<String>,
+) -> Result<BundleManifest, BundleError> {
+    if serve_bins.is_empty() {
+        files.sort();
+        return assemble_bundle(
+            dest,
+            name,
+            BundleRuntime::Mesofact {
+                version: runtime_version.to_string(),
+            },
+            &files,
+        );
+    }
+
+    let mut pinned: Vec<(String, BundleHash)> = Vec::new();
+    for (triple, source) in serve_bins {
+        let bundle_path = format!("bins/{triple}/serve");
+        match source {
+            ServeBinSource::Local(bin) => files.push((bundle_path, bin.clone())),
+            ServeBinSource::Pinned(hash) => pinned.push((bundle_path, hash.clone())),
+        }
+    }
+    for (bin_name, triple, bin) in sidecar_bins {
+        if bin_name == "serve" {
+            return Err(BundleError::Io(format!(
+                "sidecar bin for {triple} is named \"serve\", which is the runtime's own \
+                 binary — pick a distinct name"
+            )));
+        }
+        files.push((format!("bins/{triple}/{bin_name}"), bin.clone()));
+    }
+    files.sort();
+    let mut manifest = assemble_bundle(
+        dest,
+        name,
+        BundleRuntime::SelfContained { built_against },
+        &files,
+    )?;
+    if !pinned.is_empty() {
+        for (path, hash) in pinned {
+            manifest.content.insert(path, hash);
+        }
+        // assemble_bundle already wrote manifest.toml without the pinned
+        // entries (they never went through its file loop) — rewrite it now
+        // that content carries them, since the manifest object on disk must
+        // match what publish_bundle reads.
+        let toml = manifest.to_toml_string()?;
+        fs::write(dest.join("manifest.toml"), toml)
+            .map_err(|e| io(format!("writing {}", dest.join("manifest.toml").display()), e))?;
+    }
+    Ok(manifest)
+}
+
+/// Collect the files for a single component's bundle entry, with an optional
+/// mount prefix for the `dist/` tree.
+///
+/// `mount` is the normalized mount path (e.g., `"app"` for `/app`). When
+/// `include_config` is true, `mesofact.routes.ts`, `mesofact.config.toml`, and
+/// declared `data_inputs` are included — this should be true for the primary
+/// component and false for mounted components in a service bundle (R870-B11).
+pub fn collect_component_files(
+    project_root: &Path,
+    out_dir: &Path,
+    mount: Option<&str>,
+    include_config: bool,
+) -> Result<Vec<BundleFile>, BundleError> {
+    let dist_prefix = match mount {
+        Some(m) if !m.is_empty() => format!("app/dist/{m}"),
+        _ => "app/dist".to_string(),
+    };
+    let mut files = collect_dir(&dist_prefix, out_dir)?;
+    if include_config {
+        stage_app_config(project_root, &mut files);
+        stage_data_inputs(project_root, out_dir, &mut files)?;
+    }
+    Ok(files)
+}
+
 /// Stage the project-root config files a served bundle carries alongside its
 /// `dist/` tree, when present: `mesofact.routes.ts` (routes/config the runtime
 /// reads) and `mesofact.config.toml` (the `[publish]` block a `mesofact serve

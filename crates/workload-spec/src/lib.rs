@@ -1400,6 +1400,38 @@ fn default_feed_interval_secs() -> u64 {
 /// Serve-time reference to a published W272 bundle (R599-F4) — the
 /// `{bundle_digest, runtime, lifecycle}` triple a `mesofact-static` workload
 /// carries when kamaji, not the build reconciler, serves it.
+///
+/// @yah:ticket(R870-B6, "Bundle origin is node-wide, so a second tenant's bundle can never be materialized")
+/// @yah:status(review)
+/// @yah:at(2026-09-09T03:23:08Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R870)
+/// @yah:gotcha("REPORTED BY THE NOISETABLE CAMP, which is R870's second tenant made concrete. Its bundle deploy gets ALL THE WAY to admission and then fails: 'materialize bundle f75c6940...: missing blob manifests/f75c6940... for path \"manifest.toml\"'. Ident and placement were correct — the CLI printed 'noisetable admitted by us-east-001 (http://100.64.0.3:7443)' — so this is not a discovery or placement bug. The node accepted a digest it has no way to fetch.")
+/// @yah:gotcha("ROOT CAUSE, read not guessed: MesofactServeBundle is { digest, runtime, lifecycle, port, env } and carries NEITHER a bucket NOR an origin (oss/yah-base/crates/workload-spec/src/lib.rs). BundleSlot::serve_bundle constructs it from the slot and drops the slot's `bucket` on the floor (oss/yubaba/crates/cloud/src/reconciler/mesofact_bundle.rs). kamaji then fetches from the NODE-WIDE KAMAJI_BUNDLE_ORIGIN (oss/kamaji/crates/kamaji-bin/src/main.rs:86). So the publish side is per-service and the fetch side is per-node, and they only agree while the fleet has exactly one tenant.")
+/// @yah:gotcha("MEASURED, WITH A NEGATIVE CONTROL — all four taken 2026-09-08. (1) our manifest blob IS in the noisetable-marketing bucket: `yah cloud bucket ls --bucket noisetable-marketing` lists manifests/f75c6940.... (2) https://cdn.noisetable.com/manifests/f75c6940... = 200. (3) https://cdn.yah.dev/manifests/f75c6940... = 404 — the node's origin, where it looked. (4) POSITIVE CONTROL, so 404 is not just a broken URL shape: https://cdn.yah.dev/manifests/0279f43e... (a real yah bundle) = 200. yah-dev holds 49 manifests/ objects; noisetable-marketing holds 1, and it is ours.")
+/// @yah:gotcha("THE RUNTIME ASSET HALF FAILS IDENTICALLY AND IS A SECOND BLOCKER, not the same one twice — fixing only the manifest fetch leaves the deploy failing one step later. runtimes/mesofact/0.8.32/x86_64-unknown-linux-musl.toml exists in yah-dev and in NO other bucket, and the apply printed 'no mesofact/0.8.32 runtime asset is published yet' against the tenant's own bucket. Whatever carries the origin must cover manifests, blobs AND the runtime-asset lookup.")
+/// @yah:gotcha("THE WORKAROUND WAS CONSIDERED AND REFUSED BY THE OPERATOR, recorded so it is not re-proposed as a shortcut: point the tenant's bundle slot at bucket = \"yah-dev\" so it lands in the store the node already reads. It works today and is one word. It also puts a tenant's build output in yah's bucket, which makes the tenant boundary fictional for bundle content in exactly the way reusing the account-scoped ACME token would have for DNS — the same call R870-F1 already made the other way when it minted a noisetable-only token instead. Noisetable's mirror still declares bucket = \"noisetable-marketing\" and is correct as written; it is yah that cannot consume it.")
+/// @yah:next("THE PRECEDENT IS IN THE SAME STRUCT AND SHOULD BE COPIED RATHER THAN REDESIGNED. MesofactServeBundle::port's own doc records that it 'used to mean fall back to kamaji's node-wide default (KAMAJI_BUNDLE_PORT, else 8080), which was a single node-wide slot wearing the word default — correct only while a node hosted one'. R844-F2 fixed that axis by making the value travel with the workload and letting the node-wide setting be a fallback. KAMAJI_BUNDLE_ORIGIN is the same defect on the store axis, unfixed. Do the same thing: an Option<String> origin (or bucket) on MesofactServeBundle, threaded from BundleSlot::serve_bundle, with KAMAJI_BUNDLE_ORIGIN demoted to the fallback so every existing single-tenant deploy is byte-identical.")
+/// @yah:next("SCOPE IS THREE EDIT SITES, all named: (a) MesofactServeBundle gains the field (oss/yah-base/crates/workload-spec/src/lib.rs) — wire type, so schema + TS export + drift test move with it; (b) BundleSlot::serve_bundle stops discarding the slot's `bucket` (oss/yubaba/crates/cloud/src/reconciler/mesofact_bundle.rs); (c) kamaji resolves the per-workload origin ahead of KAMAJI_BUNDLE_ORIGIN for manifest, blob AND runtime-asset fetches (oss/kamaji/crates/kamaji-bin). A bucket name is not directly fetchable, so decide deliberately whether the field carries a public origin URL or a bucket that the node maps to one — the tenant's blobs are reachable at https://cdn.noisetable.com today, so an origin URL needs no new credential on the node and keeps kamaji credential-free, which is the property worth preserving.")
+/// @yah:next("DO NOT SOLVE THIS BY GIVING KAMAJI R2 CREDENTIALS PER TENANT. It fetches over plain HTTP from a public origin today and holds no bucket credential at all; adding one would put a tenant-scoped R2 key on three public boxes for content that is already world-readable. The W295 warning about the account-wide R2 write pair is the adjacent precedent.")
+/// @yah:verify("End to end, from the noisetable camp: `yah cloud apply --service noisetable-marketing --env cloud` with bucket = \"noisetable-marketing\" unchanged reaches Running rather than Failed on us-east-001, and https://noisetable.com/ serves the site instead of the R870-F5 holding page.")
+/// @yah:verify("Regression, single-tenant: yah-marketing's own deploy is unchanged with no edit to its mirror — it declares bucket = \"yah-dev\" and the node's KAMAJI_BUNDLE_ORIGIN already points there, so the fallback path must produce a byte-identical spec. Assert it at the wire type, not just by observing yah.dev stay up.")
+/// @yah:verify("The runtime-asset half specifically: the deploy must NOT print 'no mesofact/<ver> runtime asset is published yet' when the tenant's own origin serves one, and must still resolve the stock runtime for a tenant that publishes none.")
+/// @yah:handoff("FIXED, AND THE FIX IS THE PRECEDENT THE TICKET NAMED. `MesofactServeBundle` gains `origin: Option<String>` — the public HTTPS origin serving the bucket the workload was published to — appended after `env` (postcard is positional; no skip_serializing_if), `#[serde(default)]` + `#[ts(optional = nullable)]`. `None` means the node's own `KAMAJI_BUNDLE_ORIGIN`, so every existing single-tenant deploy is byte-identical and no yah-owned mirror needs an edit.")
+/// @yah:handoff("A URL, NOT A BUCKET, decided rather than defaulted. A bucket name is not fetchable: resolving one would need a node-side bucket→origin table (the same node-wide defect one level down) or R2 credentials on every box, for content that is world-readable and against a node that deliberately holds none. `providers.static.asset_origin` already makes this call one tier over. Declared rather than derived from `zone`, because `https://cdn.<zone>` is a guess about an R2 custom-domain binding that may not exist.")
+/// @yah:handoff("PUBLISHER SIDE (oss/yubaba/crates/cloud/src/reconciler/mesofact_bundle.rs): `BundleSlot` gains `origin`, `origin` joins ALLOWED_SLOT_KEYS, and `serve_bundle` stops dropping the store on the floor. Parsed strictly — a schemeless value (`cdn.noisetable.com`, or a bucket name) is REFUSED at parse with the reason, because its only consumer joins keys onto it as path segments, so accepting one would deploy clean and fail on the node at materialize time. A trailing slash is trimmed once, here.")
+/// @yah:handoff("NODE SIDE (oss/kamaji/crates/kamaji-bin/src/server.rs): new `BundleBackend::store_for(origin)`. `None` returns the node's store itself, unwrapped. `Some` builds an `HttpReadOnlyObjectStore` (on the blocking pool — a reqwest blocking client panics if constructed inside a tokio runtime) and puts it in FRONT of the node's, not in place of it. All three fetch sites take it: the manifest+blob materialize, the serve runtime-asset resolve, and the feed-tier fetcher (threaded through `fork_revalidate_receiver` → `fork_feed_tier`).")
+/// @yah:handoff("THE READ-THROUGH IS WHAT MAKES THE RUNTIME-ASSET HALF WORK, and it is why this is a chain and not a swap. The fleet publishes the stock `mesofact/<ver>` serve runtime once, to its own origin; a tenant has no reason to mirror ~70MB of it. Tenant origin answers for the tenant's bundle, node origin answers for the stock runtime, and which is which is not knowable per key. New `yah_object_store::FallbackObjectStore` (oss/yah-base/crates/object-store/src/fallback.rs) does exactly that and nothing else: reads chain, writes are REFUSED (a chain has no principled answer to which member a `put` lands in — guessing would put one tenant's bytes in another's store, the boundary this ticket exists to draw). Safe because every key on this path is content-addressed and blake3-verified after the fetch, so a fallback can return the wrong store's bytes only if they are the right bytes. A primary ERROR is not laundered into a miss: an unreachable tenant origin fails loudly instead of quietly serving yah's copy.")
+/// @yah:handoff("APPLY-TIME NOTE CORRECTED (app/yah/cli/src/cloud.rs): 'no mesofact/<ver> runtime asset is published yet … or the node will have nothing to fork' was true for a single-tenant fleet and is now false — for a tenant bucket it is the NORMAL state. It names the bucket it checked and says the node reads through to its own origin for the stock one.")
+/// @yah:handoff("REGENERATED: `cargo run -p xtask -- emit-schemas` + export-ts. `.yah/schema/workload.toml.schema.json` and `packages/yah/workload-spec/index.ts` carry the new field. (`.yah/schema/machine.toml.schema.json` also moved — it was already dirty in this shared tree when this session started, not something this ticket authored.)")
+/// @yah:verify("cargo test -p yah-object-store -p yah-workload-spec (oss/yah-base): 101 pass, 0 fail — includes 7 new FallbackObjectStore tests (primary wins, clean miss falls through, head chains, a primary error is NOT a miss, locate names both members, writes refused, list_prefix unions).")
+/// @yah:verify("cargo test -p yah-cloud --lib (oss/yubaba): 1134 pass, 0 fail — 4 new: a declared origin reaches the serve_bundle; NO declared origin leaves the node-wide one in charge (the single-tenant regression, asserted at the wire type, not by watching yah.dev stay up); trailing slash trimmed; a schemeless origin is refused naming the shape.")
+/// @yah:verify("cargo test -p kamaji-bin --features bundle-serving --lib (oss/kamaji): 270 pass, 0 fail (was 267). THE END-TO-END ONE IS `a_second_tenants_bundle_materializes_from_its_own_origin`: the tenant's bundle is published to a store served over a REAL loopback HTTP/1.1 origin (not a second injected ObjectStore — a test that handed the backend an in-memory store would pass with the URL ignored, which is the bug), the node's store holds ONLY the fleet's stock runtime, and the deploy comes up: tenant content from the tenant's origin, stock runtime read through to the node's. `without_an_origin_a_tenant_bundle_fails_after_a_clean_admission` is its negative control — the reported bug verbatim. `an_undeclared_origin_resolves_to_the_node_store_unchanged` pins Arc::ptr_eq on the None path so the single-tenant case pays nothing for the mechanism.")
+/// @yah:verify("cargo check -p kamaji-bin with NO features (the bundle-serving-off build) and cargo test -p kamaji-proto (33 pass, the postcard round-trip): both clean.")
+/// @yah:verify("cargo check --workspace: exit 0. Every remaining warning is pre-existing in files this ticket did not touch (board.rs, runner/sessions.rs, mesofact_static.rs, agent-tools/shared_pool.rs).")
+/// @yah:verify("NOT VERIFIED LIVE, AND CANNOT BE FROM HERE: the ticket's first verify is a `yah cloud apply` from the noisetable camp reaching Running. That needs the fleet to be RUNNING this kamaji — us-east-001 still runs the pre-change binary, which ignores the field. Filed as R870-T9 (roll kamaji, then add the one `origin` line to noisetable's mirror), which depends_on this ticket.")
+/// @yah:gotcha("ROLL ORDER DOES NOT BITE, checked rather than assumed: `origin` reaches yubaba as JSON and `MesofactServeBundle` carries no `deny_unknown_fields`, so a mirror declaring an origin against an un-rolled node has the field ignored and fails exactly as it does today — not a parse error. Only kamaji has to move.")
+/// @yah:gotcha("THE NODE CACHE IS SHARED ACROSS ORIGINS AND THAT IS FINE FOR BUNDLES, LESS OBVIOUSLY SO FOR RUNTIME ASSETS. Materialized bundles are keyed by blake3 digest, so two tenants cannot collide. Runtime assets are keyed by `<runtime>/<version>/<triple>` — so two tenants publishing DIFFERENT bytes under the same `mesofact/<ver>` would share one node cache entry, first writer wins. Not reachable today (nobody but the fleet publishes a mesofact runtime, and `publish_runtime_asset`'s own docs already say publish a new version rather than repointing one), but it is the next thing this axis will need if a tenant ever ships its own build of a stock runtime name.")
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct MesofactServeBundle {
@@ -1467,6 +1499,49 @@ pub struct MesofactServeBundle {
     /// `skip_serializing_if`.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+
+    /// Public HTTPS origin serving the bundle store this workload was published
+    /// to (R870-B6) — e.g. `"https://cdn.noisetable.com"`, the R2 custom domain
+    /// bound to the tenant's own bucket.
+    ///
+    /// `None` → the node's own `KAMAJI_BUNDLE_ORIGIN`, which is the shape every
+    /// yah-owned mirror uses and the reason this is optional rather than
+    /// required.
+    ///
+    /// # Why the store has to travel with the workload
+    ///
+    /// This is `port`'s defect one axis over, and it was found the same way: by
+    /// a second tenant. Publishing is per-service — `providers.bundle.bucket`
+    /// names the tenant's own R2 bucket — while fetching was per-*node*, from
+    /// the single `KAMAJI_BUNDLE_ORIGIN` the systemd drop-in sets. Those two
+    /// agree only while the fleet hosts one tenant. The noisetable deploy got
+    /// all the way to admission and then failed with `missing blob
+    /// manifests/<digest>`: its manifest was in `noisetable-marketing`, and the
+    /// node looked in `cdn.yah.dev`.
+    ///
+    /// Pointing the tenant's slot at yah's bucket would also have worked, and
+    /// was refused — a tenant's build output in yah's store makes the tenant
+    /// boundary fictional for bundle content.
+    ///
+    /// # Why a URL and not the bucket name
+    ///
+    /// A bucket name is not fetchable. Resolving one would need either a
+    /// node-side bucket→origin map (another node-wide table, the same defect
+    /// again) or R2 credentials on every box — for content that is already
+    /// world-readable, and against a node that deliberately holds no bucket
+    /// credential at all (see `HttpReadOnlyObjectStore`). Integrity comes from
+    /// the content address, not the transport, so an unauthenticated origin is
+    /// exactly as safe here as an authenticated one.
+    ///
+    /// The declared origin does not *replace* the node's: kamaji reads through
+    /// to `KAMAJI_BUNDLE_ORIGIN` on a miss, which is what lets a tenant fetch
+    /// the stock `mesofact/<ver>` serve runtime the fleet publishes once
+    /// without republishing ~70MB into their own bucket.
+    ///
+    /// Appended **after** `env` — see `port`'s note on the positional codec.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub origin: Option<String>,
 }
 
 /// Lifecycle mode for a served bundle (W272 §3).
@@ -4012,6 +4087,25 @@ pub mod forge_produced {
     /// path contains a `..` component (a traversal attempt that could escape the
     /// per-forge dir — the reader must never serve a file outside it).
     pub fn host_path(forge_id: &str, container_path: &Path) -> Option<PathBuf> {
+        host_path_under(&host_dir(forge_id), container_path)
+    }
+
+    /// The same translation against an ARBITRARY host directory, for a produced
+    /// dir that is not one of yubaba's (R560-B12).
+    ///
+    /// A LOCAL container step has the identical problem a remote one has and no
+    /// [`HOST_ROOT`] to solve it with: `docker run --rm` throws the container's
+    /// writable layer away on exit, so a build that writes its `produces` under
+    /// [`CONTAINER_DIR`] and exits 0 leaves the caller reading an absent file —
+    /// exactly the remote failure this module was created for. The caller binds
+    /// a host dir of its own choosing (qed uses a run-scoped dir under the
+    /// camp's cache) and maps declared container paths through this.
+    ///
+    /// Split out rather than duplicated because the `..` guard is the whole
+    /// safety content of both: `host_path` must never serve a file outside the
+    /// per-forge dir, and this one must never write outside the caller's. Two
+    /// copies of that check is one copy that can be fixed alone.
+    pub fn host_path_under(host_dir: &Path, container_path: &Path) -> Option<PathBuf> {
         let rel = container_path.strip_prefix(CONTAINER_DIR).ok()?;
         if rel
             .components()
@@ -4019,7 +4113,7 @@ pub mod forge_produced {
         {
             return None;
         }
-        Some(host_dir(forge_id).join(rel))
+        Some(host_dir.join(rel))
     }
 
     /// The durable produced-dir bind mount for a forge run: host
@@ -4214,6 +4308,313 @@ mod secret_mount_tests {
             assert!(!name.contains('/'), "{target:?} kept a separator: {name}");
             assert_ne!(name, "..");
         }
+    }
+}
+
+// ── Durable forge build-cache convention (R876-F4) ────────────────────────────
+
+/// Convention for a remote forge step's host-persistent **build cache**.
+///
+/// # The gap this closes
+///
+/// A remote subprocess gets image + argv + the [`forge_produced`] mount and
+/// nothing else, so a step that compiles a source tree compiles it from scratch
+/// every single run: the container's writable layer (where `CARGO_TARGET_DIR`
+/// lands by default) is thrown away when kamaji reaps the exited container, and
+/// `/yah/produced` is per-run and reaped on destroy. `mesofact-musl`'s x86_64
+/// leg measured 9m56s / 9m57s / 11m10s across its successful runs and every one
+/// of those was a cold full release build.
+///
+/// This is the third mount under [`forge_state::HOST_ROOT`], and — exactly as
+/// R603-B6's handoff promised — it needs neither new yubaba code nor a
+/// `yubaba.service` edit: `ensure_forge_state_dirs` already mkdirs *any* forge
+/// bind under that root.
+///
+/// # Why the key is derived, not caller-supplied
+///
+/// A shared target dir keyed by nothing is a correctness bug, not merely a
+/// race. `mesofact-musl` carries `concurrency_key = "mesofact-musl"`, but that
+/// is *camp-side scheduling*: it does not constrain a second camp, or a
+/// hand-rolled dispatch, aiming at the same worker. The key is therefore
+/// derived by the dispatcher from **pipeline + step + target triple**
+/// ([`key_from_parts`]) rather than written in a TOML, so two different
+/// pipelines — or the same pipeline's two triples — cannot land on one target
+/// dir however the run was started.
+///
+/// Two runs of the *same* pipeline+step+triple DO share, and that is the whole
+/// point: cargo is designed for exactly that reuse, and its own `.cargo-lock`
+/// in the target dir serializes two builds that overlap in time.
+///
+/// # Eviction is explicit
+///
+/// An unbounded cache on a worker rootfs is R702's subject. Both holders of a
+/// cache root — yubaba on the worker, qed for the local-container placement —
+/// sweep it with [`evict_plan`]: anything idle past [`RETENTION`] goes, and if
+/// the filesystem is below [`FREE_FLOOR_BYTES`] the least-recently-used dirs go
+/// too, until it is not. The cache can therefore never consume the last few GB
+/// of a build worker's `/var`.
+pub mod forge_cache {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    /// Conventional container-side directory a cached forge step's build
+    /// scratch lives in. Bind-mounted onto a host-persistent, key-scoped dir.
+    ///
+    /// The step's argv points its own toolchain at this (mesofact-musl exports
+    /// `CARGO_TARGET_DIR="$YAH_CACHE_DIR/target"`), the same way it does the
+    /// source-context fetch — the mount is toolchain-agnostic and the TOML
+    /// keeps describing what actually runs.
+    pub const CONTAINER_DIR: &str = "/yah/cache";
+
+    /// Environment variable carrying [`CONTAINER_DIR`] into the step, so an
+    /// argv never has to hardcode the convention.
+    pub const CACHE_DIR_ENV: &str = "YAH_CACHE_DIR";
+
+    /// Host root under which each cache key gets a directory:
+    /// `<HOST_ROOT>/<key>/`. Under [`super::forge_state::HOST_ROOT`], so
+    /// yubaba's `ensure_forge_state_dirs` creates it and `yubaba.service`
+    /// already grants write access to it.
+    pub const HOST_ROOT: &str = "/var/lib/yah/qed/cache";
+
+    /// A cache dir untouched for this long is evicted. Long enough that a
+    /// weekly release still hits a warm cache; short enough that a renamed
+    /// step's orphan does not sit on the disk forever.
+    pub const RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 14);
+
+    /// Below this much free space on the filesystem holding a cache root,
+    /// least-recently-used cache dirs are evicted until it is above it again.
+    /// This is the bound that matters on a build worker: us-west-003's `/var`
+    /// is a 60 GB LV, and a release target dir is multiple GB.
+    pub const FREE_FLOOR_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+    /// Longest derived key kept verbatim; longer ones are truncated and
+    /// disambiguated with a digest by [`key_from_parts`].
+    pub const MAX_KEY_LEN: usize = 96;
+
+    /// Whether `key` is safe to use as a single path component under
+    /// [`HOST_ROOT`]. Deliberately narrow: alphanumerics plus `.`, `-`, `_`,
+    /// non-empty, length-capped, and never a bare `.`/`..`. Everything a
+    /// dispatcher derives passes; nothing a hostile spec could write escapes.
+    pub fn is_valid_key(key: &str) -> bool {
+        !key.is_empty()
+            && key.len() <= MAX_KEY_LEN + 24
+            && key != "."
+            && key != ".."
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    }
+
+    /// Derive the sharing key from the parts that must not collide: the
+    /// pipeline, the step within it, and the target triple.
+    ///
+    /// Characters outside the [`is_valid_key`] alphabet collapse to `-`. A key
+    /// that would exceed [`MAX_KEY_LEN`] is truncated and suffixed with a
+    /// digest of the *full* string, so shortening can never merge two distinct
+    /// keys into one.
+    ///
+    /// The digest is FNV-1a rather than blake3: this crate is deliberately a
+    /// zero-dependency schema crate (see its `seal` / `admission-verify`
+    /// features — even the cipher is opt-in), the inputs are pipeline and step
+    /// names from the camp's own TOMLs rather than anything adversarial, and
+    /// the property needed is "two long keys differ", not preimage resistance.
+    pub fn key_from_parts(pipeline: &str, step: &str, triple: &str) -> String {
+        let raw = format!("{pipeline}.{step}.{triple}");
+        let mut safe: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        if safe.len() > MAX_KEY_LEN {
+            let digest = fnv1a64(raw.as_bytes());
+            safe.truncate(MAX_KEY_LEN);
+            safe.push('.');
+            safe.push_str(&format!("{digest:016x}"));
+        }
+        safe
+    }
+
+    /// FNV-1a, 64-bit. See [`key_from_parts`] for why this and not a real hash.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// The host-persistent cache directory for one key, under [`HOST_ROOT`].
+    pub fn host_dir(key: &str) -> Option<PathBuf> {
+        cache_dir_under(Path::new(HOST_ROOT), key)
+    }
+
+    /// The same derivation against an arbitrary root — for the local-container
+    /// placement, whose cache lives under the camp's own `.yah/cache` and has
+    /// no [`HOST_ROOT`] to hang off. Split out for the same reason
+    /// [`super::forge_produced::host_path_under`] is: the key validation is the
+    /// whole safety content of both, and two copies is one copy that can be
+    /// fixed alone.
+    pub fn cache_dir_under(root: &Path, key: &str) -> Option<PathBuf> {
+        is_valid_key(key).then(|| root.join(key))
+    }
+
+    /// The build-cache bind mount for one key: host `<HOST_ROOT>/<key>` →
+    /// container [`CONTAINER_DIR`], writable. `None` for an invalid key —
+    /// the caller must refuse rather than mount something else.
+    pub fn durable_mount(key: &str) -> Option<super::VolumeMount> {
+        Some(super::VolumeMount {
+            source: super::VolumeSource::Bind {
+                host_path: host_dir(key)?,
+            },
+            target: PathBuf::from(CONTAINER_DIR),
+            read_only: false,
+        })
+    }
+
+    /// Which cache dirs to delete, given every dir in a cache root with its
+    /// last-modified time, the current free space on that filesystem, and the
+    /// floor to hold.
+    ///
+    /// Pure so the policy is one testable function shared by both holders of a
+    /// cache root (yubaba on the worker, qed for local containers) instead of
+    /// two drifting copies. The callers own the `read_dir` / `df` / `remove`.
+    ///
+    /// Two rules, in order: everything idle past `retention` goes
+    /// unconditionally; then, while `free_bytes` is under `floor_bytes`, the
+    /// least-recently-used survivor goes — LRU because the dir a build just
+    /// touched is the one whose loss costs the next run the most.
+    ///
+    /// `free_bytes` is what the caller measured BEFORE any deletion, so the
+    /// count of extra evictions is a heuristic (this function cannot know a
+    /// dir's size without walking it). It is bounded and monotone: under
+    /// sustained pressure each sweep drops one more dir, and a root that is
+    /// entirely evicted simply rebuilds cold — the failure mode is a slow
+    /// build, never a full disk.
+    pub fn evict_plan(
+        entries: &[(PathBuf, SystemTime)],
+        now: SystemTime,
+        retention: Duration,
+        free_bytes: u64,
+        floor_bytes: u64,
+    ) -> Vec<PathBuf> {
+        let mut evict = Vec::new();
+        let mut live: Vec<&(PathBuf, SystemTime)> = Vec::new();
+        for entry in entries {
+            let idle = now
+                .duration_since(entry.1)
+                .map(|age| age > retention)
+                .unwrap_or(false);
+            if idle {
+                evict.push(entry.0.clone());
+            } else {
+                live.push(entry);
+            }
+        }
+        if free_bytes < floor_bytes && !live.is_empty() {
+            live.sort_by_key(|(_, mtime)| *mtime);
+            evict.push(live[0].0.clone());
+        }
+        evict
+    }
+}
+
+#[cfg(test)]
+mod forge_cache_tests {
+    use super::forge_cache::*;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn the_cache_root_is_under_the_forge_state_root() {
+        assert!(super::forge_state::is_forge_state_path(Path::new(
+            HOST_ROOT
+        )));
+        assert!(super::forge_state::is_forge_state_path(
+            &host_dir("mesofact-musl.build.x86_64-unknown-linux-musl").unwrap()
+        ));
+    }
+
+    #[test]
+    fn the_key_separates_pipelines_steps_and_triples() {
+        let a = key_from_parts("mesofact-musl", "build", "x86_64-unknown-linux-musl");
+        let b = key_from_parts("mesofact-musl", "build", "aarch64-unknown-linux-musl");
+        let c = key_from_parts("other-pipeline", "build", "x86_64-unknown-linux-musl");
+        let d = key_from_parts("mesofact-musl", "other-step", "x86_64-unknown-linux-musl");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
+        assert!(is_valid_key(&a), "{a}");
+    }
+
+    /// Shortening must never merge two distinct keys — the whole point of the
+    /// key is that a collision is impossible.
+    #[test]
+    fn an_over_long_key_is_digest_disambiguated_not_merely_truncated() {
+        let long = "p".repeat(MAX_KEY_LEN);
+        let a = key_from_parts(&long, "step-one", "x86_64-unknown-linux-musl");
+        let b = key_from_parts(&long, "step-two", "x86_64-unknown-linux-musl");
+        assert_ne!(a, b);
+        assert!(is_valid_key(&a) && is_valid_key(&b));
+    }
+
+    #[test]
+    fn a_key_that_could_escape_the_root_is_refused_rather_than_sanitized() {
+        for bad in ["", ".", "..", "../etc", "a/b", "a\0b"] {
+            assert!(!is_valid_key(bad), "{bad:?} must not be a cache key");
+            assert!(host_dir(bad).is_none(), "{bad:?}");
+            assert!(durable_mount(bad).is_none(), "{bad:?}");
+        }
+        // …and a derived key from hostile parts is sanitized into the alphabet.
+        let k = key_from_parts("../../etc", "x/y", "t");
+        assert!(is_valid_key(&k), "{k}");
+        assert_eq!(host_dir(&k).unwrap().parent().unwrap(), Path::new(HOST_ROOT));
+    }
+
+    #[test]
+    fn durable_mount_shape() {
+        let m = durable_mount("k").expect("valid key");
+        assert_eq!(m.target, PathBuf::from(CONTAINER_DIR));
+        assert!(!m.read_only, "a build cache the step cannot write is useless");
+        match &m.source {
+            super::VolumeSource::Bind { host_path } => {
+                assert_eq!(host_path, &PathBuf::from(HOST_ROOT).join("k"));
+            }
+            other => panic!("expected a bind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn idle_dirs_are_evicted_and_fresh_ones_are_kept_when_there_is_room() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let entries = vec![
+            (PathBuf::from("/c/old"), now - RETENTION - Duration::from_secs(1)),
+            (PathBuf::from("/c/fresh"), now - Duration::from_secs(60)),
+        ];
+        let plan = evict_plan(&entries, now, RETENTION, FREE_FLOOR_BYTES * 2, FREE_FLOOR_BYTES);
+        assert_eq!(plan, vec![PathBuf::from("/c/old")]);
+    }
+
+    #[test]
+    fn disk_pressure_evicts_the_least_recently_used_survivor() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let entries = vec![
+            (PathBuf::from("/c/hot"), now - Duration::from_secs(60)),
+            (PathBuf::from("/c/cool"), now - Duration::from_secs(6000)),
+        ];
+        let plan = evict_plan(&entries, now, RETENTION, 1, FREE_FLOOR_BYTES);
+        assert_eq!(plan, vec![PathBuf::from("/c/cool")]);
+    }
+
+    #[test]
+    fn an_empty_root_under_disk_pressure_plans_nothing() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(evict_plan(&[], now, RETENTION, 0, FREE_FLOOR_BYTES).is_empty());
     }
 }
 

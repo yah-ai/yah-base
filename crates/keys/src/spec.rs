@@ -707,6 +707,58 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         onepassword: None,
     },
     CredentialSpec {
+        slot: "cloudflare-r2-cert-store-access-key-id",
+        // Deliberately shares CF_R2_ACCESS_KEY_ID with the account-wide pair
+        // below. `R2ObjectStore::from_vault` hard-codes one slot name and one
+        // env fallback, so a door that must reach ONE bucket and no other has
+        // exactly one way to say so: put the scoped key in that env var, in a
+        // 0600 EnvironmentFile, and never give the node a vault.
+        env: Some("CF_R2_ACCESS_KEY_ID"),
+        purpose: "R2 access key id scoped to the `yah-cert-store` bucket alone (CF token \
+                  yah-cert-store-rw, item read + write). What the three public doors hold \
+                  so the enrollment publisher can sweep the set and the ACME issuer can \
+                  mirror the sealed pair — WITHOUT the account-wide write below, which \
+                  could rewrite the public releases index from an internet-facing box",
+        consumers: &[
+            "/etc/yah-cloud/cert-store.env on us-{east,south,west}-001 (0600, root)",
+            ".yah/infra/machines/us-east-001.toml (bucket + account id recorded)",
+            "oss/yubaba/crates/yubaba/src/cert_store.rs (CertStoreConfig::connect_objects)",
+        ],
+        provider: Provider::Cloudflare,
+        domain: Domain::Infra,
+        // Same reasoning as the fleet-read pair: `cloudflare-legacy-yah` is a
+        // user-owned token that can mint account tokens, so replacing this one
+        // is an API call rather than a dashboard visit.
+        band: Band::Automatable,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
+        slot: "cloudflare-r2-cert-store-secret-key",
+        env: Some("CF_R2_SECRET_KEY"),
+        purpose: "secret half of the bucket-scoped cert-store R2 pair. It is the SHA-256 of \
+                  the Cloudflare token value, which is how R2 derives an S3 secret from a \
+                  token — the token value itself is not stored anywhere",
+        consumers: &["/etc/yah-cloud/cert-store.env on us-{east,south,west}-001 (0600, root)"],
+        provider: Provider::Cloudflare,
+        domain: Domain::Infra,
+        band: Band::Automatable,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
         slot: "cloudflare-r2-fleet-read-access-key-id",
         env: None,
         purpose: "read-only R2 access key id (CF token yah-fleet-index-read), shipped to fleet \

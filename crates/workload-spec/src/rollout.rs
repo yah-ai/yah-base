@@ -35,6 +35,25 @@ pub struct RolloutPolicy {
     /// Ordered deployment steps (e.g. staging → canary → prod).
     #[serde(default)]
     pub steps: Vec<RolloutStep>,
+    /// R118-T5: hold each step until every node it names has reported a healthy
+    /// boot of the new artifact, and revert the rollout if any of them reports a
+    /// failed one.
+    ///
+    /// **Opt-in, and off by default, because the evidence has to exist.** A
+    /// cloud rollout's [`RolloutStep::mirrors`] are mirror names that nothing
+    /// will ever file a boot-health report for; turning this on for them would
+    /// stall every step until the rollout's [`Self::window_seconds`] ran out. A
+    /// rig rollout's `mirrors` are node names, and each of those nodes reports
+    /// its own RAUC verdict to its local yubaba
+    /// (`POST /v1/nodes/{node}/boot-health`).
+    ///
+    /// Turning it on switches the step gate from *fail-open* (a window elapses,
+    /// nothing is known, promote) to **fail-closed**: unknown is not healthy,
+    /// and a step whose nodes have not reported does not advance. That is the
+    /// same posture liveness takes in the noisetable camp — an unknown node is a
+    /// veto, never an assumed yes.
+    #[serde(default)]
+    pub require_node_health: bool,
 }
 
 /// Rollout strategy.
