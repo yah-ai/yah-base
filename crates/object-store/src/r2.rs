@@ -36,8 +36,10 @@ use reqwest::StatusCode;
 use sha2::{Digest, Sha256};
 
 use local_driver::s3_sign::{
-    sign_s3_get_with_query, sign_s3_no_body, sign_s3_put_object, sign_s3_put_object_with,
-    uri_encode_key, S3PutOptions,
+    // `sign_s3_put_object` (the fixed-header entry point) is gone from this file
+    // as of R330-B51: both write paths now go through `sign_s3_put_object_with`
+    // so a Cache-Control can ride the signature on either.
+    sign_s3_get_with_query, sign_s3_no_body, sign_s3_put_object_with, uri_encode_key, S3PutOptions,
 };
 
 use crate::{Error, ObjectStore, Precondition};
@@ -404,7 +406,13 @@ impl ObjectStore for R2ObjectStore {
             .collect())
     }
 
-    fn put_if(&self, key: &str, data: Vec<u8>, cond: Precondition) -> Result<String, Error> {
+    fn put_if(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        cond: Precondition,
+        cache_control: Option<&str>,
+    ) -> Result<String, Error> {
         let url = self.object_url(key);
         let body_sha256 = {
             let mut h = Sha256::new();
@@ -416,15 +424,26 @@ impl ObjectStore for R2ObjectStore {
         // only covers the headers in `SignedHeaders`, and S3/R2 honor extra
         // unsigned headers — so the precondition is enforced server-side without
         // touching the signer.
-        let mut headers = sign_s3_put_object(
+        //
+        // `Cache-Control` is NOT in that unsigned category and must go through
+        // the signer (R330-B51): S3 stores it as object metadata rather than
+        // merely honouring it on the request, so it has to be inside
+        // `SignedHeaders` or the PUT is rejected as a signature mismatch. Hence
+        // `sign_s3_put_object_with` here rather than the fixed-header
+        // `sign_s3_put_object` this used to call — the same entry point
+        // `put_inner` uses, so both write paths tag objects identically.
+        let mut headers = sign_s3_put_object_with(
             &url,
             &body_sha256,
-            content_type_for_key(key),
             data.len(),
             R2_REGION,
             &self.access_key,
             &self.secret_key,
-            None,
+            &S3PutOptions {
+                content_type: content_type_for_key(key),
+                blake3_meta: None,
+                cache_control,
+            },
         )
         .map_err(|e| Error::Backend(format!("sign PUT {key}: {e}")))?;
 
@@ -771,7 +790,20 @@ mod tests {
     /// what went onto the wire, and no more — the point is the headers, and a
     /// mock at the `reqwest` layer would only re-assert what the signer already
     /// returned rather than what the client actually sent.
+    /// Like [`one_shot_http`] but answers with an `ETag`, which `put_if` reads
+    /// off the PUT response. Without one it falls back to a follow-up HEAD, and
+    /// a one-shot server is gone by then.
+    fn one_shot_http_with_etag() -> (String, std::thread::JoinHandle<String>) {
+        one_shot_http_responding("HTTP/1.1 200 OK\r\nETag: \"served-etag\"\r\nContent-Length: 0\r\n\r\n")
+    }
+
     fn one_shot_http() -> (String, std::thread::JoinHandle<String>) {
+        one_shot_http_responding("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    }
+
+    /// The body of [`one_shot_http`], with the canned response as a parameter so
+    /// a `put_if` test can be answered with an `ETag`.
+    fn one_shot_http_responding(response: &'static str) -> (String, std::thread::JoinHandle<String>) {
         use std::io::{BufRead, BufReader, Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -803,10 +835,7 @@ mod tests {
                 .unwrap_or(0);
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body).unwrap();
-            reader
-                .into_inner()
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                .unwrap();
+            reader.into_inner().write_all(response.as_bytes()).unwrap();
             head
         });
         (url, handle)
@@ -842,6 +871,71 @@ mod tests {
             head.contains("signedheaders=cache-control;content-length;content-type;host;"),
             "{head}"
         );
+    }
+
+    /// R330-B51, the conditional twin of the test above — and the one that would
+    /// have caught the original bug. `put_if` used to call the fixed-header
+    /// `sign_s3_put_object`, so it had no way to carry a directive at all and
+    /// every CAS-written object (`yah/index.json` among them) went out bare.
+    ///
+    /// Asserts all three things that have to be true together: the header is on
+    /// the socket, it is INSIDE `SignedHeaders` — S3 stores `Cache-Control` as
+    /// object metadata rather than merely honouring it, so an unsigned one is a
+    /// signature mismatch, not a silently-dropped header — and the precondition
+    /// still rides along unsigned beside it.
+    #[test]
+    fn put_if_sends_the_cache_control_header_on_the_wire_and_signs_it() {
+        let (endpoint, server) = one_shot_http_with_etag();
+        let store = R2ObjectStore::new("acct", "yah-dev", "AK", "SK")
+            .unwrap()
+            .with_endpoint(endpoint);
+
+        let etag = store
+            .put_if(
+                "yah/index.json",
+                b"{\"versions\":[]}".to_vec(),
+                Precondition::IfMatch("\"abc123\"".into()),
+                Some(crate::CACHE_CONTROL_NO_CACHE),
+            )
+            .unwrap();
+        assert_eq!(etag, "\"served-etag\"");
+
+        let head = server.join().unwrap().to_lowercase();
+        assert!(head.starts_with("put /yah-dev/yah/index.json "), "{head}");
+        assert!(
+            head.contains("cache-control: no-cache, max-age=0\r\n"),
+            "the directive never reached the socket: {head}"
+        );
+        assert!(
+            head.contains("signedheaders=cache-control;content-length;content-type;host;"),
+            "cache-control is not inside SignedHeaders — R2 would 403 this: {head}"
+        );
+        // The precondition is still there, and still unsigned.
+        assert!(head.contains("if-match: \"abc123\"\r\n"), "{head}");
+        assert!(!head.contains("signedheaders=if-match"), "{head}");
+    }
+
+    /// `None` must mean "send no header", exactly as plain `put` does — not
+    /// "send an empty one", which R2 would store and serve as a real directive.
+    #[test]
+    fn put_if_with_no_cache_control_sends_no_such_header() {
+        let (endpoint, server) = one_shot_http_with_etag();
+        let store = R2ObjectStore::new("acct", "yah-dev", "AK", "SK")
+            .unwrap()
+            .with_endpoint(endpoint);
+
+        store
+            .put_if(
+                "fleet/state/latest.json",
+                b"{}".to_vec(),
+                Precondition::IfAbsent,
+                None,
+            )
+            .unwrap();
+
+        let head = server.join().unwrap().to_lowercase();
+        assert!(!head.contains("cache-control"), "{head}");
+        assert!(head.contains("if-none-match: *\r\n"), "{head}");
     }
 
     /// R630-B1, the property the whole fix rests on: the bytes on the wire and

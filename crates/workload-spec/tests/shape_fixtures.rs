@@ -285,7 +285,7 @@ fn a_stream_tier_needs_exactly_one_named_volume_to_be_relative_to() {
     let validate::ShapeError::Field { path, reason } =
         &validate::shape(&none).expect_err("no named volume must not load");
     assert_eq!(*path, FieldPath::Annotation("yah.durability.subjects"));
-    assert!(reason.contains("0 named volumes"), "{reason}");
+    assert!(reason.contains("0 named-or-bind volumes"), "{reason}");
 
     let mut two = stateful_appliance();
     two.volumes.push(workload_spec::VolumeMount {
@@ -302,6 +302,64 @@ fn a_stream_tier_needs_exactly_one_named_volume_to_be_relative_to() {
     // The refusal names the candidates — an operator fixing this needs to know
     // which two it could not choose between.
     assert!(reason.contains("accounts, sessions"), "{reason}");
+}
+
+/// R858-F17: a **bind** is a legitimate root for volume-relative subjects, and
+/// excluding it excluded headscale — a native-exec appliance whose state lives
+/// at `/var/lib/yah-cloud/headscale/`, with no named volume and no prospect of
+/// one. It was the single workload in this fleet whose loss has actually taken
+/// the mesh down, and the narrow rule made it the one that could not declare
+/// durability.
+#[test]
+fn a_bind_volume_is_a_legitimate_root_for_subjects() {
+    let mut spec = stateful_appliance();
+    // A bind is separately restricted to `tier = "infra"` (see the bind rule in
+    // `validate::shape`), which is exactly the class this widening is for —
+    // headscale is an infra appliance. The two rules compose rather than
+    // conflict, and this line is what makes that visible.
+    spec.tier = workload_spec::TierTag("infra".into());
+    spec.volumes = vec![workload_spec::VolumeMount {
+        source: workload_spec::VolumeSource::Bind {
+            host_path: "/var/lib/yah-cloud/headscale".into(),
+        },
+        target: "/var/lib/headscale".into(),
+        read_only: false,
+    }];
+    declare_stream(&mut spec, "db.sqlite");
+    validate::shape(&spec).expect("a bind-rooted declaration must load");
+}
+
+/// A tmpfs is the declaration that this data does not survive the process, so
+/// it must not satisfy a tier whose whole purpose is that it does.
+#[test]
+fn a_tmpfs_does_not_satisfy_a_bytes_shipping_tier() {
+    let mut spec = stateful_appliance();
+    spec.volumes = vec![workload_spec::VolumeMount {
+        source: workload_spec::VolumeSource::Tmpfs { size_mb: 64 },
+        target: "/scratch".into(),
+        read_only: false,
+    }];
+    declare_stream(&mut spec, "accounts.db");
+    let validate::ShapeError::Field { reason, .. } =
+        &validate::shape(&spec).expect_err("a ramdisk is not durable state");
+    assert!(reason.contains("0 named-or-bind volumes"), "{reason}");
+}
+
+/// The widening added a second KIND of candidate, not permission to guess
+/// between two of them.
+#[test]
+fn one_named_plus_one_bind_is_still_ambiguous() {
+    let mut spec = stateful_appliance();
+    spec.tier = workload_spec::TierTag("infra".into());
+    spec.volumes.push(workload_spec::VolumeMount {
+        source: workload_spec::VolumeSource::Bind { host_path: "/srv/acct".into() },
+        target: "/srv".into(),
+        read_only: false,
+    });
+    declare_stream(&mut spec, "accounts.db");
+    let validate::ShapeError::Field { reason, .. } =
+        &validate::shape(&spec).expect_err("two candidate roots must not load");
+    assert!(reason.contains("2 named-or-bind volumes"), "{reason}");
 }
 
 /// The rule is scoped to tiers that ship bytes. `tier = "none"` has no

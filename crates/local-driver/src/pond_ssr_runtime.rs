@@ -453,6 +453,12 @@ mod tests {
             },
             labels: Default::default(),
             annotations: Default::default(),
+            // R850-F1 drive-by: `WorkloadSpec::files` (inline files, positional
+            // postcard encoding so it is not optional in a struct literal) landed
+            // in HEAD without these two test fixtures being updated, breaking
+            // `cargo check --manifest-path oss/yah-base/Cargo.toml --all-targets`
+            // for the whole camp. Empty is the pre-field behaviour.
+            files: Vec::new(),
         }
     }
 

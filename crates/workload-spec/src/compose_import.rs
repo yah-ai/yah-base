@@ -293,6 +293,7 @@ fn translate_service(
         },
         labels: HashMap::new(),
         annotations: HashMap::new(),
+        files: Vec::new(),
     };
 
     Ok(spec)

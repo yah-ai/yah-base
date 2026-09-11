@@ -17,3 +17,4 @@ mod round_trip;
 mod secrets_invariant;
 mod semantic;
 mod shape_fixtures;
+mod ts_drift;

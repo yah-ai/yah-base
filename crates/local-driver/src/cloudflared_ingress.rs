@@ -223,6 +223,7 @@ impl CloudflaredIngressSpec {
             },
             labels,
             annotations,
+            files: Vec::new(),
         };
 
         Workload::container(spec)

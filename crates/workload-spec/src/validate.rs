@@ -585,29 +585,42 @@ pub fn shape(spec: &WorkloadSpec) -> Result<Vec<ShapeWarning>, ShapeError> {
     // declaration names files that will never exist; two or more means the
     // hydrate helper would have to guess which host directory to restore into,
     // and a wrong guess writes somebody's database over somebody else's.
+    //
+    // A **bind** counts, not only a yubaba-managed named volume. The rule was
+    // named-only until R858-F17 named the case it excluded: headscale keeps its
+    // state at `/var/lib/yah-cloud/headscale/`, is a native-exec appliance, and
+    // has no named volume and never will — so the narrow rule made the one
+    // workload whose loss took this camp's mesh down for 37 hours the one
+    // workload that could not declare durability. A bind is already restricted
+    // to `tier = "infra"` below, which is exactly the class this applies to.
     if let Some(d) = durability.as_ref().filter(|d| d.tier.ships_bytes()) {
-        let named: Vec<&str> = spec
+        let roots: Vec<String> = spec
             .volumes
             .iter()
             .filter_map(|v| match &v.source {
-                VolumeSource::Named { name } => Some(name.as_str()),
-                _ => None,
+                VolumeSource::Named { name } => Some(name.clone()),
+                VolumeSource::Bind { host_path } => Some(host_path.display().to_string()),
+                // Tmpfs is deliberately not a candidate: it is the declaration
+                // that this data does not survive the process, so counting it
+                // would let a spec claim durable state on a ramdisk.
+                VolumeSource::Tmpfs { .. } => None,
             })
             .collect();
-        if named.len() != 1 {
+        if roots.len() != 1 {
             return Err(ShapeError::Field {
                 path: FieldPath::Annotation(DURABILITY_SUBJECTS_ANNOTATION),
                 reason: format!(
                     "{DURABILITY_TIER_ANNOTATION} = \"{}\" declares subjects {:?}, which are \
-                     relative to a named volume, but this spec declares {} named volumes{}; \
-                     a tier that ships bytes needs exactly one",
+                     relative to one volume, but this spec declares {} named-or-bind volumes{}; \
+                     a tier that ships bytes needs exactly one (tmpfs does not count — it is a \
+                     declaration that the data does not survive)",
                     d.tier,
                     d.subjects,
-                    named.len(),
-                    if named.is_empty() {
+                    roots.len(),
+                    if roots.is_empty() {
                         String::new()
                     } else {
-                        format!(" ({})", named.join(", "))
+                        format!(" ({})", roots.join(", "))
                     }
                 ),
             });

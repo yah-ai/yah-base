@@ -189,6 +189,7 @@ fn minimal_spec() -> WorkloadSpec {
         },
         labels: Default::default(),
         annotations: Default::default(),
+        files: Vec::new(),
     }
 }
 

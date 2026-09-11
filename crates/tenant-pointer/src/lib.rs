@@ -332,7 +332,15 @@ pub fn create_if_absent(
         cell: cell.to_string(),
         generation: FIRST_GENERATION,
     };
-    match store.put_if(&pointer_key(tenant), encode(&record)?, Precondition::IfAbsent) {
+    // None: the tenant->cell pointer is read by yubaba over the S3 API on the
+    // control path, never fetched through a CDN, so there is no cache to direct
+    // (R330-B51). If it ever gains a public reader, it becomes CACHE_CONTROL_NO_CACHE.
+    match store.put_if(
+        &pointer_key(tenant),
+        encode(&record)?,
+        Precondition::IfAbsent,
+        None,
+    ) {
         Ok(etag) => Ok(CasOutcome::Committed(Pointer { record, etag })),
         Err(StoreError::PreconditionFailed(_)) => {
             // Somebody created it first (or we did, before a crash).
@@ -376,6 +384,7 @@ pub fn compare_and_swap(
         &pointer_key(&current.record.tenant),
         encode(&record)?,
         Precondition::IfMatch(current.etag.clone()),
+        None,
     ) {
         Ok(etag) => Ok(Pointer { record, etag }),
         Err(StoreError::PreconditionFailed(_)) => Err(PointerError::Conflict),
@@ -627,11 +636,12 @@ mod tests {
             key: &str,
             data: Vec<u8>,
             cond: Precondition,
+            cache_control: Option<&str>,
         ) -> Result<String, StoreError> {
             if let Some(theirs) = self.before_put_if.lock().unwrap().take() {
                 self.inner.put(key, encode(&theirs).unwrap())?;
             }
-            self.inner.put_if(key, data, cond)
+            self.inner.put_if(key, data, cond, cache_control)
         }
     }
 

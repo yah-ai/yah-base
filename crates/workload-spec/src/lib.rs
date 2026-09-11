@@ -419,6 +419,36 @@
 //! @yah:verify("EVERY NUMBER BELOW WAS RUN BY ME, and the last four on a settled tree after the final edit. workload-spec: `cargo test --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --all-features` = 162 lib + 87 integration passed / 0 failed (73 integration before, so +14 new in tests/mesh_ports.rs). yah-base workspace: `cargo test --manifest-path oss/yah-base/Cargo.toml --workspace` = every target ok (37/99/34/38/23/28/146/87/1/1, 0 failed). kamaji: `cargo test --manifest-path oss/kamaji/Cargo.toml --workspace --all-features` = every target ok, kamaji lib 51 passed (45 before, +6 for `declared_port_names`), kamaji-bin lib 278 passed, sibling_wire_e2e and docker_backend_e2e 2 passed each — the two suites R844-F15's postcard bug broke, which is the check that matters for a V7 bump.")
 //! @yah:verify("yubaba: `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib` = 1011 passed / 0 failed / 4 ignored; `-p yubaba --lib` = 632 passed / 0 failed; `-p yubaba --features testing --test testing -- integration_service_records::` = 11 passed / 0 failed (the suite that asserts a deploy publishes a ready dialable record, i.e. the path `declared_port_names` now feeds). Root: `cargo test -p yah --lib` = 1360 passed / 0 failed / 1 ignored. THE R844 PURITY CANARY, run twice and green both times: `cargo test -p xtask --test main mirror_ingress` = 11 passed / 0 failed — plan_ingress still plans the camp's REAL .yah/services tree with no network, no credentials and no CloudConfig.")
 //! @yah:verify("CARGO EXIT CODES CAPTURED DIRECTLY, not inferred from a grep (an earlier run of mine reported `rc=1` which was ripgrep's no-matches status, i.e. a PASS wearing a failure's clothes — re-run to settle it): `cargo check --manifest-path oss/kamaji/Cargo.toml --workspace --all-features --all-targets` cargo-exit=0, zero `^error` lines; `cargo check --workspace --all-targets` cargo-exit=0, zero `^error` lines. SCOPE HELD: `git diff -- .yah/services/` is EMPTY — this change touches no mirror, and the three apex pins R844-T10 owns are untouched at cloud.toml:105/:250/:276.")
+//!
+//! @yah:ticket(R885-B5, "cpu_millis is documented as a request and rendered as a hard quota — split request from limit")
+//! @yah:at(2026-09-10T07:30:46Z)
+//! @yah:status(open)
+//! @yah:phase(P2)
+//! @yah:parent(R885)
+//! @yah:next("Tier: Cleric. The judgment is made; this applies it.")
+//! @yah:next("ONE NUMBER, THREE MEANINGS. ResourceLimits::cpu_millis (workload-spec/src/lib.rs:4732) documents itself as a REQUEST — \"an allocatable quantity a bin-packer can subtract from a node budget\". containerd (kamaji-containerd-core/src/lib.rs:1216) and docker (kamaji/src/docker.rs:439) render it as a relative WEIGHT via cpu_shares(). cgroup.rs:146-152 renders it as a hard QUOTA in cpu.max. microvm.rs:563 renders it as a vCPU COUNT via div_ceil(1000).max(1).")
+//! @yah:next("THE BUG THIS CAUSES: a workload declaring 250m as its fair share gets throttled at a quarter core even on a completely idle node. A request rendered as a ceiling is a semantic bug, not a missing feature.")
+//! @yah:next("FIX: cpu_millis stays the request and renders as cpu.weight. An OPTIONAL limit, carried as an annotation (not a field — see the postcard wire rule at kamaji-proto/src/version.rs:63), renders as cpu.max when present and omits it when absent. The containerd/docker weight derivation is already correct and must not change. R572-T2 consciously postponed a separate cpu_limit_millis for exactly this; this is that work, done as an annotation instead of a field.")
+//! @yah:next("memory.high is deliberately NOT in scope. No recorded incident asks for a throttle-before-kill tier; file it when something does.")
+//! @yah:verify("rg -n \"cpu\\.weight|format_cpu_max\" oss/kamaji/crates/kamaji-bin/src/cgroup.rs — cpu.weight is written from the request; cpu.max is written only when a limit annotation is present.")
+//! @yah:verify("cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-bin --lib — the cgroup rendering tests cover both the limit-present and limit-absent shapes.")
+//! @yah:verify("The containerd and docker paths still derive the same cpu_shares value they do today — no change in oss/kamaji/crates/kamaji-containerd-core/src/lib.rs or kamaji/src/docker.rs.")
+//! @yah:depends_on(R885-B1)
+//!
+//! @yah:ticket(R885-T6, "Delete ephemeral_storage_mb from ResourceLimits and give the microVM its own named scratch floor")
+//! @yah:at(2026-09-10T07:31:12Z)
+//! @yah:status(open)
+//! @yah:phase(P3)
+//! @yah:parent(R885)
+//! @yah:next("Tier: Cleric either way; the operator call is what makes it blocked, not the difficulty.")
+//! @yah:next("THE FIELD LIES TODAY. ResourceLimits::ephemeral_storage_mb (workload-spec/src/lib.rs:4735) documents itself as a cap on the writable layer plus tmpfs footprint. NO backend enforces it: the OCI resources block (kamaji-containerd-core/src/lib.rs:1213-1218) carries only memory and cpu; docker argv carries only --memory and --cpu-shares; cgroup.rs deliberately omits it (not a cgroup v2 control). Its ONE live consumer, microvm.rs:693, uses it as a FLOOR on the scratch disk — the opposite of a cap. WorkloadSpec::for_forge sets 512 MiB, which as a cap would fail every build at first checkout.")
+//! @yah:next("EITHER ANSWER IS A SCHEMA CHANGE and needs the CLAUDE.md regen dance: cargo run -p xtask -- emit-schemas, then cargo run --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --bin export-ts. Gated by schema-drift-guard and workload-spec-drift-guard in .yah/qed/check.toml.")
+//! @yah:verify("rg -rn \"ephemeral_storage_mb\" --type rust — every remaining site agrees with whichever answer was chosen; no site reads it as a cap while another reads it as a floor.")
+//! @yah:verify("scripts/check-schema-drift.sh and scripts/check-workload-spec-ts.sh both clean.")
+//! @yah:gotcha("Deleting the field is a postcard wire change and therefore a ProtocolVersion bump (kamaji-proto/src/version.rs, currently V8) plus a sweep of WorkloadSpec struct literals across four cargo workspaces and two excluded manifests — R860-T1 took 35 call sites and three misses. Blast radius is bounded (node-local UDS, yubaba and kamaji self-install as a pair, so skew is a restart not a rolling upgrade) but it is not free. If R885-F3 also turns out to need a bump, do both in one.")
+//! @yah:next("DECIDED 2026-09-10 (operator): DELETE. Remove ephemeral_storage_mb from ResourceLimits entirely and give the microVM its own explicitly-named scratch-disk floor. Rationale is CLAUDE.md pre-1.0 doctrine — change the design rather than tape it. Do NOT keep the field aliased, defaulted, or read-both-and-prefer-whichever; one shape has to win and it is the one without the field.")
+//! @yah:next("THE MICROVM REPLACEMENT IS THE REAL WORK, not the deletion. microvm.rs:693 currently reads ephemeral_storage_mb as a scratch-disk FLOOR (disk_size_bytes at :1071), and WorkloadSpec::for_forge sets 512 MiB expecting exactly that. Give it a named annotation of its own so the floor is legible as a floor. Do not silently drop the behaviour along with the field — a build that fails at first checkout is the failure mode.")
+//! @yah:gotcha("THE WIRE BUMP IS NOW CERTAIN, not conditional — deleting a ResourceLimits field is a postcard wire change and therefore a ProtocolVersion bump (kamaji-proto/src/version.rs, V8 today). Coordinate with R885-F3 BEFORE bumping: if F3 also needs a new WorkloadState shape, both changes ride one V9 rather than a V9 and a V10. Whichever ticket moves first should say so in its handoff.")
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -431,6 +461,7 @@ use ts_rs::TS;
 pub mod admission;
 pub mod compose_import;
 pub mod control_plane_install;
+pub mod export_ts;
 pub mod rollout;
 pub mod secrets;
 pub mod sovereign;
@@ -1119,6 +1150,7 @@ impl ContainerBuild {
             },
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            files: Vec::new(),
         })
     }
 }
@@ -1867,6 +1899,7 @@ impl TenantPasswayWorkload {
             },
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         }
     }
 
@@ -2748,6 +2781,58 @@ pub struct WorkloadSpec {
     /// yubaba beyond `yah.forge=true` which suppresses the Never-restart guard.
     #[serde(default)]
     pub annotations: HashMap<String, String>,
+
+    /// Config files the node writes out **before** the workload starts, and
+    /// rewrites on every redeploy (R870-F23).
+    ///
+    /// The case this exists for is a workload whose configuration is *derived
+    /// from the control plane's own config* rather than baked into an image or
+    /// expressible as an env var: R870's inner door reads its mount table from
+    /// a JSON file (`PASSWAY_PATH_ROUTES_FILE`), because a mount carries an
+    /// upstream *set* and a header map and an env var would have to invent two
+    /// nesting levels inside one string.
+    ///
+    /// **Why this belongs to the spec and not to a separate materialization
+    /// step.** The file's content is a pure function of the same plan that
+    /// produced this spec, so it has to change at exactly the moment the spec
+    /// does. Carrying it here makes that true by construction: one deploy
+    /// writes the file and starts the process that reads it, and a redeploy
+    /// rewrites it and re-execs. A separate "write the config, then deploy"
+    /// step is two owners of one fact, and the seam between them is a door
+    /// serving a stale route table for however long the two are out of step —
+    /// the failure mode `CLAUDE.md`'s R858 entry is the standing example of.
+    ///
+    /// Not a secret channel: content is stored in the spec in the clear and
+    /// travels wherever the spec travels. Secrets go through
+    /// [`SecretMount`], which resolves by reference at the node.
+    ///
+    /// Appended last, `#[serde(default)]`, no `skip_serializing_if`: the
+    /// postcard codec is positional, so the field is always encoded and every
+    /// spec that predates it decodes to an empty vec — i.e. unchanged.
+    #[serde(default)]
+    pub files: Vec<InlineFile>,
+}
+
+/// One entry of [`WorkloadSpec::files`] — a file the node materializes from
+/// the spec itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct InlineFile {
+    /// Absolute path on the node (native backend) or inside the container.
+    /// Parent directories are created if absent.
+    pub path: PathBuf,
+
+    /// The file's exact bytes, as UTF-8. Written whole — never merged into
+    /// or appended to whatever was there before, so the file on disk is
+    /// always precisely what the spec says and a shrinking config cannot
+    /// leave a tail of the old one behind.
+    pub content: String,
+
+    /// Unix permission bits, e.g. `0o600`. `None` = the platform default for
+    /// a newly created file.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub mode: Option<u32>,
 }
 
 impl WorkloadSpec {
@@ -2849,6 +2934,7 @@ impl WorkloadSpec {
             },
             labels: HashMap::new(),
             annotations,
+            files: Vec::new(),
         }
     }
 

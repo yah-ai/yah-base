@@ -145,11 +145,36 @@ pub trait ObjectStore: Send + Sync {
     /// returned ETag is the comparand for the next [`Precondition::IfMatch`] in
     /// a CAS chain, so a single writer can advance a pointer without re-reading.
     ///
+    /// `cache_control` carries the same directive [`put_cached`](ObjectStore::put_cached)
+    /// takes, and `None` means "send no header" exactly as [`put`](ObjectStore::put)
+    /// does. It is a REQUIRED parameter rather than a second method (R330-B51).
+    ///
+    /// R703-B8 gave the unconditional path a cache directive and stopped there,
+    /// so for two releases every CAS-written object shipped directive-less **by
+    /// construction** — there was no way to ask for one. That is not a
+    /// theoretical gap: `yah/index.json`, rewritten at a fixed key on every
+    /// release and read by the /releases page, was served with no
+    /// `Cache-Control` at all while its sibling `yah/latest.json` correctly
+    /// answered `no-cache, max-age=0`, because the index goes through this
+    /// method and the pointer does not.
+    ///
+    /// Conditional writes target mutable pointers almost by definition — you
+    /// compare-and-swap a thing precisely because it changes — so the directive
+    /// belongs here more than anywhere. Anything at a fixed key that gets
+    /// rewritten wants [`CACHE_CONTROL_NO_CACHE`]; private state objects nobody
+    /// fetches over a CDN pass `None` and mean it.
+    ///
     /// The default impl returns [`Error::Backend`]: a backend that cannot offer
     /// an atomic conditional write must **not** silently emulate it with
     /// `get`-then-`put` — that would break the linearizability callers depend on
     /// (W243's cross-cell pointer fence). Backends that support it override this.
-    fn put_if(&self, _key: &str, _data: Vec<u8>, _cond: Precondition) -> Result<String, Error> {
+    fn put_if(
+        &self,
+        _key: &str,
+        _data: Vec<u8>,
+        _cond: Precondition,
+        _cache_control: Option<&str>,
+    ) -> Result<String, Error> {
         Err(Error::Backend(
             "conditional put (put_if) not supported by this backend".into(),
         ))
@@ -273,7 +298,13 @@ impl ObjectStore for InMemoryObjectStore {
         Ok(self.objects.lock().unwrap().get(key).map(|(_, e)| e.clone()))
     }
 
-    fn put_if(&self, key: &str, data: Vec<u8>, cond: Precondition) -> Result<String, Error> {
+    fn put_if(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        cond: Precondition,
+        cache_control: Option<&str>,
+    ) -> Result<String, Error> {
         // One lock across check-then-write = atomic CAS.
         let mut g = self.objects.lock().unwrap();
         match (&cond, g.get(key)) {
@@ -297,6 +328,21 @@ impl ObjectStore for InMemoryObjectStore {
         }
         let etag = etag_of(&data);
         g.insert(key.to_string(), (data, etag.clone()));
+        // Recorded the same way `put_cached` records it, so a test can assert the
+        // directive a conditional write WOULD have sent. Without this the whole
+        // class of bug R330-B51 fixes — "the header silently isn't sent" — stays
+        // untestable in-memory, which is how it went unnoticed for two releases.
+        // Mirrors `put`'s clearing semantics: `None` removes any prior entry
+        // rather than leaving a stale directive the real store would not send.
+        let mut cc = self.cache_control.lock().unwrap();
+        match cache_control {
+            Some(v) => {
+                cc.insert(key.to_string(), v.to_string());
+            }
+            None => {
+                cc.remove(key);
+            }
+        }
         Ok(etag)
     }
 }
@@ -432,16 +478,51 @@ mod tests {
         assert_eq!(e, Some(etag_of(b"v")));
     }
 
+    /// R330-B51: a conditional write records its directive the same way
+    /// `put_cached` does, so a consumer's test can assert what a CAS WOULD have
+    /// sent. Without this the in-memory store silently reports nothing, and the
+    /// exact failure this parameter exists to prevent — "the header is not on
+    /// the request" — stays invisible to every test that does not open a socket.
+    #[test]
+    fn put_if_records_the_cache_control_it_was_given() {
+        let s = InMemoryObjectStore::new();
+        s.put_if(
+            "yah/index.json",
+            b"{}".to_vec(),
+            Precondition::IfAbsent,
+            Some(CACHE_CONTROL_NO_CACHE),
+        )
+        .unwrap();
+        assert_eq!(
+            s.cache_control("yah/index.json").as_deref(),
+            Some(CACHE_CONTROL_NO_CACHE)
+        );
+    }
+
+    /// And `None` CLEARS rather than leaving the previous directive in place —
+    /// matching `put`. A stale recorded header would let a test pass on a
+    /// directive the real store had stopped sending, which is worse than no
+    /// recording at all.
+    #[test]
+    fn put_if_with_none_clears_a_previously_recorded_directive() {
+        let s = InMemoryObjectStore::new();
+        s.put_cached("k", b"v1".to_vec(), CACHE_CONTROL_NO_CACHE).unwrap();
+        let etag = s.etag("k").unwrap().unwrap();
+        s.put_if("k", b"v2".to_vec(), Precondition::IfMatch(etag), None)
+            .unwrap();
+        assert_eq!(s.cache_control("k"), None);
+    }
+
     #[test]
     fn put_if_absent_creates_then_refuses_overwrite() {
         let s = InMemoryObjectStore::new();
-        let e1 = s.put_if("p", b"gen1".to_vec(), Precondition::IfAbsent).unwrap();
+        let e1 = s.put_if("p", b"gen1".to_vec(), Precondition::IfAbsent, None).unwrap();
         assert_eq!(s.get("p").unwrap().as_deref(), Some(&b"gen1"[..]));
         assert_eq!(s.etag("p").unwrap().as_deref(), Some(e1.as_str()));
 
         // A second create-only write must lose — object already exists.
         let err = s
-            .put_if("p", b"gen2".to_vec(), Precondition::IfAbsent)
+            .put_if("p", b"gen2".to_vec(), Precondition::IfAbsent, None)
             .unwrap_err();
         assert!(matches!(err, Error::PreconditionFailed(_)), "got {err:?}");
         // Untouched.
@@ -453,23 +534,23 @@ mod tests {
         // Models the W243 global tenant→cell pointer: each generation bump is an
         // IfMatch CAS against the prior etag.
         let s = InMemoryObjectStore::new();
-        let e1 = s.put_if("ptr", b"cell=US,gen=1".to_vec(), Precondition::IfAbsent).unwrap();
+        let e1 = s.put_if("ptr", b"cell=US,gen=1".to_vec(), Precondition::IfAbsent, None).unwrap();
 
         let e2 = s
-            .put_if("ptr", b"cell=EU,gen=2".to_vec(), Precondition::IfMatch(e1.clone()))
+            .put_if("ptr", b"cell=EU,gen=2".to_vec(), Precondition::IfMatch(e1.clone()), None)
             .unwrap();
         assert_ne!(e1, e2);
         assert_eq!(s.get("ptr").unwrap().as_deref(), Some(&b"cell=EU,gen=2"[..]));
 
         // A stale comparand (e1) must now bounce.
         let err = s
-            .put_if("ptr", b"cell=US,gen=3".to_vec(), Precondition::IfMatch(e1))
+            .put_if("ptr", b"cell=US,gen=3".to_vec(), Precondition::IfMatch(e1), None)
             .unwrap_err();
         assert!(matches!(err, Error::PreconditionFailed(_)), "got {err:?}");
         assert_eq!(s.get("ptr").unwrap().as_deref(), Some(&b"cell=EU,gen=2"[..]));
 
         // The fresh comparand (e2) wins.
-        s.put_if("ptr", b"cell=US,gen=3".to_vec(), Precondition::IfMatch(e2)).unwrap();
+        s.put_if("ptr", b"cell=US,gen=3".to_vec(), Precondition::IfMatch(e2), None).unwrap();
         assert_eq!(s.get("ptr").unwrap().as_deref(), Some(&b"cell=US,gen=3"[..]));
     }
 
@@ -478,10 +559,10 @@ mod tests {
         // The cross-cell fence in miniature: source + target both read the same
         // pointer etag; exactly one IfMatch may succeed.
         let s = InMemoryObjectStore::new();
-        let shared = s.put_if("ptr", b"v0".to_vec(), Precondition::IfAbsent).unwrap();
+        let shared = s.put_if("ptr", b"v0".to_vec(), Precondition::IfAbsent, None).unwrap();
 
-        let a = s.put_if("ptr", b"from-A".to_vec(), Precondition::IfMatch(shared.clone()));
-        let b = s.put_if("ptr", b"from-B".to_vec(), Precondition::IfMatch(shared));
+        let a = s.put_if("ptr", b"from-A".to_vec(), Precondition::IfMatch(shared.clone()), None);
+        let b = s.put_if("ptr", b"from-B".to_vec(), Precondition::IfMatch(shared), None);
         assert!(a.is_ok(), "first writer should win: {a:?}");
         assert!(
             matches!(b, Err(Error::PreconditionFailed(_))),
@@ -494,7 +575,7 @@ mod tests {
     fn put_if_match_absent_key_fails() {
         let s = InMemoryObjectStore::new();
         let err = s
-            .put_if("nope", b"x".to_vec(), Precondition::IfMatch("\"whatever\"".into()))
+            .put_if("nope", b"x".to_vec(), Precondition::IfMatch("\"whatever\"".into()), None)
             .unwrap_err();
         assert!(matches!(err, Error::PreconditionFailed(_)), "got {err:?}");
         assert!(!s.contains_key("nope"));
@@ -523,7 +604,7 @@ mod tests {
     fn default_conditional_methods_report_unsupported() {
         let s = MinimalStore;
         assert!(matches!(
-            s.put_if("k", vec![], Precondition::IfAbsent),
+            s.put_if("k", vec![], Precondition::IfAbsent, None),
             Err(Error::Backend(_))
         ));
         assert!(matches!(s.etag("k"), Err(Error::Backend(_))));

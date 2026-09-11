@@ -85,6 +85,27 @@ const CERT_MOUNT_PATH: &str = "/run/secrets/tls.crt";
 /// Container path the shared private key is mounted at (mode `0o400`).
 const KEY_MOUNT_PATH: &str = "/run/secrets/tls.key";
 
+/// Container path the cheers issuer's Ed25519 **verify** key is mounted at
+/// (mode `0o400`), when [`PasswayIngressSpec::auth`] is set.
+///
+/// ⚠ RAW BYTES, EXACTLY 32, AND BOTH FAILURES ARE BOOT PANICS. passway's
+/// `build_auth` reads this file and does two things to it in a row, either of
+/// which kills the process before it serves a request:
+///
+/// 1. `bytes.as_slice().try_into()` into `[u8; 32]`, panicking with
+///    `"expected exactly 32 bytes, got {n}"` — so a hex/base64/PEM-encoded
+///    mount, or one with a trailing newline, dies here.
+/// 2. `PasetoV4PublicVerifier::from_public_key(&key).expect("valid Ed25519
+///    public key bytes")` — so 32 bytes of the *wrong* thing dies on the very
+///    next line.
+///
+/// Written down because it is exactly the constraint a later reader
+/// "simplifies" by storing the key as text: the cost is not a config error at
+/// deploy time, it is a door that never comes up, on the host whose whole
+/// reason for existing is that it is confidential. Both panics are at
+/// `oss/passway/crates/passway/src/main.rs:1139-1146`.
+const AUTH_KEY_MOUNT_PATH: &str = "/run/secrets/cheers-verify.key";
+
 /// pingora's per-instance pid file — the target for kamaji's graceful-upgrade
 /// `SIGQUIT`. Lives under a writable tmpfs the image provides.
 const PID_FILE: &str = "/run/passway/pingora.pid";
@@ -269,6 +290,65 @@ fn key_secret_name(domain: &str) -> String {
     format!("tls/{domain}/key")
 }
 
+/// Cheers bearer-auth configuration for a door (R556-F6).
+///
+/// **ONE `Option`, NOT FIVE, AND THAT IS THE POINT.** passway's `build_auth`
+/// keys the entire feature off a single variable: it returns `None` — *"every
+/// route stays anonymous in that case"* — the moment
+/// `PASSWAY_AUTH_PUBLIC_KEY_FILE` is unset, and only `.expect()`s KID / ISS /
+/// AUD once the key file **is** set. So the two half-configured spellings fail
+/// in opposite directions:
+///
+/// - key file set, kid missing → a loud boot panic naming the variable. Fine.
+/// - key file **unset**, kid/iss/aud set → a **silently anonymous door**, with
+///   nothing anywhere complaining, on a host whose whole purpose is that it is
+///   operator-confidential.
+///
+/// The second is the worst outcome in this feature, so it is made
+/// unrepresentable rather than merely refused: there is no way to spell four of
+/// these five and not the fifth. (Same move R870-F23 made with `DeployTier`.)
+///
+/// **Auth belongs on the OUTER door.** If a service ever runs an inner door
+/// too, it does not get one of these: the outer door is the trust boundary and
+/// terminates TLS, while the inner one is cleartext on loopback *behind* it, so
+/// a per-process `CheersAuth` there would re-verify a token on a hop that has
+/// already passed the boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PasswayAuth {
+    /// Cluster-secret key holding the issuer's **32 raw bytes** of Ed25519
+    /// public key — e.g. `"cheers/yah-camp/verify"`. Delivered as a
+    /// Cluster→File `SecretMount` at [`AUTH_KEY_MOUNT_PATH`], the same channel
+    /// and the same mode the cert/key pair already ride.
+    ///
+    /// A `SecretMount` rather than `WorkloadSpec::files` because this is key
+    /// material and `files` stores its content **in the clear in the spec** —
+    /// its own doc says so. The reverse split holds too: a generated, non-
+    /// secret routing table has no business in the secret store.
+    pub key_secret: String,
+
+    /// `PASSWAY_AUTH_KID` — the issuer key id. `yah cloud cheers show`.
+    pub kid: String,
+
+    /// `PASSWAY_AUTH_ISS` — the expected token issuer. `yah cloud cheers show`.
+    pub iss: String,
+
+    /// `PASSWAY_AUTH_AUD` — the expected audience. Must match what
+    /// `yah cloud cheers token` mints for the service this door fronts.
+    pub aud: String,
+
+    /// Path prefixes that REQUIRE a bearer, rendered **comma-joined** into the
+    /// single `PASSWAY_AUTH_REQUIRED_PREFIXES` variable — passway splits that
+    /// one value on `,` (main.rs:1152), so repeated flags join here rather
+    /// than emitting the variable twice.
+    ///
+    /// It is an allowlist of prefixes that require auth, with no exclusion
+    /// form, so `"/"` is the only value that covers a whole surface. Empty is
+    /// rejected by [`PasswayIngressSpec::validate`]: a door carrying a verify
+    /// key that protects no prefix is auth-configured and anonymous at once,
+    /// which is the same failure class this type exists to make unspellable.
+    pub require_prefixes: Vec<String>,
+}
+
 /// Caller-supplied passway ingress bring-up parameters. The `yah cloud ingress`
 /// deploy verb builds this from flags/component config, then lowers it to the
 /// yubaba workload payload via [`Self::into_container_workload`].
@@ -357,6 +437,23 @@ pub struct PasswayIngressSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_sni: Option<HostScoped<String>>,
 
+    /// R556-F6: require a cheers bearer on this door. `None` — the shape every
+    /// door in the tree carried until now — is a fully anonymous door.
+    ///
+    /// WHY A DOOR-LEVEL FIELD AND NOT A PER-HOSTNAME ONE, which is the first
+    /// thing a reader will want: passway's `build_auth` constructs ONE
+    /// `CheersAuth` and ONE `RouteAuthPolicy` per **process** and applies them
+    /// to every hostname that process fronts. There is no host dimension;
+    /// `RouteAuthPolicy::allow_anonymous` carves out sub-*paths*, not hosts.
+    /// So "authenticated" is a property of a door, and a confidential service
+    /// sharing a door with a public one cannot be protected — it needs a door
+    /// of its own. That is not an implementation gap to route around here: it
+    /// is why analytics.yah.dev gets a per-tenant door rather than riding
+    /// us-east-001's `*.yah.dev` one, whose REQUIRED_PREFIXES="/" would have
+    /// demanded a bearer for yah.dev itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<PasswayAuth>,
+
     /// Override the passway binary invocation. Defaults to
     /// `["/usr/local/bin/passway"]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -392,6 +489,46 @@ impl PasswayIngressSpec {
                         ));
                     }
                 }
+            }
+        }
+        if let Some(auth) = &self.auth {
+            // Each of these reaches passway as a variable it `.expect()`s, so an
+            // empty one is a boot panic on a remote node. Same argument the
+            // function header makes for the host-scoped keys: turn it into a
+            // message in the terminal of whoever typed the flag.
+            for (field, value) in [
+                ("--auth-key-secret", &auth.key_secret),
+                ("--auth-kid", &auth.kid),
+                ("--auth-iss", &auth.iss),
+                ("--auth-aud", &auth.aud),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(format!("{field} is empty; passway panics at boot without it"));
+                }
+            }
+            // A verify key that protects no prefix is auth-configured and
+            // anonymous at the same time — the failure class `PasswayAuth`
+            // exists to make unspellable, arriving through the one field that
+            // can still express it.
+            if auth.require_prefixes.iter().all(|p| p.trim().is_empty()) {
+                return Err(
+                    "--require-auth names no prefix; a door with a verify key that protects \
+                     nothing is authenticated and anonymous at once (pass `/` for the whole \
+                     surface — the policy is an allowlist of prefixes REQUIRING auth, with no \
+                     exclusion form)"
+                        .to_string(),
+                );
+            }
+            // PASSWAY_AUTH_REQUIRED_PREFIXES is ONE variable split on `,`, so a
+            // comma inside a prefix silently becomes two prefixes — one of them
+            // a path nobody meant to protect and, worse, the other a path
+            // nobody meant to leave open.
+            if let Some(bad) = auth.require_prefixes.iter().find(|p| p.contains(',')) {
+                return Err(format!(
+                    "--require-auth prefix {bad:?} contains a comma; \
+                     PASSWAY_AUTH_REQUIRED_PREFIXES is comma-separated, so this would silently \
+                     split into two different prefixes"
+                ));
             }
         }
         Ok(())
@@ -463,10 +600,37 @@ impl PasswayIngressSpec {
             }
         }
 
-        let secrets = vec![
+        // R556-F6. Emitted as a block, never piecemeal: the key-file variable
+        // is what switches the whole feature on inside passway, so a partial
+        // render is the silently-anonymous door `PasswayAuth` exists to
+        // prevent. `Option<PasswayAuth>` is what makes that structural — there
+        // is no partial value to render.
+        if let Some(auth) = &self.auth {
+            env.push(literal_env(
+                "PASSWAY_AUTH_PUBLIC_KEY_FILE",
+                AUTH_KEY_MOUNT_PATH.into(),
+            ));
+            env.push(literal_env("PASSWAY_AUTH_KID", auth.kid.clone()));
+            env.push(literal_env("PASSWAY_AUTH_ISS", auth.iss.clone()));
+            env.push(literal_env("PASSWAY_AUTH_AUD", auth.aud.clone()));
+            // ONE variable, comma-joined — passway splits this value on `,`
+            // rather than reading a repeated variable.
+            env.push(literal_env(
+                "PASSWAY_AUTH_REQUIRED_PREFIXES",
+                auth.require_prefixes.join(","),
+            ));
+        }
+
+        let mut secrets = vec![
             cluster_file_secret(cert_secret_name(&self.domain), CERT_MOUNT_PATH),
             cluster_file_secret(key_secret_name(&self.domain), KEY_MOUNT_PATH),
         ];
+        if let Some(auth) = &self.auth {
+            secrets.push(cluster_file_secret(
+                auth.key_secret.clone(),
+                AUTH_KEY_MOUNT_PATH,
+            ));
+        }
 
         let mut annotations = HashMap::new();
         // Bind the public :443 on the host — guarded escape hatch, infra-only.
@@ -537,6 +701,7 @@ impl PasswayIngressSpec {
             },
             labels: HashMap::new(),
             annotations,
+            files: Vec::new(),
         };
 
         Workload::container(spec)
@@ -582,8 +747,23 @@ mod tests {
             upstream_sni: None,
             discover_from: None,
             discover_ident: None,
+            auth: None,
             command: None,
         }
+    }
+
+    /// The R556-F6 shape: a per-tenant door fronting one confidential service,
+    /// with cheers auth over its whole surface.
+    fn authed_spec() -> PasswayIngressSpec {
+        let mut s = sample_spec();
+        s.auth = Some(PasswayAuth {
+            key_secret: "cheers/yah-camp/verify".into(),
+            kid: "YOHV4Riq-g8fX4uYl8rTjQ".into(),
+            iss: "yah-camp".into(),
+            aud: "yah-analytics".into(),
+            require_prefixes: vec!["/".into()],
+        });
+        s
     }
 
     /// A discovery-mode spec with the coordinator pinned the way the deploy
@@ -921,5 +1101,163 @@ mod tests {
             fanned.upstream_sni.as_ref().unwrap().render(String::clone),
             "cloud.mesh.yah.dev=cloud.mesh.yah.dev"
         );
+    }
+
+    // ── R556-F6: cheers auth on a door ──────────────────────────────────────
+
+    #[test]
+    fn a_door_is_anonymous_unless_auth_is_declared() {
+        // The shape every door in the tree carried before R556-F6, asserted so
+        // that adding auth cannot silently arm it on the public apex.
+        let spec = lower(&sample_spec());
+        for name in [
+            "PASSWAY_AUTH_PUBLIC_KEY_FILE",
+            "PASSWAY_AUTH_KID",
+            "PASSWAY_AUTH_ISS",
+            "PASSWAY_AUTH_AUD",
+            "PASSWAY_AUTH_REQUIRED_PREFIXES",
+        ] {
+            assert_eq!(env_val(&spec, name), None, "{name} leaked onto an unauthed door");
+        }
+        assert!(
+            !spec.secrets.iter().any(|s| matches!(
+                &s.target,
+                SecretTarget::File { path, .. } if path.as_os_str() == AUTH_KEY_MOUNT_PATH
+            )),
+            "an unauthed door mounted a verify key"
+        );
+    }
+
+    #[test]
+    fn auth_renders_all_five_variables_and_mounts_the_key() {
+        let spec = lower(&authed_spec());
+        // The key file variable names the MOUNT PATH, never the secret key —
+        // passway reads a file, and the cluster-secret name is resolved
+        // node-side by the SecretMount below.
+        assert_eq!(
+            env_val(&spec, "PASSWAY_AUTH_PUBLIC_KEY_FILE"),
+            Some(AUTH_KEY_MOUNT_PATH)
+        );
+        assert_eq!(env_val(&spec, "PASSWAY_AUTH_KID"), Some("YOHV4Riq-g8fX4uYl8rTjQ"));
+        assert_eq!(env_val(&spec, "PASSWAY_AUTH_ISS"), Some("yah-camp"));
+        assert_eq!(env_val(&spec, "PASSWAY_AUTH_AUD"), Some("yah-analytics"));
+        assert_eq!(env_val(&spec, "PASSWAY_AUTH_REQUIRED_PREFIXES"), Some("/"));
+
+        // Cluster→File at 0o400, the same channel and mode the cert/key pair
+        // ride — key material never goes through `WorkloadSpec::files`, which
+        // stores content in the clear in the spec.
+        let mount = spec
+            .secrets
+            .iter()
+            .find(|s| matches!(
+                &s.target,
+                SecretTarget::File { path, .. } if path.as_os_str() == AUTH_KEY_MOUNT_PATH
+            ))
+            .expect("verify key was not mounted");
+        assert!(
+            matches!(&mount.source, SecretRef::Cluster { name } if name == "cheers/yah-camp/verify"),
+            "verify key must come from the cluster store, got {:?}",
+            mount.source
+        );
+        assert!(
+            matches!(&mount.target, SecretTarget::File { mode, .. } if *mode == 0o400),
+            "verify key mount must be 0o400 like the cert/key pair"
+        );
+        // The cert/key pair is still there — auth adds a mount, never replaces.
+        assert_eq!(spec.secrets.len(), 3);
+    }
+
+    #[test]
+    fn required_prefixes_is_one_comma_joined_variable() {
+        // passway splits PASSWAY_AUTH_REQUIRED_PREFIXES on `,` (main.rs:1152)
+        // rather than reading a repeated variable, so several `--require-auth`
+        // flags must join here. Emitting the variable twice would leave passway
+        // seeing whichever the runtime kept.
+        let mut s = authed_spec();
+        s.auth.as_mut().unwrap().require_prefixes =
+            vec!["/api".into(), "/admin".into()];
+        let spec = lower(&s);
+        assert_eq!(
+            env_val(&spec, "PASSWAY_AUTH_REQUIRED_PREFIXES"),
+            Some("/api,/admin")
+        );
+        assert_eq!(
+            spec.env
+                .iter()
+                .filter(|e| e.name == "PASSWAY_AUTH_REQUIRED_PREFIXES")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn half_configured_auth_has_no_spelling() {
+        // The whole reason `auth` is ONE Option rather than five. passway's
+        // build_auth keys the feature off PASSWAY_AUTH_PUBLIC_KEY_FILE alone
+        // and returns None — every route anonymous — when it is unset, while
+        // .expect()-ing kid/iss/aud only once it IS set. Five independent
+        // fields would let a caller spell kid+iss+aud with no key and get a
+        // silently anonymous door on a confidential host; this asserts the
+        // rendering is all-or-nothing, which `Option<PasswayAuth>` makes
+        // structural rather than merely tested.
+        let anon = lower(&sample_spec());
+        let authed = lower(&authed_spec());
+        let count = |s: &WorkloadSpec| {
+            s.env.iter().filter(|e| e.name.starts_with("PASSWAY_AUTH_")).count()
+        };
+        assert_eq!(count(&anon), 0);
+        assert_eq!(count(&authed), 5);
+    }
+
+    #[test]
+    fn validate_refuses_the_shapes_that_would_panic_or_go_quiet() {
+        assert!(authed_spec().validate().is_ok());
+
+        // Each of these reaches passway as a variable it .expect()s.
+        for blank in ["key_secret", "kid", "iss", "aud"] {
+            let mut s = authed_spec();
+            let a = s.auth.as_mut().unwrap();
+            match blank {
+                "key_secret" => a.key_secret = "  ".into(),
+                "kid" => a.kid = String::new(),
+                "iss" => a.iss = String::new(),
+                _ => a.aud = String::new(),
+            }
+            assert!(s.validate().is_err(), "{blank} blank was accepted");
+        }
+
+        // Auth-configured and anonymous at once — the failure class the type
+        // exists to prevent, arriving through the one field that can still
+        // express it.
+        let mut none = authed_spec();
+        none.auth.as_mut().unwrap().require_prefixes = vec![];
+        assert!(none.validate().is_err());
+        let mut blank = authed_spec();
+        blank.auth.as_mut().unwrap().require_prefixes = vec!["  ".into()];
+        assert!(blank.validate().is_err());
+
+        // A comma inside a prefix silently becomes two prefixes — one nobody
+        // meant to protect, one nobody meant to leave open.
+        let mut comma = authed_spec();
+        comma.auth.as_mut().unwrap().require_prefixes = vec!["/a,/b".into()];
+        let err = comma.validate().unwrap_err();
+        assert!(err.contains("comma-separated"), "{err}");
+    }
+
+    #[test]
+    fn auth_survives_a_serde_round_trip_and_defaults_to_absent() {
+        // The spec is persisted, so an older record with no `auth` key must
+        // deserialize as an anonymous door rather than failing.
+        let legacy: PasswayIngressSpec =
+            serde_json::from_str(r#"{ "domain": "yah.dev" }"#).unwrap();
+        assert!(legacy.auth.is_none());
+
+        let round: PasswayIngressSpec =
+            serde_json::from_str(&serde_json::to_string(&authed_spec()).unwrap()).unwrap();
+        assert_eq!(round.auth, authed_spec().auth);
+
+        // ...and an anonymous door does not persist a null `auth` key.
+        let json = serde_json::to_string(&sample_spec()).unwrap();
+        assert!(!json.contains("auth"), "{json}");
     }
 }

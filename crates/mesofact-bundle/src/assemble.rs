@@ -371,6 +371,18 @@ pub fn assemble_bundle_from_files(
 /// `include_config` is true, `mesofact.routes.ts`, `mesofact.config.toml`, and
 /// declared `data_inputs` are included — this should be true for the primary
 /// component and false for mounted components in a service bundle (R870-B11).
+///
+/// A mounted component stages **inside the served root**, at
+/// `app/dist/html/<mount>/`, not beside it at `app/dist/<mount>/`. The served
+/// root is a server-side constant, not a build-output coincidence:
+/// `Server::from_bundle` points `from_workload` at `<bundle>/app`, and
+/// `from_workload` roots static serving at `<workload>/dist/html`. So a file
+/// staged at `app/dist/html/app/index.html` is reachable at `/app/index.html`
+/// and one staged at `app/dist/app/index.html` is reachable at no URL at all
+/// — which is how R870-B11 shipped a merged bundle whose mounted half 404'd
+/// on every path. The unmounted primary needs no `html/` here because its own
+/// `out_dir` already contains one: a mesofact-spa/static build emits
+/// `dist/html/**`, and that tree lands under `app/dist/`.
 pub fn collect_component_files(
     project_root: &Path,
     out_dir: &Path,
@@ -378,7 +390,7 @@ pub fn collect_component_files(
     include_config: bool,
 ) -> Result<Vec<BundleFile>, BundleError> {
     let dist_prefix = match mount {
-        Some(m) if !m.is_empty() => format!("app/dist/{m}"),
+        Some(m) if !m.is_empty() => format!("app/dist/html/{m}"),
         _ => "app/dist".to_string(),
     };
     let mut files = collect_dir(&dist_prefix, out_dir)?;
@@ -500,6 +512,52 @@ mod tests {
                 "app/dist/assets/nested/x.css",
                 "app/dist/index.html",
             ]
+        );
+    }
+
+    /// R870-B11: a mounted component must land *under* the served root, not
+    /// beside it. The oracle here is deliberately not this function's own path
+    /// construction — it is `Server::from_workload`'s `<workload>/dist/html`,
+    /// restated as the literal prefix a URL-reachable file has to carry.
+    #[test]
+    fn a_mounted_component_stages_inside_the_served_root() {
+        const SERVED_ROOT: &str = "app/dist/html/";
+
+        let dir = TempDir::new().unwrap();
+        write(&dir.path().join("index.html"), b"<app>");
+        write(&dir.path().join("app-abc123_bg.wasm"), b"\0asm");
+
+        let files =
+            collect_component_files(dir.path(), dir.path(), Some("app"), false).unwrap();
+        let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "app/dist/html/app/app-abc123_bg.wasm",
+                "app/dist/html/app/index.html",
+            ]
+        );
+        for (path, _) in &files {
+            assert!(
+                path.starts_with(SERVED_ROOT),
+                "{path} is staged outside the served root {SERVED_ROOT} — unreachable by any URL"
+            );
+        }
+    }
+
+    /// The unmounted primary carries no extra `html/`: its own build output
+    /// already contains one, so the served root comes from the tree it stages.
+    #[test]
+    fn an_unmounted_component_stages_its_own_html_tree_at_the_dist_root() {
+        let dir = TempDir::new().unwrap();
+        write(&dir.path().join("html/index.html"), b"<html>");
+        write(&dir.path().join("html/market.html"), b"<html>");
+
+        let files = collect_component_files(dir.path(), dir.path(), None, false).unwrap();
+        let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["app/dist/html/index.html", "app/dist/html/market.html"]
         );
     }
 
