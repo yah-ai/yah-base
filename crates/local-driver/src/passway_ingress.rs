@@ -63,8 +63,7 @@ use std::net::Ipv4Addr;
 use serde::{Deserialize, Serialize};
 use workload_spec::{
     EnvValue, EnvVar, ExposeSpec, HealthProbe, Healthcheck, ImageRef, LifecycleArchetype,
-    MeshExpose, MeshIdent, Millis, NamespaceId, ResourceLimits, RestartPolicy, SchemaVersion,
-    SecretMount, SecretRef, SecretTarget, StopPolicy, TenantId, TierTag, VolumeMount, Workload,
+    MeshExpose, MeshIdent, Millis, NamespaceId, ResourceLimits, RestartPolicy,     SecretMount, SecretRef, SecretTarget, StopPolicy, TenantId, TierTag, VolumeMount, Workload,
     WorkloadSpec, HOST_NETWORK_ANNOTATION, HOST_NETWORK_VALUE, PUBLIC_IP_TAINT,
     REQUIRES_TAINT_ANNOTATION,
 };
@@ -105,6 +104,18 @@ const KEY_MOUNT_PATH: &str = "/run/secrets/tls.key";
 /// reason for existing is that it is confidential. Both panics are at
 /// `oss/passway/crates/passway/src/main.rs:1139-1146`.
 const AUTH_KEY_MOUNT_PATH: &str = "/run/secrets/cheers-verify.key";
+
+/// The variable that switches passway's bearer auth on — set iff [`PasswayAuth`]
+/// is present, and the one thing `build_auth` keys the whole feature off.
+///
+/// Public because it is also how a reader of a *deployed* door tells an
+/// authenticated one from an anonymous one: the door's `PasswayIngressSpec` is
+/// not persisted anywhere, so the rendered env is the only evidence that
+/// survives the deploy. R870-B24's read-back guard reads exactly this name out
+/// of the live workload, and it is exported rather than re-spelled there so the
+/// renderer and the guard cannot drift apart — a guard looking for a variable
+/// this file no longer emits would pass every push, silently.
+pub const AUTH_KEY_FILE_VAR: &str = "PASSWAY_AUTH_PUBLIC_KEY_FILE";
 
 /// pingora's per-instance pid file — the target for kamaji's graceful-upgrade
 /// `SIGQUIT`. Lives under a writable tmpfs the image provides.
@@ -290,6 +301,46 @@ fn key_secret_name(domain: &str) -> String {
     format!("tls/{domain}/key")
 }
 
+/// Which vocabulary the operator used to spell [`PasswayAuth`] — the only
+/// thing it changes is the *wording* of a refusal (R870-F26).
+///
+/// There are two ways in now: `yah cloud ingress deploy --auth-*` flags, and a
+/// mirror's `[[ingress]]` → `[ingress.auth]` table. One validation
+/// implementation serves both — that is the point of the enum — but a message
+/// that names a flag to someone who typed a TOML key sends them looking in the
+/// wrong file, which is the same class of misdirection the B24 gotcha was
+/// filed about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthSpelling {
+    /// `yah cloud ingress deploy … --auth-key-secret …`.
+    Flags,
+    /// A mirror's `[ingress.auth]` table under an `[[ingress]]` edge.
+    MirrorTable,
+}
+
+impl AuthSpelling {
+    /// The five settings named as the operator wrote them, in
+    /// `key_secret, kid, iss, aud, require_prefixes` order.
+    const fn names(self) -> [&'static str; 5] {
+        match self {
+            Self::Flags => [
+                "--auth-key-secret",
+                "--auth-kid",
+                "--auth-iss",
+                "--auth-aud",
+                "--require-auth",
+            ],
+            Self::MirrorTable => [
+                "[ingress.auth].key_secret",
+                "[ingress.auth].kid",
+                "[ingress.auth].iss",
+                "[ingress.auth].aud",
+                "[ingress.auth].require_prefixes",
+            ],
+        }
+    }
+}
+
 /// Cheers bearer-auth configuration for a door (R556-F6).
 ///
 /// **ONE `Option`, NOT FIVE, AND THAT IS THE POINT.** passway's `build_auth`
@@ -308,12 +359,23 @@ fn key_secret_name(domain: &str) -> String {
 /// unrepresentable rather than merely refused: there is no way to spell four of
 /// these five and not the fifth. (Same move R870-F23 made with `DeployTier`.)
 ///
+/// **Two spellings, one type (R870-F26).** `yah cloud ingress deploy
+/// --auth-*` builds one of these from flags; a mirror's `[[ingress]]` edge
+/// embeds one verbatim as `[ingress.auth]`, which is what lets `yah cloud
+/// apply` push an authenticated door instead of replacing it with an anonymous
+/// one. There is deliberately no config-side copy of these five fields: a
+/// parallel struct would be free to drift from the renderer below, and the
+/// failure that drift produces is a door that reports success and is
+/// unprotected. [`Self::validate`] is likewise the single implementation,
+/// parameterised only by which vocabulary a message should name.
+///
 /// **Auth belongs on the OUTER door.** If a service ever runs an inner door
 /// too, it does not get one of these: the outer door is the trust boundary and
 /// terminates TLS, while the inner one is cleartext on loopback *behind* it, so
 /// a per-process `CheersAuth` there would re-verify a token on a hop that has
 /// already passed the boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct PasswayAuth {
     /// Cluster-secret key holding the issuer's **32 raw bytes** of Ed25519
     /// public key — e.g. `"cheers/yah-camp/verify"`. Delivered as a
@@ -347,6 +409,59 @@ pub struct PasswayAuth {
     /// key that protects no prefix is auth-configured and anonymous at once,
     /// which is the same failure class this type exists to make unspellable.
     pub require_prefixes: Vec<String>,
+}
+
+impl PasswayAuth {
+    /// Refuse the four spellings that reach passway as a boot panic or, worse,
+    /// as a door that is auth-configured and anonymous at once.
+    ///
+    /// Lives here rather than inside [`PasswayIngressSpec::validate`] because
+    /// there are now two ways to author these five settings — CLI flags and a
+    /// mirror's `[ingress.auth]` table (R870-F26) — and a second copy of these
+    /// rules on the config side would be free to drift from the renderer three
+    /// lines below it. `spelling` only picks the vocabulary the message names.
+    ///
+    /// Note what is NOT checked here: a missing field. All five are required by
+    /// `Deserialize`, so a half-written table is refused by serde naming the
+    /// field, and a half-written flag set by clap's `requires_all`. This covers
+    /// what those two cannot — a field that is *present* and empty.
+    pub fn validate(&self, spelling: AuthSpelling) -> Result<(), String> {
+        let [key_secret, kid, iss, aud, require] = spelling.names();
+        // Each of these reaches passway as a variable it `.expect()`s, so an
+        // empty one is a boot panic on a remote node. Turn it into a message in
+        // the terminal of whoever typed it.
+        for (field, value) in [
+            (key_secret, &self.key_secret),
+            (kid, &self.kid),
+            (iss, &self.iss),
+            (aud, &self.aud),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("{field} is empty; passway panics at boot without it"));
+            }
+        }
+        // A verify key that protects no prefix is auth-configured and anonymous
+        // at the same time — the failure class `PasswayAuth` exists to make
+        // unspellable, arriving through the one field that can still express it.
+        if self.require_prefixes.iter().all(|p| p.trim().is_empty()) {
+            return Err(format!(
+                "{require} names no prefix; a door with a verify key that protects nothing is \
+                 authenticated and anonymous at once (name `/` for the whole surface — the \
+                 policy is an allowlist of prefixes REQUIRING auth, with no exclusion form)"
+            ));
+        }
+        // PASSWAY_AUTH_REQUIRED_PREFIXES is ONE variable split on `,`, so a
+        // comma inside a prefix silently becomes two prefixes — one of them a
+        // path nobody meant to protect and, worse, the other a path nobody
+        // meant to leave open.
+        if let Some(bad) = self.require_prefixes.iter().find(|p| p.contains(',')) {
+            return Err(format!(
+                "{require} prefix {bad:?} contains a comma; PASSWAY_AUTH_REQUIRED_PREFIXES is \
+                 comma-separated, so this would silently split into two different prefixes"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Caller-supplied passway ingress bring-up parameters. The `yah cloud ingress`
@@ -492,44 +607,14 @@ impl PasswayIngressSpec {
             }
         }
         if let Some(auth) = &self.auth {
-            // Each of these reaches passway as a variable it `.expect()`s, so an
-            // empty one is a boot panic on a remote node. Same argument the
-            // function header makes for the host-scoped keys: turn it into a
-            // message in the terminal of whoever typed the flag.
-            for (field, value) in [
-                ("--auth-key-secret", &auth.key_secret),
-                ("--auth-kid", &auth.kid),
-                ("--auth-iss", &auth.iss),
-                ("--auth-aud", &auth.aud),
-            ] {
-                if value.trim().is_empty() {
-                    return Err(format!("{field} is empty; passway panics at boot without it"));
-                }
-            }
-            // A verify key that protects no prefix is auth-configured and
-            // anonymous at the same time — the failure class `PasswayAuth`
-            // exists to make unspellable, arriving through the one field that
-            // can still express it.
-            if auth.require_prefixes.iter().all(|p| p.trim().is_empty()) {
-                return Err(
-                    "--require-auth names no prefix; a door with a verify key that protects \
-                     nothing is authenticated and anonymous at once (pass `/` for the whole \
-                     surface — the policy is an allowlist of prefixes REQUIRING auth, with no \
-                     exclusion form)"
-                        .to_string(),
-                );
-            }
-            // PASSWAY_AUTH_REQUIRED_PREFIXES is ONE variable split on `,`, so a
-            // comma inside a prefix silently becomes two prefixes — one of them
-            // a path nobody meant to protect and, worse, the other a path
-            // nobody meant to leave open.
-            if let Some(bad) = auth.require_prefixes.iter().find(|p| p.contains(',')) {
-                return Err(format!(
-                    "--require-auth prefix {bad:?} contains a comma; \
-                     PASSWAY_AUTH_REQUIRED_PREFIXES is comma-separated, so this would silently \
-                     split into two different prefixes"
-                ));
-            }
+            // Same argument the function header makes for the host-scoped keys,
+            // delegated to the type that owns those five settings so the mirror
+            // `[ingress.auth]` path (R870-F26) enforces the identical rules.
+            // A spec reaching here was authored one of two ways and both have
+            // already had their own spelling named at load/parse time; `Flags`
+            // is the one this function's callers can still be the FIRST to
+            // report on (`yah cloud ingress deploy`).
+            auth.validate(AuthSpelling::Flags)?;
         }
         Ok(())
     }
@@ -606,10 +691,7 @@ impl PasswayIngressSpec {
         // prevent. `Option<PasswayAuth>` is what makes that structural — there
         // is no partial value to render.
         if let Some(auth) = &self.auth {
-            env.push(literal_env(
-                "PASSWAY_AUTH_PUBLIC_KEY_FILE",
-                AUTH_KEY_MOUNT_PATH.into(),
-            ));
+            env.push(literal_env(AUTH_KEY_FILE_VAR, AUTH_KEY_MOUNT_PATH.into()));
             env.push(literal_env("PASSWAY_AUTH_KID", auth.kid.clone()));
             env.push(literal_env("PASSWAY_AUTH_ISS", auth.iss.clone()));
             env.push(literal_env("PASSWAY_AUTH_AUD", auth.aud.clone()));
@@ -647,7 +729,6 @@ impl PasswayIngressSpec {
         let grace = Millis::from_secs(5);
 
         let spec = WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: INGRESS_WORKLOAD_NAME.into(),
             image,
             tier: TierTag("infra".into()),
@@ -668,7 +749,10 @@ impl PasswayIngressSpec {
             resources: ResourceLimits {
                 memory_mb: 256,
                 cpu_millis: 512,
-                ephemeral_storage_mb: 256,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -700,6 +784,7 @@ impl PasswayIngressSpec {
                 operator: None,
             },
             labels: HashMap::new(),
+            durability: None,
             annotations,
             files: Vec::new(),
         };

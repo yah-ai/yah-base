@@ -30,7 +30,7 @@ use thiserror::Error;
 
 use crate::{
     EnvValue, EnvVar, ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, NamespaceId,
-    RestartPolicy, ResourceLimits, SchemaVersion, StopPolicy, TenantId, TierTag, VolumeMount,
+    RestartPolicy, ResourceLimits, StopPolicy, TenantId, TierTag, VolumeMount,
     VolumeSource, WorkloadSpec,
 };
 
@@ -249,7 +249,6 @@ fn translate_service(
     let workdir = svc.working_dir.as_ref().map(PathBuf::from);
 
     let spec = WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: mesh_name.clone(),
         image,
         tier: TierTag(tier_str.into()),
@@ -266,7 +265,10 @@ fn translate_service(
         resources: ResourceLimits {
             memory_mb: 256,
             cpu_millis: 512,
-            ephemeral_storage_mb: 512,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on,
         // compose has no locality/supply concept, so an import can only ever
@@ -292,6 +294,7 @@ fn translate_service(
             operator: None,
         },
         labels: HashMap::new(),
+        durability: None,
         annotations: HashMap::new(),
         files: Vec::new(),
     };
@@ -524,6 +527,7 @@ fn translate_volumes(
             source,
             target,
             read_only,
+            from_secret_mount: false,
         });
     }
     (out, has_bind)

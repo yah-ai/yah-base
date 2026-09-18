@@ -337,6 +337,21 @@ pub struct S3PutOptions<'a> {
     /// keys want [`CACHE_CONTROL_IMMUTABLE`]; fixed-key pointers want
     /// [`CACHE_CONTROL_NO_CACHE`].
     pub cache_control: Option<&'a str>,
+    /// `Content-Disposition` — what a browser saves the object AS, independent
+    /// of the key it lives at.
+    ///
+    /// This is the header that makes a content-addressed key downloadable by a
+    /// human. A blob published at `images/<blake3>` (xlb addresses by hash and
+    /// its `cdn_fallback` template can substitute nothing else) otherwise lands
+    /// in a Downloads folder named `f42a9455a50a…` with no extension, because a
+    /// browser names a download from the URL's last path segment. Stored on the
+    /// object, R2 replays it on every GET — so the CDN Worker in front needs no
+    /// rule, no manifest lookup and no reverse proxy to serve a correct
+    /// filename, and the key stays exactly what the hash says it is.
+    ///
+    /// Compose it with `yah_object_store::attachment_filename` rather than by
+    /// hand: the quoting and the rejected characters are that function's job.
+    pub content_disposition: Option<&'a str>,
 }
 
 /// `Cache-Control` for immutable, versioned, content-addressed objects.
@@ -383,6 +398,7 @@ pub fn sign_s3_put_object(
             content_type,
             blake3_meta,
             cache_control: None,
+            content_disposition: None,
         },
     )
 }
@@ -401,6 +417,7 @@ pub fn sign_s3_put_object_with(
         content_type,
         blake3_meta,
         cache_control,
+        content_disposition,
     } = *opts;
     let now = chrono::Utc::now();
     let date = now.format("%Y%m%d").to_string();
@@ -417,9 +434,15 @@ pub fn sign_s3_put_object_with(
     // literals — the previous pair of literals was already one optional header
     // away from being wrong, and `cache-control` is the awkward case: it sorts
     // BEFORE `content-length`, so it prepends where `x-amz-meta-blake3` appends.
-    let mut signed: Vec<(&str, String)> = Vec::with_capacity(7);
+    let mut signed: Vec<(&str, String)> = Vec::with_capacity(8);
     if let Some(cc) = cache_control {
         signed.push(("cache-control", cc.to_string()));
+    }
+    // Sorts between the two above: `content-d…` < `content-l…`. The debug_assert
+    // below is what actually holds that, so a future header goes in wherever it
+    // belongs rather than wherever it reads nicely.
+    if let Some(cd) = content_disposition {
+        signed.push(("content-disposition", cd.to_string()));
     }
     signed.push(("content-length", content_length.to_string()));
     signed.push(("content-type", content_type.to_string()));
@@ -484,6 +507,9 @@ pub fn sign_s3_put_object_with(
     headers.insert("content-type", content_type.parse()?);
     if let Some(cc) = cache_control {
         headers.insert("cache-control", cc.parse()?);
+    }
+    if let Some(cd) = content_disposition {
+        headers.insert("content-disposition", cd.parse()?);
     }
     if let Some(b3) = blake3_meta {
         headers.insert("x-amz-meta-blake3", b3.parse()?);
@@ -857,6 +883,7 @@ mod tests {
                 content_type: "application/json",
                 blake3_meta: None,
                 cache_control: Some(CACHE_CONTROL_NO_CACHE),
+                content_disposition: None,
             },
         )
         .unwrap();
@@ -891,6 +918,7 @@ mod tests {
                 content_type: "application/octet-stream",
                 blake3_meta: Some(&b3),
                 cache_control: Some(CACHE_CONTROL_IMMUTABLE),
+                content_disposition: None,
             },
         )
         .unwrap();
@@ -930,6 +958,7 @@ mod tests {
                 content_type: "text/plain",
                 blake3_meta: None,
                 cache_control: None,
+                content_disposition: None,
             },
         )
         .unwrap();

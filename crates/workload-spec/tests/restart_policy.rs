@@ -111,21 +111,17 @@ fn for_forge_memory_request_is_a_floor_not_the_cgroup_ceiling() {
     );
 }
 
-/// Absent annotation ⇒ the request is the ceiling, i.e. exactly the pre-split
+/// Absent request ⇒ the request is the ceiling, i.e. exactly the pre-split
 /// behaviour. Every spec in the tree that never declares a request is admitted
 /// on the same number it always was.
 #[test]
 fn memory_request_falls_back_to_the_limit_when_undeclared() {
     let mut spec = WorkloadSpec::for_forge("b", forge_image(), TierTag("infra".into()), vec![]);
-    spec.annotations
-        .remove(workload_spec::MEMORY_REQUEST_ANNOTATION);
+    spec.resources.memory_request_mb = None;
     assert_eq!(spec.memory_request_mb(), spec.resources.memory_mb);
 
-    // A garbage value falls back too rather than admitting on 0 — an
-    // unparseable request must not silently become "fits anywhere".
-    spec.annotations.insert(
-        workload_spec::MEMORY_REQUEST_ANNOTATION.into(),
-        "not-a-number".into(),
-    );
+    // A zero falls back too rather than admitting on 0 — a request must not
+    // silently become "fits anywhere".
+    spec.resources.memory_request_mb = Some(0);
     assert_eq!(spec.memory_request_mb(), spec.resources.memory_mb);
 }

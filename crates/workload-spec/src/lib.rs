@@ -421,8 +421,9 @@
 //! @yah:verify("CARGO EXIT CODES CAPTURED DIRECTLY, not inferred from a grep (an earlier run of mine reported `rc=1` which was ripgrep's no-matches status, i.e. a PASS wearing a failure's clothes — re-run to settle it): `cargo check --manifest-path oss/kamaji/Cargo.toml --workspace --all-features --all-targets` cargo-exit=0, zero `^error` lines; `cargo check --workspace --all-targets` cargo-exit=0, zero `^error` lines. SCOPE HELD: `git diff -- .yah/services/` is EMPTY — this change touches no mirror, and the three apex pins R844-T10 owns are untouched at cloud.toml:105/:250/:276.")
 //!
 //! @yah:ticket(R885-B5, "cpu_millis is documented as a request and rendered as a hard quota — split request from limit")
-//! @yah:at(2026-09-10T07:30:46Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:at(2026-09-11T07:27:24Z)
 //! @yah:phase(P2)
 //! @yah:parent(R885)
 //! @yah:next("Tier: Cleric. The judgment is made; this applies it.")
@@ -430,14 +431,26 @@
 //! @yah:next("THE BUG THIS CAUSES: a workload declaring 250m as its fair share gets throttled at a quarter core even on a completely idle node. A request rendered as a ceiling is a semantic bug, not a missing feature.")
 //! @yah:next("FIX: cpu_millis stays the request and renders as cpu.weight. An OPTIONAL limit, carried as an annotation (not a field — see the postcard wire rule at kamaji-proto/src/version.rs:63), renders as cpu.max when present and omits it when absent. The containerd/docker weight derivation is already correct and must not change. R572-T2 consciously postponed a separate cpu_limit_millis for exactly this; this is that work, done as an annotation instead of a field.")
 //! @yah:next("memory.high is deliberately NOT in scope. No recorded incident asks for a throttle-before-kill tier; file it when something does.")
-//! @yah:verify("rg -n \"cpu\\.weight|format_cpu_max\" oss/kamaji/crates/kamaji-bin/src/cgroup.rs — cpu.weight is written from the request; cpu.max is written only when a limit annotation is present.")
-//! @yah:verify("cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-bin --lib — the cgroup rendering tests cover both the limit-present and limit-absent shapes.")
 //! @yah:verify("The containerd and docker paths still derive the same cpu_shares value they do today — no change in oss/kamaji/crates/kamaji-containerd-core/src/lib.rs or kamaji/src/docker.rs.")
 //! @yah:depends_on(R885-B1)
+//! @yah:gotcha("YOU ARE NO LONGER ADDITIVE — THE THROTTLE IS LIVE AS OF R885-B1 (2026-09-11). Wiring the cgroup driver onto kamaji::native::NativeRuntime shipped the very semantic bug W344 Finding 5 describes: cpu_millis, documented as a REQUEST, is now rendered as a hard `cpu.max` quota on the live fleet path. Measured on us-east-001: four native workloads at `cpu.max=25600 100000`, i.e. hard-capped at 0.256 of a core even on an idle node, where before the wiring they could burst to whatever the box had. The relay's ordering note calls 2/3/5 'independent and additive behind 1'; for this ticket that is now wrong — every node that takes the R885-B1 binaries is throttled until this lands. The split is unchanged (request -> cpu.weight, optional annotation-carried limit -> cpu.max; the containerd/docker weight derivation is already correct and stays); what changed is the urgency. The write site is CgroupV2::create_workload in oss/kamaji/crates/kamaji/src/cgroup.rs — note that file MOVED out of kamaji-bin in R885-B1.")
+//! @yah:handoff("THE THROTTLE IS OFF. cpu_millis is now rendered as cpu.weight (a relative share, no ceiling on an idle node) and cpu.max is written ONLY when the spec declares a ceiling. Three files: (1) oss/yah-base/crates/workload-spec/src/lib.rs — new CPU_LIMIT_ANNOTATION = \"yah.limits.cpu-millis\" and WorkloadSpec::cpu_limit_millis() -> Option<u32>, the exact mirror of memory_request_mb (that one adds the missing REQUEST beside a field that is a ceiling; this one adds the missing CEILING beside a field that is a request). Absent, unparseable, or 0 all mean NO ceiling — the permissive direction, because capping a workload at zero CPU over a typo is the worse failure. (2) oss/kamaji/crates/kamaji/src/cgroup.rs — new pub struct WorkloadLimits {cpu_request_millis, cpu_limit_millis: Option<u32>, memory_max_mb} with from_spec (live path, reads the annotation) and from_request (callers holding only ResourceLimits, so no ceiling); create_workload takes it instead of &ResourceLimits and writes cpu.weight unconditionally, cpu.max conditionally; new format_cpu_weight beside the existing format_cpu_max. (3) oss/kamaji/crates/kamaji/src/native.rs — the live call site now passes WorkloadLimits::from_spec(spec).")
+//! @yah:handoff("THE WEIGHT MAPPING AND ITS ONE-LINE JUSTIFICATION: weight = clamp(millis * 100 / 1000, 1, 10000), i.e. 1000m -> 100. 100 is the cgroup v2 / systemd CPUWeight= default, so \"one core\" lands on the platform default exactly as the containerd and docker backends' cpu_shares() puts 1000m on 1024, cgroup v1's default — a workload's relative standing is then the same whichever backend runs it, which is the property that made the three renderings disagree in the first place. Clamped because the kernel rejects a cpu.weight outside 1..=10000: a sub-10m request still gets a nonzero share rather than a failed write, and an absurd request saturates instead of erroring. cpu_millis == 0 (\"no declared request\") renders as the default 100, so the write is unconditional and explicit rather than relying on the file's initial value.")
+//! @yah:handoff("THE OPERATOR QUESTION, DECIDED: an already-deployed workload on an upgraded node picks the new rendering up ON REDEPLOY ONLY, and nothing needs to reconcile existing leaves. Startup never rewrites a leaf — the only writer in the whole tree is create_workload (verified: grep for cpu.max/cpu.weight across oss/ crates/ app/ scripts/ returns this one write site plus doc comments). deploy_workload does teardown (rmdir) then mkdir, and a freshly created cgroup starts at the kernel default cpu.max = \"max <period>\", so the stale 25600 100000 cannot survive a redeploy and no reconciler is warranted. THE ONE RESIDUE: a leaf whose rmdir failed EBUSY and is therefore reused keeps its stale cpu.max, because an absent ceiling now skips the write rather than clearing the file. That is exactly R885-B4's race, it is narrow, and the manual remedy is one line on the node (`echo \"max 100000\" > <leaf>/cpu.max`). I chose skip-the-write over write-\"max\" because the ticket's acceptance requires cpu.max be written only when the annotation is present, and because clearing a file nobody set is how you paper over B4 instead of fixing it. NOTE FOR WHOEVER SHIPS THIS: us-east-001 is currently running hotship 0.8.38-h5 bytes carrying the R885-B1 confinement (recorded by @Ashguard:coffee on R881-B7), so its four native workloads are throttled right now and need this tree shipped plus one redeploy each.")
+//! @yah:handoff("DISCOVERED WORK DONE IN THIS PASS, beyond the ticket title. (a) THE TWO GENERATED ARTIFACTS HAD TO BE REGENERATED and the drift test caught it: schemars and ts-rs both emit Rust doc comments into their output, so correcting ResourceLimits::cpu_millis's doc (it said `0` means \"no CPU limit\", which is now wrong twice over — 0 means no declared REQUEST, and the field is not a limit at all) broke yah-workload-spec's ts_drift::committed_ts_bindings_match_current_rust_types. Ran both generators per CLAUDE.md; `git diff --stat` on the two artifacts is 2 lines of .yah/schema/workload.toml.schema.json + 13 of packages/yah/workload-spec/index.ts and NOTHING else, so no peer's pending regen was swept in. (b) The stale pointer in this ticket's own Verify block (oss/kamaji/crates/kamaji-bin/src/cgroup.rs — that file was deleted in R885-B1) is removed and replaced with the real path, along with the kamaji-bin test command that went with it. (c) Two module headers corrected where they now lie: kamaji/src/native.rs:8 said the leaf carries \"memory.max and cpu.max\", and kamaji/src/cgroup.rs's summary said the driver translates ResourceLimits into cpu.max + memory.max. cgroup.rs also gains a \"CPU: a request is not a ceiling\" section recording the us-east-001 measurement, so the next person to reach for cpu.max finds the incident rather than rediscovering it.")
+//! @yah:handoff("WHAT I DELIBERATELY DID NOT DO. memory.high — out of scope by the ticket, and no incident asks for a throttle-before-kill tier. microvm.rs:563's third reading (cpu_millis.div_ceil(1000).max(1) as a vCPU COUNT) is untouched: W344 names it as the third disagreeing interpretation but it is not a throttle, a microVM's vCPU count genuinely is a count, and changing it is a separate judgment on a backend with no live native blast radius. No spec in the tree sets yah.limits.cpu-millis, which is correct and deliberate: the fleet's current state (every native workload burstable, weighted by its request) is the pre-R885-B1 behaviour plus proportional fairness under contention, and a ceiling is now something a workload opts into rather than something it gets by accident.")
+//! @yah:verify("THE ACCEPTANCE GREP, on the file that actually exists: `rg -n \"cpu.weight|cpu.max\" oss/kamaji/crates/kamaji/src/cgroup.rs` — cpu.weight is written unconditionally from the request at create_workload (write_file(&path.join(\"cpu.weight\"), &format_cpu_weight(limits.cpu_request_millis))), and cpu.max sits inside `if let Some(ceiling_millis) = limits.cpu_limit_millis`. There is no other cpu.max/cpu.weight write site anywhere in oss/, crates/, app/ or scripts/.")
+//! @yah:verify("BOTH SHAPES ARE COVERED, and the limit-ABSENT one is asserted twice — at the driver and at the live deploy path. cgroup::tests::a_workload_with_no_declared_ceiling_gets_a_weight_and_no_quota (cpu.weight == \"100\" for 1000m, and cpu.max does NOT EXIST); cgroup::tests::a_declared_ceiling_is_written_to_cpu_max_beside_the_weight (250m request + 2000m ceiling -> weight 25 AND cpu.max \"200000 100000\", two different numbers from two different sources); native::tests::deploying_a_workload_mints_a_cgroup_leaf_carrying_its_limits now drives the REAL deploy_workload and asserts cpu.weight == \"12\" with cpu.max absent — that test previously asserted cpu.max == \"12800 100000\", i.e. it pinned the bug; native::tests::a_declared_cpu_ceiling_renders_as_cpu_max drives the real deploy with the annotation set and gets \"50000 100000\". Plus cpu_weight_translates_a_request_to_a_relative_share (clamping both ends, 0 -> 100) and three workload-spec accessor tests including one asserting that garbage and an explicit 0 both mean no ceiling.")
+//! @yah:verify("THE containerd AND docker DERIVATIONS ARE BYTE-IDENTICAL TO TODAY, verified three ways rather than asserted: `git diff -- oss/kamaji/crates/kamaji/src/docker.rs` is EMPTY (0 lines); kamaji-containerd-core/src/lib.rs shows 10 changed lines and ZERO of them are code — `git diff -U0 | grep \"^[+-]\" | grep -v \"^[+-]//!\"` returns 0, they are a peer's @yah: board annotations for R881-B7; and ResourceLimits::cpu_shares itself is untouched in workload-spec (the only cpu_shares lines in that diff are three doc-comment references being re-worded). So spec.resources.cpu_shares() at containerd lib.rs:1373 and docker.rs:440 still derives millis*1024/1000 exactly as before.")
+//! @yah:verify("EVERY NUMBER BELOW WAS RUN BY ME ON THIS TREE. cargo test -p kamaji --features native-integration --lib: 120 pass / 0 fail (baseline 116, R885-B1's recorded figure; +4 = 3 net new cgroup tests and 1 new native call-site test, all seven named above confirmed present by name in the run). cargo test -p kamaji-bin --features native-exec --lib: 237 pass / 0 fail (baseline 237, unchanged — the off-Linux spawn test's create_workload call was updated to WorkloadLimits::from_request). workload-spec --lib: 192 pass / 0 fail (baseline 189, +3 accessor tests). yah-base workspace, the argv a workload-spec change makes non-optional (its test targets are invisible to every other workspace's --all-targets): `cargo test --manifest-path oss/yah-base/Cargo.toml --workspace` — all targets ok, 0 failed, AFTER the regen; before it, yah-workload-spec --test main was 104 pass / 1 FAIL on the ts-drift gate, now 105 / 0. cargo check --manifest-path oss/kamaji/Cargo.toml --workspace --all-features --all-targets exit 0, no errors. cargo check -p camp-identity (the root-workspace consumer of kamaji-bin) exit 0.")
+//! @yah:verify("CROSS-COMPILE, the Linux-path verification this Mac can actually achieve: `cargo zigbuild -p kamaji-bin --features containerd-integration,native-exec --target x86_64-unknown-linux-gnu` — Finished, exit 0. So the Linux path COMPILES. WHAT I DID NOT ACHIEVE, stated plainly: no live reading. Every cgroup assertion here is against a tempdir, where the control files are ordinary files rather than kernel interfaces — which is why the limit-absent test asserts cpu.max does not EXIST, a check that is only equivalent to \"unlimited\" because a real cgroupfs materialises the file at the kernel default. The live acceptance is still owed: on a node running these bytes, after one redeploy, `cat /sys/fs/cgroup/yubaba.slice/kamaji.service/<ident>/{cpu.weight,cpu.max}` must show the weight set and cpu.max reading `max 100000`.")
+//! @yah:gotcha("THE FIX IS PROVEN IN TESTS AND ON A CROSS-COMPILE, NOT ON HARDWARE — and this relay has already been burned by exactly that gap (R885-B1's own first gotcha: R406-T4/T5 sat in review for two months with passing tests and no reachable call site). What is different here is that the call site IS reachable and IS asserted by a test that drives the real deploy_workload. What is still missing is a node. us-east-001 currently runs hotship 0.8.38-h5 bytes with the R885-B1 confinement and NO B5 fix, so its four native workloads are throttled at this moment; shipping this tree plus one redeploy per workload is what closes the incident, and the reading that proves it is cpu.weight set with cpu.max at `max 100000`.")
+//! @yah:cleanup("An absent ceiling SKIPS the cpu.max write rather than clearing the file, so a leaf reused after a failed teardown (R885-B4's EBUSY race) keeps a stale quota. Narrow, and deliberate — the alternative papers over B4 — but if B4 lands a cgroup.kill + ordered teardown, re-read this decision: with a reliable rmdir the residue becomes impossible, and with an unreliable one it might be worth writing \"max <period>\" explicitly.")
 //!
 //! @yah:ticket(R885-T6, "Delete ephemeral_storage_mb from ResourceLimits and give the microVM its own named scratch floor")
-//! @yah:at(2026-09-10T07:31:12Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:at(2026-09-11T08:49:25Z)
 //! @yah:phase(P3)
 //! @yah:parent(R885)
 //! @yah:next("Tier: Cleric either way; the operator call is what makes it blocked, not the difficulty.")
@@ -449,6 +462,20 @@
 //! @yah:next("DECIDED 2026-09-10 (operator): DELETE. Remove ephemeral_storage_mb from ResourceLimits entirely and give the microVM its own explicitly-named scratch-disk floor. Rationale is CLAUDE.md pre-1.0 doctrine — change the design rather than tape it. Do NOT keep the field aliased, defaulted, or read-both-and-prefer-whichever; one shape has to win and it is the one without the field.")
 //! @yah:next("THE MICROVM REPLACEMENT IS THE REAL WORK, not the deletion. microvm.rs:693 currently reads ephemeral_storage_mb as a scratch-disk FLOOR (disk_size_bytes at :1071), and WorkloadSpec::for_forge sets 512 MiB expecting exactly that. Give it a named annotation of its own so the floor is legible as a floor. Do not silently drop the behaviour along with the field — a build that fails at first checkout is the failure mode.")
 //! @yah:gotcha("THE WIRE BUMP IS NOW CERTAIN, not conditional — deleting a ResourceLimits field is a postcard wire change and therefore a ProtocolVersion bump (kamaji-proto/src/version.rs, V8 today). Coordinate with R885-F3 BEFORE bumping: if F3 also needs a new WorkloadState shape, both changes ride one V9 rather than a V9 and a V10. Whichever ticket moves first should say so in its handoff.")
+//! @yah:next("R885-F3 LANDED NODE-LOCAL ONLY AND OWES YOU A WIRE DELTA (2026-09-11). F3 classifies OOM vs plain SIGKILL inside kamaji and names it in the journal + in WorkloadStatus::Failed{reason}, but `reason` dies at the UDS boundary: kamaji-bin/src/server.rs:3866 and :3924 both flatten `WorkloadStatus::Failed { .. } => WireState::Failed`, and kamaji-proto's WorkloadState (messages.rs:158) is a FIELDLESS enum with nowhere to put a string. So yubaba still cannot tell an OOM from a crash. CARRY THIS IN YOUR V9: add `OomKilled` as a new variant of kamaji_proto::WorkloadState (it is already #[non_exhaustive]; postcard encodes the discriminant as a varint, so appending at the END keeps Pending..Failed on 0..5 and only an unbumped peer decoding discriminant 6 breaks - which is exactly what the bump exists to refuse). Then map it at BOTH server.rs sites from a classification kamaji already computes: crate::cgroup::ExitClass::is_oom() is the predicate, and NativeProcess::settle already has the value. The only extra plumbing needed is carrying ExitClass (or a bool) out of Completion, which is crate-internal and not a wire type.")
+//! @yah:gotcha("THE BATCH IS NOW CONFIRMED, NOT CONDITIONAL: R885-F3 is at review having deliberately NOT bumped ProtocolVersion (operator/leader call - land everything below the wire, leave the upward report to T6's certain V9). F3's wire delta is spelled out in this ticket's @yah:next above. Do both in the one V9: deleting ephemeral_storage_mb from ResourceLimits AND adding WorkloadState::OomKilled. F3 touched only oss/kamaji/crates/kamaji/src/{cgroup.rs,native.rs} and did NOT touch workload-spec/src/lib.rs, so it leaves no conflict with your ResourceLimits sweep.")
+//! @yah:next("TIER RE-STAMPED Cleric -> Warrior by the relay leader, 2026-09-11, with the reason recorded because a silent tier bump is exactly what R889-B1 is about. The original `Tier: Cleric` stamp was written when this ticket was 'delete a field + give the microVM a named floor'. Since then R885-F3 landed node-local-only and pushed its entire wire delta onto this ticket: a new `kamaji_proto::WorkloadState::OomKilled` variant, mapped at BOTH server.rs:3866 and :3924, plus carrying `ExitClass` out of `Completion`. Combined with the ProtocolVersion V8->V9 bump, the ~35-call-site WorkloadSpec sweep across four cargo workspaces and two excluded manifests (R860-T1's measured cost, with three misses), and the schema + TS regen, this is now the `class_tiers` Warrior descriptor verbatim - 'tricky implementation with a clear spec, heavy integration'. GENERAL LESSON WORTH CARRYING: a Tier stamp is written at filing time and can be invalidated by a SIBLING ticket pushing scope onto it. Whoever re-reads a stamp before dispatching should check whether the ticket still describes the work it was stamped for.")
+//! @yah:handoff("THE BUMP IS V11, NOT V9 — THE TICKET'S \"V8 TODAY\" WAS TWO BUMPS STALE. kamaji-proto/src/version.rs read ProtocolVersion::CURRENT = V10 on pickup, not V8: R605-T27 landed V9 (microvm: MicroVmHealth on NodeCapabilities) and R850-T4 landed V10 (DeployAck replaces AckKind::Deploy) after this ticket was filed. So both of this ticket's changes ride ONE bump to V11, which is the batching the ticket asked for; only the number moved. version.rs's V11 stanza spells out both halves and why each alone would earn a bump — (a) DELETING a field from a struct on a positional postcard wire shifts every byte after the hole, which is V2/V4/V5/V6/V8 run backwards and no safer for being subtraction; (b) appending WorkloadState::OomKilled is the benign kind, free once a bump is being spent. Tree anchor at dispatch: 494e22fa14b21d0cc72dd8a3132e7f078d1eb5eb.")
+//! @yah:handoff("PIECE 1+2 — THE FIELD IS GONE AND THE FLOOR IS NAMED `floor`. ResourceLimits::ephemeral_storage_mb deleted; successor is annotation `yah.limits.scratch-floor-mb` (SCRATCH_FLOOR_ANNOTATION) read by WorkloadSpec::scratch_floor_mb() -> Option<u32>, following R885-B5's cpu_limit_millis / R885-T2's pids_limit precedent verbatim (annotation not field, because a field costs exactly the wire bump this ticket is paying). microvm::workspace::disk_size_bytes(input_bytes, Option<u32>) and build_disk take the floor; deploy passes spec.scratch_floor_mb(). for_forge declares FORGE_SCRATCH_FLOOR_MB = 512 via the annotation so the old `ephemeral_storage_mb: 512` declaration is RENAMED, not dropped. Naming call I made: kept it in the `yah.limits.*` family beside the two ceilings, with the word `floor` in the key carrying the opposite direction — documented at the const.")
+//! @yah:handoff("MEASURED, AND IT RETIRES THE TICKET'S OWN WORRY: THE `requested` TERM WAS ALREADY DEAD CODE TREE-WIDE. microvm's WORKSPACE_MIN_BYTES floor is 8 GiB and disk_size_bytes is a `max`, while the LARGEST ephemeral_storage_mb anywhere in the tree was 1024 MiB (histogram over every rust literal: 0, 32, 64, 128, 256, 512, 1024 — nothing above). So the spec-supplied term never won for any workload that exists, and for_forge's 512 MiB in particular has always resolved to 8 GiB. Deleting the field is therefore behaviour-preserving by measurement, not by argument. The mechanism is still kept because it is load-bearing ABOVE 8 GiB, which is the only reason to have it at all — pinned by an assertion at 32 GiB.")
+//! @yah:handoff("PIECE 3 — R885-F3'S WIRE DELTA IS CARRIED, PLUS ONE BUG IT WOULD HAVE INTRODUCED. kamaji_proto::WorkloadState::OomKilled appended LAST (messages.rs). Plumbing is a new `oom_killed: bool` on kamaji's own WorkloadStatus::Failed (crate-internal, not a wire type, as F3 specified): native.rs settle() sets it from class.is_oom() — the ExitClass F3 already computes — and every other backend passes false, documented as \"not known to be an OOM\", never \"known not to be one\". Mapped at BOTH server.rs sites (runtime_state_to_entry, docker_workload_to_entry). sibling.rs carries the RETURN leg so the bit survives the round trip instead of being flattened one hop after it crossed. DISCOVERED AND FIXED IN THIS PASS, not filed: server.rs liveness_rank ends in `_ => 2` for states a newer peer might send, so OomKilled would have fallen into it and ranked 2 — ABOVE Failed(1) and level with Pending — letting an OOM-killed row win the List dedupe against a more informative row for the same id. Explicit `WireState::OomKilled => 1` arm plus a test. The catch-all is right for a state this build has never heard of and wrong for one it ships.")
+//! @yah:handoff("THE SWEEP: 75 rg hits across FIVE workspaces (root, oss/kamaji, oss/yah-base, oss/yubaba, oss/qed), all five now compiling with --all-features --all-targets. 38 files had standalone struct-literal lines; the non-mechanical ones were velveteen-exec/src/remote.rs:1101 (the buildkit image-build step set 4096 — a REAL second consumer the ticket did not name, now the annotation), workload-spec/src/validate.rs (capacity error text), and 19 JSON fixtures + app/yah/xlb-node/workload.json (field was the LAST key, so the preceding comma had to go too — all 20 re-validated as parseable JSON). A METHOD NOTE FOR WHOEVER RE-RUNS THE ACCEPTANCE GREP: this ticket's own verify line says `rg -rn \"ephemeral_storage_mb\"`, and `-r` is ripgrep's REPLACE flag — `-rn` parses as `-r n`, so every hit renders as the literal `n` and the output is unreadable. Use `rg -n`. That cost a pass to notice.")
+//! @yah:gotcha("STALE SECOND COPY OF A GENERATED FILE, PRE-EXISTING AND NOT TOUCHED BY THIS TICKET: oss/packages/yah/workload-spec/index.ts is 22040 bytes against the live packages/yah/workload-spec/index.ts at 39216, and it still carries `ephemeral_storage_mb: number`. `export-ts` writes ONLY the root packages/ path, and neither check-schema-drift.sh nor check-workload-spec-ts.sh reads the oss/ copy — both gates pass green with it stale. It was ~17KB behind before this ticket, so hand-patching the one field would make a file that is wrong in dozens of ways LOOK current, which is worse than leaving it. Deliberately left; needs either a generator that targets it or deletion, as its own ticket.")
+//! @yah:cleanup("DOCKER BACKEND CANNOT ANSWER `oom_killed` AND THE DATA IS RIGHT THERE. docker.rs status mapping hardcodes oom_killed: false because DockerState (docker.rs:87) does not parse the `OOMKilled` bool Docker's own /containers/{id}/json State object returns. Contained follow-on: add the field to DockerState, map it at the three WorkloadStatus::Failed arms. Left out deliberately — it is a different backend's classification and this ticket's piece 3 is the native path. Comment at the site names it so the `false` reads as a gap rather than a fact.")
+//! @yah:handoff("ALL FOUR ACCEPTANCE CRITERIA MET. (1) `rg -n \"ephemeral_storage_mb\" --type rust` returns ZERO code reads across all five workspaces — only board prose and deliberate historical references inside doc comments explaining what was deleted. (2) The for_forge scratch floor is proven by test, not inspection: deleting_the_field_did_not_change_what_for_forge_is_given drives the REAL WorkloadSpec::for_forge through the real accessor and asserts disk_size_bytes is identical for an empty tree and a 3 GiB one, that None and a declared-below-8-GiB floor agree, and that a 32 GiB floor still wins. (3) `rg -n \"OomKilled\" oss/kamaji` shows the variant, both server.rs mappings, and both directions tested — an_oom_kill_reaches_the_wire_distinct_from_a_plain_failure pins OOM -> OomKilled AND plain SIGKILL -> Failed. (4) ProtocolVersion is V11 exactly once with both changes in it. Schema + TS regen ran; check-schema-drift.sh and check-workload-spec-ts.sh both report `ok: in sync`.")
+//! @yah:verify("EVERY NUMBER RUN BY ME ON THIS TREE (anchor 494e22fa14b21d0cc72dd8a3132e7f078d1eb5eb), against the baselines the dispatch named. `cargo test -p kamaji --features native-integration --lib`: 153 pass / 0 fail, baseline 153 after B4 — UNCHANGED, because my microVM test needs the microvm feature. With `--features native-integration,microvm-integration --lib`: 195 pass / 0 fail, including the new microvm::tests::deleting_the_field_did_not_change_what_for_forge_is_given and all seven of F3's settle tests untouched. `cargo test -p kamaji-bin --features native-exec --lib`: 239 pass / 0 fail, baseline 237, +2 both mine. `cargo test -p yah-workload-spec --lib`: 196 pass / 0 fail, baseline 196 unchanged; `--tests` adds 105 pass / 0 fail over the 20 edited JSON fixtures. `cargo test -p kamaji-proto`: 34 pass / 0 fail, baseline 33, +1 mine. `cargo check --workspace --all-features --all-targets` exit 0 on oss/kamaji, oss/yah-base, oss/yubaba; `-p velveteen-exec --all-features --all-targets` exit 0 on oss/qed; `cargo check --workspace --all-targets` exit 0 on the root. `cargo clippy -p kamaji --features native-integration --all-targets`: 1 warning, PRE-EXISTING (jit.rs:312 too-many-arguments — the same one B1, F3 and B4 each recorded), none from this change.")
+//! @yah:verify("NOT ACHIEVED, STATED PLAINLY: NO LIVE LINUX NODE READING, and no live UDS exercised between a real yubaba and a real kamaji at V11. This is a macOS dev machine. The Linux-path verification achieved is the cross-compile — `cargo zigbuild -p kamaji-bin --features containerd-integration,native-exec --target x86_64-unknown-linux-gnu`, Finished, exit 0 — plus a byte-level pin of the wire claim in place of a real peer: appending_oom_killed_left_every_existing_discriminant_alone asserts each WorkloadState encodes to its literal postcard byte (Pending..Failed = 0..5 unmoved, OomKilled = 6), against the actual encoder rather than an `as usize` cast, because the cast reads the Rust discriminant and the claim is about the wire. Same macOS limitation B1, B5, T2, F3 and B4 each recorded. STILL OWED ON A NODE: deploy a workload past its memory.max and confirm yubaba now receives OomKilled rather than Failed — the end-to-end that R590-B10's scar is really about; and confirm a yubaba/kamaji pair restarted together negotiate V11 (skew here is a restart, not a rolling upgrade, since the two self-install as a pair).")
+//! @yah:gotcha("T6'S ROLL IS A THREE-NODE PROTOCOL BUMP, NOT A ONE-NODE ONE — and it did NOT ride R885's 2026-09-11 hot ship. That ship carried B4/B9/B10/B11 to us-east-001 only; T6 is still unshipped everywhere. From @Ashguard:coffee (R876), who dated the fleet independently: the live fleet is running PRE-T6 kamaji, established by `grep -c -a` against the deployed binaries — `ephemeral_storage_mb` PRESENT and `scratch-floor-mb` ABSENT. That string-dating trick is worth keeping: it dates a deployed binary by its own contents when `--version` cannot be trusted (hotship.sh:880 warns that `--version` is a build-time string that has agreed with a release the binary did not contain, R746-T3 — confirmed again on 2026-09-11, when us-east-001's yubaba printed 0.8.37 while /health correctly reported the hot-shipped 0.8.38-h5; `/health` is the authority, `--version` is not). WHY THIS MATTERS FOR T6 SPECIFICALLY: deleting ephemeral_storage_mb from ResourceLimits moves the postcard wire, so every node must cross together — unlike R885's capability and cgroup work, which degraded gracefully on a single node. Whoever rolls T6 is planning a fleet-wide coordinated roll of us-west-001, us-east-001 and us-south-001, not a scoped hot ship, and should read R885-B9's hotship gotcha first: hotship ships BINARIES ONLY and writes no unit file, which for T6 is fine but for the CAP_SETPCAP half of B9 is the difference between in-force and inert.")
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -466,9 +493,7 @@ pub mod rollout;
 pub mod secrets;
 pub mod sovereign;
 pub mod validate;
-mod version;
 
-pub use version::SchemaVersion;
 
 // ── Duration ──────────────────────────────────────────────────────────────────
 
@@ -540,11 +565,13 @@ pub const DEFAULT_NAMESPACE: &str = "default";
 /// `(tenant, namespace)` pair).
 ///
 /// **Degenerate case:** when a yubaba reconciler sees only one `TenantId`
-/// across every workload on a machine, per-tenant Podman networks collapse
-/// into the shared tier networks, the tenant prefix on mesh identity is
-/// dropped, and PostgreSQL role separation is skipped — isolation primitives
-/// become no-ops. You pay only when more than one tenant is present. Specs
-/// written before this axis existed deserialize to [`TenantId::singleton`].
+/// across every workload on a machine, the tenant prefix on mesh identity is
+/// dropped and PostgreSQL role separation is skipped — isolation primitives
+/// become no-ops. You pay only when more than one tenant is present. Container
+/// networking is keyed on the id, not the count: [`TenantId::singleton`]
+/// workloads share the node bridge, and every other tenant gets its own (W343
+/// §Tenant isolation). Specs written before this axis existed deserialize to
+/// [`TenantId::singleton`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct TenantId(pub String);
@@ -619,7 +646,7 @@ impl NamespaceId {
 ///
 /// - **TOML/JSON (human-readable)** → *internally* tagged on `kind`, i.e. the
 ///   flat shape every on-disk `workload.toml` actually uses
-///   (`kind = "static-asset"` beside `schema_version`, `[[asset]]`, `[aliases]`).
+///   (`kind = "static-asset"` beside `[[asset]]` and `[aliases]`).
 /// - **postcard (binary)** → *externally* tagged, byte-identical to the derived
 ///   representation R590-B3 established for the kamaji UDS.
 ///
@@ -1048,9 +1075,6 @@ impl<'de> Deserialize<'de> for ContainerManifest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ContainerBuild {
-    /// Wire-format version. Always `V1` today.
-    pub schema_version: SchemaVersion,
-
     /// Component name. Same field the reference form carries, so a manifest
     /// identifies itself the same way whichever form it is written in.
     pub name: String,
@@ -1092,7 +1116,6 @@ impl ContainerBuild {
         let ports = MeshExpose::anonymous_ports(self.run.port);
 
         Ok(WorkloadSpec {
-            schema_version: self.schema_version,
             name: self.name.clone(),
             image,
             tier,
@@ -1123,12 +1146,16 @@ impl ContainerBuild {
                     },
                     target: m.container,
                     read_only: m.read_only,
+                    from_secret_mount: false,
                 })
                 .collect(),
             resources: ResourceLimits {
                 memory_mb: 1024,
                 cpu_millis: 1000,
-                ephemeral_storage_mb: 1024,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -1149,6 +1176,7 @@ impl ContainerBuild {
                 operator: None,
             },
             labels: HashMap::new(),
+            durability: None,
             annotations: HashMap::new(),
             files: Vec::new(),
         })
@@ -1249,9 +1277,6 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct MesofactStaticWorkload {
-    /// Wire-format version. Always `V1` today.
-    pub schema_version: SchemaVersion,
-
     /// Build command + output directory.
     pub build: BuildConfig,
 
@@ -1399,6 +1424,17 @@ pub struct MesofactRevalidateReceiver {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub feed_project_prefix: Option<String>,
+
+    /// Secrets materialized to fixed host paths before the receiver process
+    /// forks (R876-B16). Bundle-tier deploys are native (no container
+    /// namespace, see `deploy_non_container`), so only `SecretTarget::File`
+    /// is meaningful here — there is no env-var form, because the whole point
+    /// is that the plaintext credential value never becomes part of this
+    /// spec or of kamaji's in-memory/on-disk deploy record. Replaces the
+    /// prior design where the CLI resolved R2/Cloudflare credentials itself
+    /// and inlined them as literal values into `env` above.
+    #[serde(default)]
+    pub secrets: Vec<SecretMount>,
 }
 
 /// One almanac feed handed to the on-node fetcher (R330-F31).
@@ -1660,11 +1696,19 @@ pub const DEFAULT_PASSWAY_COMMAND: &str = "/usr/local/bin/passway";
 /// `yubaba::domain_admin` applies to the DNS-01 record name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
+// R896-F2: `deny_unknown_fields` was REMOVED here. It used to be inert on the
+// kamaji wire — R658-B1 said so explicitly, "only constrains TOML/JSON", which
+// was true while that wire was positional postcard with no field names to
+// reject. It is not true any more: `Workload::TenantPassway` now crosses the UDS
+// as name-keyed JSON (`kamaji_proto::tolerant`), so this attribute would refuse
+// a spec from a peer one field ahead — defeating the whole envelope on exactly
+// the workload kind `yubaba::tenant_passway` reconciles most often, and turning
+// an additive field change back into a paired fleet ship.
+//
+// `BuildConfig` keeps its copy: that one is authoring-only and the loudness it
+// buys (a misplaced `routes` key is a parse error naming the key, not a silently
+// dropped one) is the reason R658-B1 added it.
 pub struct TenantPasswayWorkload {
-    #[serde(default)]
-    pub schema_version: SchemaVersion,
-
     /// The single custom domain this passway terminates TLS for — the SNI the
     /// demux matched to route here, and the hostname
     /// [`jit_spec`](Self::jit_spec) keys the rendered `PASSWAY_UPSTREAMS`
@@ -1723,6 +1767,35 @@ pub struct TenantPasswayWorkload {
     /// hangs, not as a config error.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+
+    /// Discover the backends from yubaba's service records instead of the
+    /// static [`upstreams`](Self::upstreams) list (R910-F2).
+    ///
+    /// `None` is the free tier's shape: the door knows where TLS terminates
+    /// and nothing about where the tenant's app runs, so it answers 503 until
+    /// something fills `upstreams`. `Some` is a door that fronts a workload
+    /// this fleet places, which is what a tunnel-fronted door is: the
+    /// placement moves, so a pinned address list would go stale.
+    ///
+    /// A field rather than three `env` entries because `PASSWAY_UPSTREAM_SOURCE`
+    /// is a derived key [`jit_spec`](Self::jit_spec) writes last — the escape
+    /// hatch cannot change it, by design.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub discover: Option<TenantPasswayDiscovery>,
+}
+
+/// Where a per-tenant passway polls for its backends (R910-F2): the yubaba
+/// nodes holding the fronted workload's service records, and that workload's
+/// ident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct TenantPasswayDiscovery {
+    /// Base URLs of the yubabas to poll, e.g. `http://100.64.0.10:7443`. Every
+    /// entry is polled and the records unioned (R844-F23).
+    pub urls: Vec<String>,
+    /// The fronted workload's ident, as its service records carry it.
+    pub ident: String,
 }
 
 /// Node-side paths of one tenant's materialized certificate pair.
@@ -1733,7 +1806,8 @@ pub struct TenantPasswayWorkload {
 /// materializes them out of `yubaba::cert_store` owns their permissions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
+// R896-F2: removed for the same reason as [`TenantPasswayWorkload`] above —
+// this type rides inside it across the now name-keyed kamaji wire.
 pub struct TenantPasswayTls {
     /// PEM chain path (`PASSWAY_TLS_CERT`).
     pub cert: String,
@@ -1758,7 +1832,6 @@ impl TenantPasswayWorkload {
     pub fn cold(domain: impl Into<String>, listen: impl Into<String>) -> Self {
         let domain = domain.into();
         Self {
-            schema_version: SchemaVersion::V1,
             tls: TenantPasswayTls::for_domain(&domain),
             domain,
             listen: listen.into(),
@@ -1766,6 +1839,7 @@ impl TenantPasswayWorkload {
             idle_ttl: Some(Millis::from_secs(60)),
             command: None,
             env: BTreeMap::new(),
+            discover: None,
         }
     }
 
@@ -1829,8 +1903,25 @@ impl TenantPasswayWorkload {
         env.insert("PASSWAY_TLS_MODE".into(), "manual".into());
         env.insert("PASSWAY_TLS_CERT".into(), self.tls.cert.clone());
         env.insert("PASSWAY_TLS_KEY".into(), self.tls.key.clone());
-        env.insert("PASSWAY_UPSTREAM_SOURCE".into(), "static".into());
         env.insert("PASSWAY_UPSTREAMS".into(), self.passway_upstreams());
+        match &self.discover {
+            // R910-F2: poll yubaba for the fronted workload's records. The
+            // URLs carry no `<hostname>=` prefix — this door serves exactly
+            // one domain, so the catch-all form is the whole instruction.
+            Some(d) => {
+                env.insert("PASSWAY_UPSTREAM_SOURCE".into(), "yubaba".into());
+                env.insert("PASSWAY_YUBABA_URL".into(), d.urls.join(","));
+                env.insert(
+                    "PASSWAY_YUBABA_IDENT".into(),
+                    format!("{}={}", self.domain, d.ident),
+                );
+            }
+            None => {
+                env.insert("PASSWAY_UPSTREAM_SOURCE".into(), "static".into());
+                env.remove("PASSWAY_YUBABA_URL");
+                env.remove("PASSWAY_YUBABA_IDENT");
+            }
+        }
         match self.idle_ttl_secs() {
             Some(secs) => {
                 env.insert("PASSWAY_IDLE_TTL_SECS".into(), secs.to_string());
@@ -1843,7 +1934,6 @@ impl TenantPasswayWorkload {
         }
 
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: id.to_string(),
             image: ImageRef {
                 // Identity metadata only — the JIT tier forks a node binary and
@@ -1874,7 +1964,10 @@ impl TenantPasswayWorkload {
             resources: ResourceLimits {
                 memory_mb: 64,
                 cpu_millis: 256,
-                ephemeral_storage_mb: 64,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -1898,6 +1991,7 @@ impl TenantPasswayWorkload {
                 operator: None,
             },
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: Vec::new(),
         }
@@ -1933,6 +2027,26 @@ impl TenantPasswayWorkload {
 ///
 /// Note `deny_unknown_fields` is inert for the postcard kamaji wire, which is
 /// non-self-describing and positional — this only constrains TOML/JSON.
+///
+/// @yah:relay(R905, "Per-environment build override — a mirror cannot change what its component builds with")
+/// @yah:status(review)
+/// @yah:at(2026-09-14T20:25:20Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:next("THE GAP, stated structurally. A `[build]` block lives on the COMPONENT's workload.toml (BuildConfig here: `command`, `out_dir`, `render_command` — nothing else), and a component is declared once in `.yah/services/<svc>/service.toml`. The MIRROR is the only per-environment surface, and `.yah/schema/mirror.toml.schema.json`'s top-level keys are exactly `asset_aliases, drivers, ingress, ingress_machines, providers, schema_version, shape` — no `build`, no `env`. So a service that deploys the SAME component to two environments has no way to build it differently for each, and `mesofact_static`'s build step passes no environment either (`run_build` -> `ExecContext::default().with_cwd()`).")
+/// @yah:next("FIRST CONSUMER, CONFIRMED LIVE, NOT HYPOTHETICAL — noisetable's staging origin (noisetable camp R704-T4). `web/landing/workload.toml:39` hardcodes `command = \"bun run build:cloud\"`, and `build:cloud` is `NOISETABLE_API_ORIGIN=https://api.noisetable.com bun run build` (web/landing/package.json:17). A sibling `build:staging` pointing at `https://api-staging.noisetable.com` EXISTS at package.json:18 and `rg build:staging` over the whole repo returns exactly that one definition line — nothing can reference it, because there is nowhere to put the reference. Measured consequence: `curl -sS https://staging.noisetable.com/account` serves `\"api_base\":\"https://api.noisetable.com/api/v1\"`, production CORS allows only `https://noisetable.com`, so the staging account page's every API call is blocked and the page renders \"unreachable\".")
+/// @yah:next("TWO SHAPES, both plausible; the ticket does not pick one. (a) An `env` table on BuildConfig plus a mirror-level override of it — most direct, but puts per-env data on a per-component struct. (b) A `[build]` override block on the mirror that replaces `command` for that environment — keeps the environment axis where every other environment fact already lives (`providers`, `ingress`), at the cost of a second place a build command can come from. (b) is the one this filer leans toward, precisely because the mirror is ALREADY the per-environment surface and (a) invents a second one.")
+/// @yah:next("DO NOT 'SOLVE' THIS CONSUMER-SIDE WITH HOSTNAME SNIFFING. The tempting workaround is deriving the API origin from `location.hostname` in the browser (staging.noisetable.com -> api-staging.noisetable.com). It was considered and rejected by the noisetable operator: it is one-off string-match control flow, and it converts a deploy-time fact into client-bundle logic that no build can validate. The absence of that workaround is why this ticket exists — do not close it by suggesting one.")
+/// @yah:verify("`rg -n \"build:staging\" --glob '!node_modules'` inside the noisetable checkout returns MORE than the single package.json definition line — i.e. something now references it. Today it returns exactly one hit, which is the whole defect.")
+/// @yah:verify("`curl -sS https://staging.noisetable.com/account | grep -o '\"api_base\":\"[^\"]*\"'` prints `https://api-staging.noisetable.com/api/v1`. It printed `https://api.noisetable.com/api/v1` on 2026-09-13 when this was filed.")
+/// @yah:gotcha("THE NOISETABLE SIDE IS NOT ALL OF THIS TICKET'S BLAST RADIUS, and shipping the override does not by itself fix that page. `api-staging.noisetable.com` currently resolves and serves 200 on `/health` from the PRODUCTION passway edge, whose `upstreams_by_host` lists `api.noisetable.com` and `*` with no `api-staging` entry — so a staging bundle pointed at it would 404 until noisetable R704-T4's own door (a cloudflare-tunnel on the NAT'd dev node us-west-011) is up. The two are independent and both are required; neither is a reason to defer the other.")
+/// @yah:handoff("SHAPE (b) SHIPPED, widened by an env table. MirrorConfig.build: BTreeMap<component id, MirrorBuildOverride{command, render_command, env}> (oss/yubaba/crates/cloud/src/config.rs). Field-wise override of the workload's [build]; out_dir deliberately not overridable. Wired into BOTH build paths: MesofactStaticReconciler::rebuild_static/revalidate_static (env via ExecContext::with_env) and the bundle tier in app/yah/cli/src/cloud.rs (effective_build_command + spawn_component_build shared by single- and multi-component assembly; deploy_mesofact_bundle's provenance/refusal resolve through it too). noisetable staging uses providers.bundle, so the CLI path is the one its first consumer hits. cross_ref_validate refuses [build.<id>] naming an undeclared component. mirror.toml.schema.json regenerated.")
+/// @yah:handoff("LANDED (yah side). Mirrors take `[build.<component id>]` with `command`, `render_command` and `env` (MirrorBuildOverride, oss/yubaba/crates/cloud/src/config.rs). Each field overrides the matching field of the workload's [build]; `out_dir` cannot be overridden. Honoured by BOTH build paths: MesofactStaticReconciler::rebuild_static/revalidate_static (env via ExecContext::with_env) and the bundle tier (app/yah/cli/src/cloud.rs effective_build_command + spawn_component_build, shared by single- and multi-component assembly and by deploy_mesofact_bundle's provenance/refusal). cross_ref_validate refuses a key naming an undeclared component. Schema regenerated; it was swept into peer commit 30c2c02c.")
+/// @yah:verify("cd oss/yubaba && cargo test -p yah-cloud --lib -- reconciler::mesofact_static build_override → 56 + 5 pass, including rebuild_static_runs_the_mirrors_overridden_command_with_its_env, revalidate_static_honours_the_mirrors_render_override_and_env, and cloud_config_cross_ref_fails_on_a_build_override_for_an_unknown_component")
+/// @yah:gotcha("An OLD yah binary silently ignores `[build.<id>]`, because MirrorConfig has no deny_unknown_fields. Install a yah that includes R905 before relying on the override, or staging keeps building with build:cloud and nothing errors.")
+/// @yah:assumes("The noisetable consumer edit is noisetable-camp work (R704-T4), not done here. Add `[build.site] command = \"bun run build:staging\"` (or `[build.site.env] NOISETABLE_API_ORIGIN = ...`) to .yah/services/noisetable-marketing/mirrors/staging.toml, then apply. The two filing-time verify lines (rg build:staging, curl api_base) are only satisfiable after that step and after R704-T4's api-staging door is up.")
+/// @yah:handoff("NOISETABLE LOCKSTEP (operator-authorized 2026-09-14): (1) noisetable .yah/services/noisetable-marketing/mirrors/staging.toml gains `[build.site] command = \"bun run build:staging\"` with the why + old-binary warning inline. (2) web/landing/workload.toml's comment claiming the reconciler passes no build env replaced — it now says build:cloud is production's default and staging overrides it from its mirror. (3) noisetable .yah/schema/mirror.toml.schema.json refreshed from yah's regenerated copy (+35 lines). external/yah there is a symlink to this monorepo, so the mesofact-build side needs no separate bump.")
+/// @yah:gotcha("~/.local/bin/yah (0.8.39+e0530813-dirty) does NOT carry R905 (strings check for the new cross_ref_validate message: 0 hits). Until an R905 yah is installed, noisetable's `[build.site]` is silently ignored and staging still builds with build:cloud. Also: the filing-time verify `rg build:staging` skips hidden dirs, so it never sees .yah/ — its hits come from web/landing/workload.toml's comment, not from the mirror itself.")
+/// @yah:verify("Against the REAL noisetable tree with an R905 build (target/debug/yah, 2026-09-14 13:33): `yah cloud validate --path ~/ss/noisetable` → ok. Negative: the same .yah copied to /tmp with the key changed to `[build.sight]` → `Error: loading workspace declarations: services/noisetable-marketing/mirrors/staging.toml: [build.sight] — no component \"sight\" in services/noisetable-marketing/service.toml (declared: [\"site\", \"app\"])`. CLI: cargo test -p yah --lib (6 bundle_assembly_tests incl. a_mirror_build_override_decides_what_a_component_builds_with) pass.")
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -2127,9 +2241,6 @@ pub enum Cadence {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct AlmanacManifest {
-    /// Wire-format version. Always `V1` today.
-    pub schema_version: SchemaVersion,
-
     /// Shell command executed via `sh -c` from the workload directory.
     pub command: String,
 
@@ -2354,9 +2465,6 @@ pub struct AssetEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct StaticAssetWorkload {
-    /// Wire-format version. Always `V1` today.
-    pub schema_version: SchemaVersion,
-
     /// Exhaustive catalog of files this component manages in the bucket.
     ///
     /// Named `asset` on disk (TOML `[[asset]]` array-of-tables) to follow TOML
@@ -2652,13 +2760,66 @@ pub struct Requirement {
 /// @yah:handoff("Tree anchor at handoff: 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2 — the shared tree as I left it. Diff against it (`git diff 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
 /// @yah:handoff("GENERATED-ARTIFACT BLOCKER CLEARED. The two schema JSON files this ticket regenerated (.yah/schema/workload.toml.schema.json, .yah/schema/machine.toml.schema.json) were committed by the operator in 89ace71c; packages/yah/workload-spec/index.ts landed earlier in 4bed91fe. Both drift gates are now GREEN — nothing on R860 is waiting on a permission any more.")
 /// @yah:verify("RE-VERIFIED AT HEAD 00ee20d1 (session:aa5e882d, 2026-09-05), two commits past the 4bed91fe the prior leader checked. `bash scripts/check-schema-drift.sh` exit 0 (\"ok: .yah/schema is in sync with the Rust types\"); `bash scripts/check-workload-spec-ts.sh` exit 0. `cargo test --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml` exit 0, 0 failed. Types confirmed by content at workload-spec/src/lib.rs: `enum Locality` :2384, `enum Supply` :2422, `struct Requirement` :2458, `pub requires: Vec&lt;Requirement&gt;` :2635, `effective_requirements()` :2831. `git status --porcelain` clean on all three generated paths.")
+///
+/// @yah:ticket(R896-F3, "Move yah.limits.* / yah.placement.memory-request-mb / yah.durability.* annotations into typed WorkloadSpec fields")
+/// @yah:status(review)
+/// @yah:at(2026-09-14T22:08:18Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R896)
+/// @yah:next("Tier: Warrior. Now possible without a ProtocolVersion bump because R896-F2's V13 envelope carries Deploy.spec name-keyed. Per W349 'What the migration child gets to do': yah.limits.cpu-millis -> cpu_limit_millis: Option<u32>, yah.limits.scratch-floor-mb -> scratch_floor_mb: Option<u32>, yah.limits.pids-max, yah.placement.memory-request-mb, yah.durability.* -> durability: Option<Durability> (parse + error type already exist in lib.rs). Each field gets #[serde(default)] = None = today's no-annotation behaviour, so it crosses a skew. Delete the annotation readers in the same change (below-1.0: one shape wins) and migrate any workload.toml / reconciler that writes the annotations. yah.placement.requires-taint is a scheduler input, decide separately; yah.exec / yah.sandbox stay annotations.")
+/// @yah:next("Rust-side radius is the other half of the cost (W349 'The other half'): WorkloadSpec has no Default and ~35 exhaustive literals across six workspaces; run the six-command sweep R860 names, not root --workspace. oss/kamaji/crates/kamaji-proto/tests/tolerant_field_policy.rs stays green only if every new field defaults; regen .yah/schema + workload-spec TS after.")
+/// @arch:see(.yah/docs/working/W349-evolvable-kamaji-wire-envelope.md)
+/// @yah:gotcha("SILENT BACKUP-LOSS HAZARD, found before any edit (session:dc6af742, 2026-09-14). ~/ss/noisetable authors these annotations in its own repo: .yah/infra/workloads/noisetable-account.toml and .yah/services/noisetable-api/mirrors/prod.toml. Deleting the annotation readers in this repo makes those specs parse clean with durability silently read as none (an ignored annotation is indistinguishable from an absent one), which would turn off the production account DB's backups without an error. The reverse direction is just as silent: once noisetable's TOML moves to typed fields, any node still on pre-F3 yubaba ignores the unknown `durability` key (WorkloadSpec has no deny_unknown_fields). So F3 needs (a) a loud refusal in validate.rs for any surviving yah.limits.* / yah.durability.* / yah.placement.memory-request-mb annotation, naming the replacement field, and (b) roll order: fleet on F3 code first, noisetable TOML second. Accessor call sites to move: workload-spec lib.rs 28, kamaji microvm.rs 6, workload-spec tests/restart_policy.rs 5, qed velveteen-exec remote.rs 3, cloud topology.rs 2, cloud config.rs 2, kamaji cgroup.rs 2, yubaba lib.rs 1, validate.rs 1, kamaji-bin hydrate.rs 1; plus annotation-literal fixtures in topology.rs, hydrate.rs, tail.rs, and kamaji-bin server.rs:5681 (dirty under R895, live peer @Ashguard:blade).")
+/// @yah:handoff("OPERATOR CALL ANSWERED 2026-09-14 (ask_user, session:dc6af742): 'typed fields + loud refusal + staged roll, AND edit noisetable'. Nothing is implemented yet: this session scoped the work, then handed off at a clean tree rather than starting a ~100-site migration at ~190k context. Only ONE noisetable file needs migrating: ~/ss/noisetable/.yah/infra/workloads/noisetable-account.toml:307-311 (tier=stream, engine=turso, store=s3://noisetable-account-backup/noisetable-account, subjects=account.db,grants.db,projects.db,sessions.db, rpo-seconds=120), plus its prose at :219 and :253. The prod.toml hit is annotation prose only. Edit noisetable UNCOMMITTED; the operator ships it after the fleet runs F3 code.")
+/// @yah:handoff("DESIGN DEFAULTS PICKED (reversible, say so if you change them): (1) Limits move onto ResourceLimits (lib.rs:5485, the old home of ephemeral_storage_mb) as #[serde(default)] Option<u32> fields: memory_request_mb, cpu_limit_millis, pids_max, scratch_floor_mb. Keep the WorkloadSpec METHODS memory_request_mb() (falls back to resources.memory_mb) and pids_limit() (falls back to DEFAULT_PIDS_MAX); they now read the fields. Those fallbacks are real semantics, not shims. Delete cpu_limit_millis()/scratch_floor_mb() accessors, or keep them as field reads if that is cleaner. (2) durability: Option<Durability> on WorkloadSpec, #[serde(default)]. Durability (lib.rs:3874) already derives Serialize/Deserialize; add TS + json-schema cfg_attr to it and to DurabilityTier/DurabilityEngine. The cross-field checks in DurabilityDeclError (lib.rs:3913, messages at :3959-4041) move into validate::shape (validate.rs:428; it already reports durability at :578-646 via FieldPath::Annotation, which becomes a field path). (3) Loud refusal: validate::shape rejects any annotation key starting 'yah.limits.' or 'yah.durability.', or equal to 'yah.placement.memory-request-mb', with an error naming the replacement field. Then delete the *_ANNOTATION consts (lib.rs:4226-4303).")
+/// @yah:handoff("SITES (grep with line numbers from this session): workload-spec lib.rs for_forge :2949/:2959 (sets memory-request + FORGE_SCRATCH_FLOOR_MB via annotations), accessors :3183-3290 and durability() :3627, tests :7743-8158; workload-spec tests/restart_policy.rs :100-130, tests/shape_fixtures.rs (14 hits); validate.rs :19/:578-646; kamaji cgroup.rs :643/:645, microvm.rs :1008/:1561/:3155-3178, native.rs :1973; kamaji-bin hydrate.rs :127 + fixtures :355-528, tail.rs :298-303, server.rs :5681-5684 (fixture only; server.rs is DIRTY under R895, live peer @Ashguard:blade, so touch only those lines); yubaba lib.rs :5575, headscale_appliance.rs :409-421/:643-646 (constructs a durability declaration via annotations); cloud config.rs :2363/:10715/:11639, topology.rs :805/:823/:990/:1033 + TOML fixtures :1492-2207; qed velveteen-exec remote.rs :1159/:2368-2374; kamaji-proto digest.rs:184 (a test key list only; leave yah.exec/yah.sandbox, drop the limits key).")
+/// @yah:handoff("Tree anchor at handoff: 30c2c02c84f8acd5862f2a647ef958fd304fa218 — the shared tree as I left it. Diff against it (`git diff 30c2c02c84f8acd5862f2a647ef958fd304fa218..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:next("Implement per the handoff defaults, then run the six-workspace sweep R860 names: root cargo check --workspace --all-targets, app/yah/desktop, oss/kamaji --all-features, oss/yubaba --all-targets, oss/yah-base (workload-spec tests), oss/qed (velveteen-exec). Adding Option fields to ResourceLimits breaks every exhaustive ResourceLimits literal, and adding durability breaks every WorkloadSpec literal (~35 across six workspaces). Fix them all; never end a turn with the tree red.")
+/// @yah:next("oss/kamaji/crates/kamaji-proto/tests/tolerant_field_policy.rs must stay green with an UNCHANGED frozen list: every new field defaults. Then regen with `bash scripts/check-schema-drift.sh --update` and `cargo run --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --bin export-ts`. Update W349's 'What the migration child gets to do' section to say it landed.")
+/// @yah:gotcha("ROLL ORDER IS THE SAFETY PROPERTY, not the code. Old nodes (release 0.8.36, V9-V11) silently ignore an unknown `durability` TOML key, so noisetable-account's backups would go quiet if its TOML moved first. Sequence: F3 code ships to the fleet (a paired ship, since it rides V13), THEN noisetable's TOML. Say so in the review handoff so the operator sequences it.")
+/// @yah:handoff("IMPLEMENTED 2026-09-14 (session:cd4dec9f), per the picked defaults. ResourceLimits gained memory_request_mb / cpu_limit_millis / pids_max / scratch_floor_mb (Option<u32>, serde default); WorkloadSpec gained durability: Option<Durability> (serde default, before annotations). Durability/DurabilityTier/DurabilityEngine derive TS + JsonSchema; subjects is a list, rpo_seconds/state_mb numbers. Cross-field rules moved to Durability::check, applied by WorkloadSpec::durability() -> Result<Option<&Durability>>. Loud refusal: WorkloadSpec::retired_annotation() + pub fn retired_annotation_field(key) map every retired key to its field; validate::shape refuses with FieldPath::Annotation(key) naming the field, and durability() also refuses any yah.durability.* key (so kamaji hydrate refuses too). All *_ANNOTATION consts for those keys deleted. Accessors kept with their fallbacks (0 => unset for all four, incl. memory_request_mb which now also treats 0 as undeclared). FieldPath::Annotation is now String; new FieldPath::Durability(sub). ~100 struct literals across six workspaces fixed by a compiler-driven script. Migrated sites: for_forge, velveteen remote.rs, cloud config.rs test helper, kamaji native.rs/tail.rs/server.rs/hydrate.rs tests, headscale_appliance.rs (typed field; @Ashguard:citadel notified, recorded the roll hazard on R858), topology.rs (Declared(d.clone()) + TOML fixtures -> [durability] tables, hints -> durability.state_mb), digest.rs test key. TS bindings regenerated. W349 gained a 'Landed (R896-F3)' section. noisetable-account.toml edited UNCOMMITTED in ~/ss/noisetable ([durability] table + roll-order warning).")
+/// @yah:handoff("LANDED: yah.limits.* / yah.placement.memory-request-mb / yah.durability.* are typed fields (ResourceLimits.{memory_request_mb,cpu_limit_millis,pids_max,scratch_floor_mb}, WorkloadSpec.durability), every one #[serde(default)] so it crosses a V13 skew with no ProtocolVersion bump. Retired annotations are REFUSED (validate::shape names the replacement field; WorkloadSpec::durability() also refuses yah.durability.* so kamaji hydrate fails closed). Full detail in the IMPLEMENTED handoff above. Schemas + TS bindings regenerated; W349 has a 'Landed (R896-F3)' section. Discovered-and-fixed beyond the site list: desktop shell_host.rs, crates/yah/hub workload.rs, local-driver passway/cloudflared literals; yah-cloud-admin.toml and cloud-client doc prose; memory_request_mb() now also treats 0 as undeclared (a zero request would admit anywhere).")
+/// @yah:verify("root: cargo check --keep-going --workspace --all-targets → exit 0 (includes desktop); oss/qed: cargo check -p velveteen-exec --all-targets → green; scripts/check-schema-drift.sh and scripts/check-workload-spec-ts.sh → ok")
+/// @yah:gotcha("oss/kamaji --all-targets check is currently red ONLY in a peer's in-flight test code in crates/kamaji/src/container_net.rs (Cmd.ignore_failure), not mine. The kamaji lib itself compiles.")
+/// @yah:cleanup("scripts/roll-node.sh and scripts/publish-yubaba-release.sh still mention `yah.durability.tier` in historical comments.")
+///
+/// @yah:ticket(R896-T4, "SchemaVersion: adopt as the per-spec migration carrier or delete it (W349 item 4)")
+/// @yah:status(review)
+/// @yah:at(2026-09-14T23:51:33Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R896)
+/// @arch:see(.yah/docs/working/W349-evolvable-kamaji-wire-envelope.md)
+/// @yah:handoff("DELETED, not adopted (the ticket's recommendation; grounded before the edit). SchemaVersion enum + oss/yah-base/crates/workload-spec/src/version.rs gone; `schema_version` field removed from WorkloadSpec, ContainerBuild, MesofactStaticWorkload, TenantPasswayWorkload, AlmanacManifest, StaticAssetWorkload; export_ts emit removed; every constructor across oss/kamaji (15 files + kamaji-proto digest.rs), oss/yubaba (20), oss/yah-base local-driver (4), crates/yah/hub, app/yah/cli cloud.rs, app/yah/desktop shell_host.rs stripped; the frozen list in kamaji-proto/tests/tolerant_field_policy.rs dropped `schema_version`; key removed from 13 workload.toml/workload.json manifests (incl. .yah/infra/workloads/yah-cloud-admin.toml, rusty-v8-musl), 17 workload-spec JSON fixtures, cloud-client's sample JSON, the TS round-trip test, and scripts/check-cloud-admin-image-guard.sh. Ticket annotation moved from version.rs onto `pub struct WorkloadSpec`. W349 item 4 + its status line updated. WHY DELETION IS SAFE ON READ: no carrying struct denies unknown keys, so a leftover key is ignored — pinned by new tests lib.rs `a_legacy_schema_version_key_is_ignored` (TOML, both spellings) and tests/round_trip.rs `a_legacy_schema_version_key_is_ignored_and_not_written` (JSON; replaced `schema_version_serializes_as_v1`). Nothing persisted carries it: yubaba-consensus raft holds no WorkloadSpec; kamaji's on-disk BundleDeployRecord holds MesofactServeBundle only. NOT TOUCHED, deliberately: same-named but unrelated fields — tower-rules SchemaVersion, mesofact-bundle/tenant-pointer u32s, service/mirror/domain/secret/provider `schema_version` (u32), kamaji StatefulServiceContract, passway README route config; external ~/ss/noisetable workload tomls keep a now-ignored key. Discovered stale docs fixed: cloud reconciler/mod.rs workload_kind() and mesofact_static.rs read_mesofact_build() both claimed the typed envelope rejects `schema_version = 1` (false since R546-B7, moot now).")
+/// @yah:gotcha("ROLL SKEW THIS OPENS (the one direction): an OLD reader requires the key. On-node yubaba->kamaji is already a matched V13 paired ship, so it rides that. Off-node: a post-T4 CLI/desktop `POST /workloads/deploy` (cloud-client deploy_workload) against an un-rolled yubaba fails loudly as a missing-field decode until that node rolls. Old clients against new nodes are fine (extra key ignored).")
+/// @yah:handoff("VERIFY PASS 2026-09-14 (session:e4478e54). Deletion confirmed by content; follow-on fixes found while verifying: (1) .yah/schema/workload.toml.schema.json was still emitting SchemaVersion — regenerated via `cargo run -p xtask -- emit-schemas` (-65 lines); packages/yah/workload-spec/index.ts was already current. (2) Third stale copy of the 'typed envelope rejects schema_version = 1' justification fixed at app/yah/cli/src/cloud.rs read_workload_build doc (~:5653). (3) Dead `schema_version = \"V1\"` keys dropped from test fixtures: cloud.rs write_workload_with_aliases (~:19298), oss/yubaba/crates/cloud/src/validate.rs (:1090, :1222); mesofact_static.rs read_mesofact_build_extracts_host_side_default comment (~:2295) reworded — it deliberately keeps the legacy integer key as an ignored-key regression. (4) R896-F3 breakage: its literal sweep missed two yah-local-driver test helpers — local_runtime.rs:1308 and pond_ssr_runtime.rs:431 lacked memory_request_mb/cpu_limit_millis/pids_max/scratch_floor_mb and durability; filled with None.")
+/// @yah:verify("cargo test --manifest-path oss/yah-base/Cargo.toml -p yah-workload-spec: 205 + 107 passed, 0 failed")
+/// @yah:verify("cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-proto: 39 + 4 + 5 passed, 0 failed")
+/// @yah:verify("cargo test --manifest-path oss/yah-base/Cargo.toml -p yah-local-driver: 111 passed (was a compile failure before fix 4)")
+/// @yah:verify("cargo test --manifest-path oss/yubaba/crates/cloud/Cargo.toml --lib -- validate mesofact_static: 111 passed")
+/// @yah:verify("cargo check --tests clean (no errors) for oss/yah-base, oss/yubaba, oss/kamaji workspaces and root `-p yah`")
+/// @yah:verify("./scripts/check-schema-drift.sh: ok, in sync")
+/// @yah:gotcha("An earlier `cargo check -p yah -p yah-hub --tests` in this pass hit `recursion limit reached while expanding $crate::json_internal!` in the yah lib; a re-check minutes later compiled clean with no edit from me — a peer's in-flight edit (app/yah/cli/src/mcp/tools.rs is dirty in the shared tree), not this ticket.")
+/// @yah:handoff("RE-CHECK 2026-09-14 (session:1e5ba11e). Deletion still holds by content: version.rs absent, no SchemaVersion in workload-spec/kamaji-proto/.yah/schema/TS, no workload manifest carries the key. Dropped two more dead `schema_version = 1` lines from scaffold-manifest fixtures in oss/yah-base/crates/workload-spec/tests/round_trip.rs (mesofact_static_build_table_without_a_command_parses_as_none, an_unknown_build_key_is_still_refused_now_that_command_is_optional). `cargo test -p yah-workload-spec`: 205 + 107 passed. Remaining `schema_version = 1` hits in oss/mesofact server.rs / route_headers_parity.rs are the mesofact-bundle manifest's own u32 — unrelated, correctly untouched.")
+///
+/// @yah:ticket(R896-B5, "apply's R892 schema-drift lint hard-errors on the legacy schema_version key that R896-T4 declared safe to leave ignored")
+/// @yah:status(review)
+/// @yah:at(2026-09-15T17:51:01Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R896)
+/// @yah:next("\"Tier: Cleric. Give the R892 lint (wherever it lives — grep the exact error text 'declares a key the workload schema does not have') a concept of 'known-legacy, intentionally-ignored' keys, seeded at minimum with schema_version, OR have R896-T4-style field deletions register their retired key in whatever allowlist the lint reads. Either way the fix should mean a future retired-field cleanup does not have to manually sweep every downstream repo's committed TOML the same day the field is deleted upstream.\"")
+/// @yah:gotcha("\"THE CONFLICT: R896-T4's handoff explicitly says 'external ~/ss/noisetable workload tomls keep a now-ignored key' as an accepted, safe end state — deletion from WorkloadSpec was deliberately NOT paired with deleting the key from noisetable's own committed TOML, because leaving it is meant to be harmless. But the R892 anti-silent-drop lint (added after the 2026-09-11 incident where a key present in a file and absent from the deployed spec destroyed a live workload) does not know schema_version is on an allowed-legacy list — it has no such list — so it hard-errors exactly as it's designed to for ANY unrecognized key, including this now-intentionally-tolerated one. Worked around downstream by deleting the dead key from noisetable's three workload.toml files (harmless per R896-T4), but that only fixes this one repo for this one key; the general shape of the conflict (a field WorkloadSpec deliberately deletes-but-tolerates vs. a lint that has no concept of 'tolerated legacy key') will recur for the next field R896 or a similar cleanup retires.\"")
+/// @yah:assumes("\"NOT verified: whether other downstream repos beyond ~/ss/noisetable also carry schema_version in committed workload.toml files and would hit the same apply failure the next time they run current yah.\"")
+/// @arch:see(.yah/docs/working/W349-evolvable-kamaji-wire-envelope.md)
+/// @yah:handoff("LANDED: `workload_spec::RETIRED_KEYS` (+ `RetiredKey {path, retired_by}`) right after `pub struct WorkloadSpec` in oss/yah-base/crates/workload-spec/src/lib.rs, seeded with `schema_version` / R896-T4. Doc states the rule: only INERT keys go on it — a key whose value changed node behaviour (resources.ephemeral_storage_mb) must stay refused. A future field deletion registers its key in the same diff, so no downstream TOML sweep is forced.")
+/// @yah:handoff("oss/yubaba/crates/cloud/src/config.rs refuse_dropped_keys: dropped paths found in RETIRED_KEYS are filtered out and printed as `warning: <file> declares `<key>`, retired by <ticket> and ignored; delete it`; every other dropped key still hard-errors unchanged.")
+/// @yah:handoff("Discovered: the R892-B1 test fixture REAL_WORKLOAD_TOML still carried `schema_version = 1` (the real yah-cloud-admin.toml no longer does), so `a_workload_file_whose_keys_all_survive_the_parse_is_accepted` was refusing its own fixture after R896-T4 (inferred from the code; not run against the pre-change tree). Dropped the dead key from the fixture.")
+/// @yah:handoff("New tests in config.rs: `every_retired_key_is_ignored_not_refused` (registry-driven, handles dotted paths) and `a_retired_key_does_not_excuse_an_unknown_one`.")
+/// @yah:verify("cd oss/yubaba && cargo test -p yah-cloud --lib → 1253 passed, 0 failed, 4 ignored")
+/// @yah:verify("cd oss/yah-base && cargo test -p yah-workload-spec → 207 + 108 passed")
+/// @yah:verify("Both packages are NOT root-workspace members: `cargo test -p yah-cloud` from the repo root errors 'not a member of the workspace' — run from oss/yubaba / oss/yah-base.")
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct WorkloadSpec {
-    /// Wire-format version; always `V1` today. Present at the top level so
-    /// rolling clusters can detect and migrate across schema generations.
-    pub schema_version: SchemaVersion,
-
     /// DNS-friendly workload name, e.g. `"noisetable-api"`. Regex:
     /// `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, length ≤ 63.
     pub name: String,
@@ -2773,6 +2934,20 @@ pub struct WorkloadSpec {
     /// are independent and can be set in any combination.
     pub expose: ExposeSpec,
 
+    /// Where a second copy of this workload's state lives, and how far behind
+    /// it may be (R850-P4). `None` means **nobody said**, which is a different
+    /// answer from a declared [`DurabilityTier::None`] — see
+    /// [`WorkloadSpec::durability`], the only supported read, since it also
+    /// enforces the cross-field rules serde cannot.
+    ///
+    /// Additive and defaulted: a peer that predates the field sends no
+    /// declaration, which is exactly what it meant (R896-F3). It replaced the
+    /// `yah.durability.*` annotation family; a spec still carrying one of
+    /// those keys is refused rather than read as undeclared.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub durability: Option<Durability>,
+
     /// OCI-style labels, passed through to the container. Opaque to yubaba.
     #[serde(default)]
     pub labels: HashMap<String, String>,
@@ -2812,6 +2987,35 @@ pub struct WorkloadSpec {
     #[serde(default)]
     pub files: Vec<InlineFile>,
 }
+
+/// A key [`WorkloadSpec`] used to have, deleted because its value never
+/// changed what a node does (R896-B5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredKey {
+    /// Dotted path from the spec root, e.g. `"schema_version"` or
+    /// `"resources.some_key"` — the same spelling a dropped-key refusal reports.
+    pub path: &'static str,
+    /// The ticket that deleted the field.
+    pub retired_by: &'static str,
+}
+
+/// Keys a hand-authored workload file may still declare after the field was
+/// deleted, and which a loader must therefore ignore rather than refuse.
+///
+/// `cloud`'s R892-B1 check refuses any key the parser drops, because a dropped
+/// key is normally an operator's intent evaporating — `resources.
+/// ephemeral_storage_mb` did exactly that and cost a live workload on
+/// 2026-09-11. A field whose value was pure bookkeeping carries no intent, so
+/// deleting it should not force every downstream camp to sweep its committed
+/// TOML the same day. Register it here in the same diff that deletes the field.
+///
+/// **Only inert keys belong here.** If ignoring the old value would make a node
+/// behave differently from what the file says (a limit, a mount, a policy), the
+/// refusal is the point: leave it off this list and let the file be fixed.
+pub const RETIRED_KEYS: &[RetiredKey] = &[RetiredKey {
+    path: "schema_version",
+    retired_by: "R896-T4",
+}];
 
 /// One entry of [`WorkloadSpec::files`] — a file the node materializes from
 /// the spec itself.
@@ -2862,16 +3066,8 @@ impl WorkloadSpec {
     ) -> Self {
         let mut annotations = HashMap::new();
         annotations.insert("yah.forge".into(), "true".into());
-        // The placement floor, kept distinct from the cgroup ceiling below.
-        // Without this, admission reads the 32 GiB ceiling as the amount of
-        // RAM a node must have — see `memory_request_mb` for what that cost.
-        annotations.insert(
-            MEMORY_REQUEST_ANNOTATION.into(),
-            FORGE_MEMORY_REQUEST_MB.to_string(),
-        );
 
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             // NB: DNS-label safe (no dots) — `check_name` validation rejects
             // dots here. The container_id derives from this; the state-poll
             // keys off `expose.mesh.identity` (`forge.<id>`) instead, so those
@@ -2904,12 +3100,23 @@ impl WorkloadSpec {
                 // unlimited there).
                 //
                 // That last clause is only true while this stays a CEILING. It
-                // was also the placement floor until the annotation set above
+                // was also the placement floor until `memory_request_mb` below
                 // split the two, which made every build-worker under 32 GiB
                 // unschedulable — the story is on `memory_request_mb`.
                 memory_mb: FORGE_MEMORY_LIMIT_MB,
                 cpu_millis: 512,
-                ephemeral_storage_mb: 512,
+                // The placement floor, kept distinct from the cgroup ceiling
+                // above. Without it, admission reads the 32 GiB ceiling as the
+                // amount of RAM a node must have.
+                memory_request_mb: Some(FORGE_MEMORY_REQUEST_MB),
+                cpu_limit_millis: None,
+                pids_max: None,
+                // Carried over verbatim from the `ephemeral_storage_mb: 512`
+                // this spec used to set (R885-T6). It changes nothing today and
+                // is not meant to: the microVM backend's own 8 GiB floor has
+                // always dominated this number. It is here so the workload's
+                // declared minimum survives rather than evaporating.
+                scratch_floor_mb: Some(FORGE_SCRATCH_FLOOR_MB),
             },
             depends_on: vec![],
             requires: vec![],
@@ -2932,6 +3139,7 @@ impl WorkloadSpec {
                 public: None,
                 operator: None,
             },
+            durability: None,
             labels: HashMap::new(),
             annotations,
             files: Vec::new(),
@@ -3061,10 +3269,9 @@ impl WorkloadSpec {
     /// workload — its **request**, as distinct from [`ResourceLimits::memory_mb`],
     /// which is a **ceiling** the backend turns into a cgroup `memory.max`.
     ///
-    /// Opt-in via `annotations["yah.placement.memory-request-mb"]` (see
-    /// [`MEMORY_REQUEST_ANNOTATION`]); absent or unparseable falls back to
+    /// Opt-in via [`ResourceLimits::memory_request_mb`]; absent falls back to
     /// `resources.memory_mb`, so every spec that does not set it is admitted
-    /// exactly as it was before this accessor existed.
+    /// exactly as it was before the request existed.
     ///
     /// # Why the two numbers must not be the same one
     ///
@@ -3083,19 +3290,93 @@ impl WorkloadSpec {
     /// target for remote CI. This is R590-B10's own recorded follow-up
     /// ("thread a per-step memory request … instead of a blanket forge
     /// default"), reduced to the seam that closes the bug.
-    ///
-    /// An annotation rather than a new `ResourceLimits` field on purpose:
-    /// `WorkloadSpec` crosses a postcard wire that is positional and
-    /// carries no field names (R590-B3), so adding a field would break decode
-    /// on every fleet node still running an older kamaji. `annotations` is an
-    /// existing map — an extra key rides it safely, and admission already
-    /// reads placement inputs from exactly there
-    /// ([`Self::requires_taint`], the R594 node-selector).
     pub fn memory_request_mb(&self) -> u32 {
-        self.annotations
-            .get(MEMORY_REQUEST_ANNOTATION)
-            .and_then(|v| v.trim().parse::<u32>().ok())
+        // `0` falls back too: a zero request would admit the workload on any
+        // node at all, which is never what a declared request meant.
+        self.resources
+            .memory_request_mb
+            .filter(|mb| *mb > 0)
             .unwrap_or(self.resources.memory_mb)
+    }
+
+    /// The hard CPU ceiling (millicores) a backend may enforce, if the workload
+    /// declares one — the exact mirror of [`Self::memory_request_mb`], which
+    /// adds the missing *request* beside a field that is a ceiling. Here the
+    /// field ([`ResourceLimits::cpu_millis`]) is the *request* and this adds the
+    /// missing ceiling.
+    ///
+    /// Opt-in via [`ResourceLimits::cpu_limit_millis`]. Absent or `0` means **no
+    /// ceiling**: the workload gets its declared share of a contended node and
+    /// may burst to the whole box on an idle one. That is the default because
+    /// `cpu_millis` is documented as a request, and every backend but one has
+    /// always rendered it as a relative weight
+    /// ([`ResourceLimits::cpu_shares`]).
+    ///
+    /// # Why this exists (R885-B5 / W344 Finding 5)
+    ///
+    /// R885-B1 wired the cgroup v2 driver onto the live native deploy path, and
+    /// that driver rendered `cpu_millis` into `cpu.max` — a hard quota. Measured
+    /// on us-east-001 on 2026-09-11: four native workloads at
+    /// `cpu.max = 25600 100000`, i.e. capped at 0.256 of a core even on an idle
+    /// node, where before the wiring they could burst to the whole machine. A
+    /// request rendered as a ceiling is a semantic bug, not a missing feature.
+    pub fn cpu_limit_millis(&self) -> Option<u32> {
+        self.resources.cpu_limit_millis.filter(|millis| *millis > 0)
+    }
+
+    /// The hard process-count ceiling (cgroup v2 `pids.max`) a backend
+    /// enforces on this workload's leaf — R885-T2 (W344 Finding 3: "no bound
+    /// on a fork bomb, accidental or otherwise").
+    ///
+    /// Shaped like [`Self::cpu_limit_millis`] (an opt-in override), but its
+    /// default runs the OPPOSITE direction on purpose. An absent
+    /// `cpu_limit_millis` correctly means "no ceiling", because `cpu_millis`
+    /// already has a well-defined request-only meaning without it. There is no
+    /// such fallback for pids: "unbounded" is precisely the bug R885-T2 closed,
+    /// not a feature to preserve, so absent or `0` both fall back to
+    /// [`DEFAULT_PIDS_MAX`] instead of to "unset".
+    ///
+    /// [`DEFAULT_PIDS_MAX`]'s doc comment records where the number comes
+    /// from and why it does not need to be tight to be useful.
+    ///
+    /// Opt-in override via [`ResourceLimits::pids_max`] for a workload that
+    /// legitimately needs a different bound.
+    pub fn pids_limit(&self) -> u32 {
+        self.resources
+            .pids_max
+            .filter(|pids| *pids > 0)
+            .unwrap_or(DEFAULT_PIDS_MAX)
+    }
+
+    /// A **floor** on the microVM scratch disk in MiB — the smallest workspace
+    /// this workload is willing to be given, or `None` for "the backend's own
+    /// floor is fine".
+    ///
+    /// Opt-in via [`ResourceLimits::scratch_floor_mb`]. Absent or `0` both mean
+    /// **no declared floor**; the microVM backend still applies its own
+    /// (`microvm::WORKSPACE_MIN_BYTES`), which is what actually sizes every
+    /// workload in this tree today.
+    ///
+    /// # Why this replaced a field (R885-T6 / W344)
+    ///
+    /// It is the successor to `ResourceLimits::ephemeral_storage_mb`, which was
+    /// deleted rather than renamed because the field **lied**. Its doc comment
+    /// called it a "cap on the writable layer + tmpfs footprint" and no backend
+    /// ever enforced it as one — not the OCI resources block, not docker's
+    /// argv, and deliberately not the cgroup v2 driver. Its single live
+    /// consumer, [`microvm::workspace::disk_size_bytes`], read it as a
+    /// **floor**, i.e. the exact opposite. `for_forge` then set it to 512 MiB,
+    /// a number that as a cap would have failed every build at its first
+    /// checkout and as a floor was simply ignored.
+    ///
+    /// A field that means one thing at its definition and the reverse at its
+    /// only use is not a field to keep compatible with, so per the pre-1.0
+    /// doctrine in `CLAUDE.md` the design changed instead of being taped: the
+    /// floor is now spelled `floor`.
+    ///
+    /// [`microvm::workspace::disk_size_bytes`]: https://docs.rs/kamaji
+    pub fn scratch_floor_mb(&self) -> Option<u32> {
+        self.resources.scratch_floor_mb.filter(|mb| *mb > 0)
     }
 
     /// Whether this workload must be run by kamaji's **native** (fork+exec)
@@ -3187,6 +3468,87 @@ impl WorkloadSpec {
             .unwrap_or(false)
     }
 
+    /// The substrate this spec selects, as an *ordered* value (R894-F1).
+    ///
+    /// The same reading [`Self::wants_native_exec`] and [`Self::wants_microvm`]
+    /// perform, collapsed into one total function so that "which substrate is
+    /// this" has a single answer rather than two booleans a caller re-combines.
+    /// Every existing `if wants_native_exec() … else if wants_microvm() …`
+    /// ladder in the tree is that re-combination, and R605-F8's own doc notes
+    /// that a duplicated ladder is exactly what drifts when a fourth substrate
+    /// arrives.
+    ///
+    /// An unrecognised `yah.exec` value reads as [`ExecSubstrate::Container`],
+    /// preserving what both predicates already do. That is the fail-*closed*
+    /// direction for the trust check in [`Self::trust`]'s consumers: a typo'd
+    /// `microvm` on an untrusted spec reads as a container and is refused,
+    /// rather than reading as the microVM the author meant to ask for.
+    pub fn exec_substrate(&self) -> ExecSubstrate {
+        match self
+            .annotations
+            .get(NATIVE_EXEC_ANNOTATION)
+            .map(String::as_str)
+        {
+            Some(v) if v == NATIVE_EXEC_VALUE => ExecSubstrate::Native,
+            Some(v) if v == MICROVM_EXEC_VALUE => ExecSubstrate::MicroVm,
+            _ => ExecSubstrate::Container,
+        }
+    }
+
+    /// How far this workload's code is trusted, from [`TRUST_ANNOTATION`]
+    /// (R894-F1).
+    ///
+    /// Absent means [`TrustLevel::Trusted`] — see that type's docs for why that
+    /// default is safe only because of *where* the untrusted marker is stamped.
+    /// An unrecognised value is an `Err`, never a fallback to either side.
+    pub fn trust(&self) -> std::result::Result<TrustLevel, TrustDeclError> {
+        match self.annotations.get(TRUST_ANNOTATION).map(|v| v.trim()) {
+            None => Ok(TrustLevel::Trusted),
+            Some(v) if v == TRUST_TRUSTED_VALUE => Ok(TrustLevel::Trusted),
+            Some(v) if v == TRUST_UNTRUSTED_VALUE => Ok(TrustLevel::Untrusted),
+            Some(other) => Err(TrustDeclError::UnknownLevel(other.to_string())),
+        }
+    }
+
+    /// Stamp this spec as carrying code the operator did not write, and raise
+    /// its substrate request to the minimum that trust level requires.
+    ///
+    /// **This is the choke-point verb.** Any constructor that turns third-party
+    /// bytes (a tenant image, a vended camp, a user-supplied argv) into a
+    /// `WorkloadSpec` calls it *in the same function that takes those bytes*, so
+    /// the marker cannot be lost by a caller who forgets. R823 is the first such
+    /// path.
+    ///
+    /// It raises the substrate rather than only marking trust because the two
+    /// halves belong to the same decision and splitting them across two call
+    /// sites is how one of them goes missing. Raising is one-directional: a
+    /// caller that already asked for something at least as strong keeps its own
+    /// request, so stamping a spec that explicitly wants a microVM is a no-op
+    /// and stamping is idempotent.
+    ///
+    /// A spec that had asked for `native` becomes `microvm`. That is not a
+    /// silent downgrade — it is a *widening* of isolation, the safe direction —
+    /// and it happens at the moment the untrusted origin is established, not at
+    /// admission, where the same mismatch is a refusal.
+    pub fn stamp_untrusted(&mut self) {
+        self.annotations.insert(
+            TRUST_ANNOTATION.to_string(),
+            TRUST_UNTRUSTED_VALUE.to_string(),
+        );
+        let floor = TrustLevel::Untrusted.minimum_substrate();
+        if self.exec_substrate() < floor {
+            match floor.annotation_value() {
+                Some(v) => {
+                    self.annotations
+                        .insert(NATIVE_EXEC_ANNOTATION.to_string(), v.to_string());
+                }
+                None => {
+                    self.annotations.remove(NATIVE_EXEC_ANNOTATION);
+                }
+            }
+        }
+    }
+
     /// Whether this workload builds its **own unprivileged container sandbox**
     /// inside the one the backend gives it, and therefore needs the two
     /// capabilities plus the `no_new_privs` relaxation that setting up a
@@ -3255,6 +3617,47 @@ impl WorkloadSpec {
             .unwrap_or(false)
     }
 
+    /// The host paths this workload declares it **writes to** (R885-B11 / W344),
+    /// from [`WRITABLE_PATHS_ANNOTATION`]. Empty when nothing is declared.
+    ///
+    /// This is the input to kamaji's native filesystem confinement: a native
+    /// workload is a plain `fork`+`exec` on the host, so the only description of
+    /// what it may write is the one its spec carries. `kamaji::sandbox` unions
+    /// these with the spec's `Bind` volumes and denies writes everywhere else —
+    /// and confines **only** a workload that declares one or the other, so a
+    /// spec that says nothing about its writes is not silently guessed at.
+    ///
+    /// # Why an annotation rather than a field
+    ///
+    /// It qualifies the substrate markers (`yah.exec`, `yah.sandbox`) that
+    /// already ride the annotation map, and it is a policy hint for the
+    /// sandbox rather than a fact about the workload's shape. (The original
+    /// reason — a positional postcard wire on which every new field was a
+    /// protocol bump — stopped holding at kamaji-proto V13, R896-F2.)
+    ///
+    /// ```toml
+    /// [annotations]
+    /// "yah.writable-paths" = "/var/lib/yah/qed,/tmp"
+    /// ```
+    ///
+    /// # What is refused, and why refused rather than normalized
+    ///
+    /// A relative entry, a `.`/`..` component, an empty entry (a stray comma),
+    /// or a duplicate. Each of these would otherwise turn into a *grant* — a
+    /// landlock rule is `PathBeneath`, so a mis-resolved path does not fail
+    /// closed, it opens a subtree nobody asked for. Normalizing silently is how
+    /// you grant write access to the wrong directory and never hear about it.
+    ///
+    /// Note that a declared path is a **ceiling, not a mount**: nothing here
+    /// creates a directory. A path that does not exist on the node is skipped
+    /// (with a warning) when the ruleset is built.
+    pub fn writable_paths(&self) -> Result<Vec<PathBuf>, WritablePathsDeclError> {
+        match self.annotations.get(WRITABLE_PATHS_ANNOTATION) {
+            None => Ok(Vec::new()),
+            Some(raw) => parse_writable_paths(raw),
+        }
+    }
+
     /// The durability tier this workload declares for its own state, if it
     /// declares one at all (R850-P4).
     ///
@@ -3265,21 +3668,31 @@ impl WorkloadSpec {
     /// collapsing the two would let the analyzer report that case in the same
     /// words as a deliberately-ephemeral cache.
     ///
-    /// Declared as annotations rather than fields, for the reason
-    /// [`Self::requires_taint`] and [`Self::memory_request_mb`] already record:
-    /// `WorkloadSpec` crosses a positional postcard wire carrying no field
-    /// names (R590-B3), so a new field breaks decode on every fleet node still
-    /// running an older kamaji, and forces a struct-literal edit at every
-    /// construction site.
-    ///
     /// ```toml
-    /// [annotations]
-    /// "yah.durability.tier"        = "stream"          # none|snapshot|dedup|stream
-    /// "yah.durability.engine"      = "turso"           # required by every tier but "none"
-    /// "yah.durability.store"       = "s3://yah-backups/noisetable-account"
-    /// "yah.durability.subjects"    = "accounts.db,passkeys.db,sessions.db"
-    /// "yah.durability.rpo-seconds" = "120"             # stream only
+    /// [durability]
+    /// tier        = "stream"          # none|snapshot|dedup|stream
+    /// engine      = "turso"           # required by every tier but "none"
+    /// store       = "s3://yah-backups/noisetable-account"
+    /// subjects    = ["accounts.db", "passkeys.db", "sessions.db"]
+    /// rpo_seconds = 120               # stream only
     /// ```
+    ///
+    /// # Read this, not the field
+    ///
+    /// Serde refuses an unknown tier or engine and a non-numeric RPO, but it
+    /// cannot see the rules that span fields — a shipping tier with no store,
+    /// an RPO on a snapshot tier, a subject that escapes its volume. Those are
+    /// [`Durability::check`], and this accessor is the one read that applies
+    /// it, so a malformed declaration refuses at every consumer rather than only
+    /// at the ones that remembered to validate.
+    ///
+    /// # The retired annotations (R896-F3)
+    ///
+    /// This declaration was the `yah.durability.*` annotation family until
+    /// kamaji-proto V13 made a field addition cross a skew. Any surviving key
+    /// of that family is [`DurabilityDeclError::RetiredAnnotation`], never
+    /// ignored: an ignored annotation is indistinguishable from an absent one,
+    /// and "absent" here means "this database has no backup".
     ///
     /// # Why `engine` and `subjects` are not optional (R850-F1)
     ///
@@ -3312,142 +3725,90 @@ impl WorkloadSpec {
     /// `cloud::topology` can tell an operator, *before* the topology is
     /// committed, which of their stateful workloads has no second copy of its
     /// bytes anywhere.
-    pub fn durability(&self) -> Result<Option<Durability>, DurabilityDeclError> {
-        let Some(raw) = self.annotations.get(DURABILITY_TIER_ANNOTATION) else {
-            // A store or an RPO without a tier is a half-written declaration,
-            // and reading it as "undeclared" is how a typo'd tier key becomes
-            // silent data loss.
-            for orphan in [
-                DURABILITY_STORE_ANNOTATION,
-                DURABILITY_RPO_ANNOTATION,
-                DURABILITY_STATE_MB_ANNOTATION,
-                DURABILITY_ENGINE_ANNOTATION,
-                DURABILITY_SUBJECTS_ANNOTATION,
-            ] {
-                if self.annotations.contains_key(orphan) {
-                    return Err(DurabilityDeclError::OrphanKey { key: orphan });
-                }
-            }
+    pub fn durability(&self) -> Result<Option<&Durability>, DurabilityDeclError> {
+        if let Some(key) = self
+            .annotations
+            .keys()
+            .filter(|k| k.starts_with("yah.durability."))
+            .min()
+        {
+            return Err(DurabilityDeclError::RetiredAnnotation {
+                key: key.clone(),
+                field: retired_annotation_field(key).unwrap_or("durability"),
+            });
+        }
+        let Some(d) = &self.durability else {
             return Ok(None);
         };
+        d.check()?;
+        Ok(Some(d))
+    }
 
-        let tier = DurabilityTier::parse(raw.trim()).ok_or_else(|| {
-            DurabilityDeclError::UnknownTier {
-                value: raw.clone(),
-            }
-        })?;
-
-        let store = self
-            .annotations
-            .get(DURABILITY_STORE_ANNOTATION)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        // A tier that ships bytes somewhere needs to name the somewhere.
-        // Defaulting it would put the only copy of a database in a bucket
-        // nobody chose.
-        if tier.ships_bytes() && store.is_none() {
-            return Err(DurabilityDeclError::MissingStore { tier });
-        }
-        if !tier.ships_bytes() && store.is_some() {
-            return Err(DurabilityDeclError::StoreWithoutTier);
-        }
-
-        let rpo_seconds = match self.annotations.get(DURABILITY_RPO_ANNOTATION) {
-            None => None,
-            Some(v) => {
-                if tier != DurabilityTier::Stream {
-                    return Err(DurabilityDeclError::RpoOnNonStreamTier { tier });
-                }
-                Some(v.trim().parse::<u32>().map_err(|_| {
-                    DurabilityDeclError::UnparseableRpo { value: v.clone() }
-                })?)
-            }
-        };
-
-        let state_mb = match self.annotations.get(DURABILITY_STATE_MB_ANNOTATION) {
-            None => None,
-            Some(v) => Some(v.trim().parse::<u32>().map_err(|_| {
-                DurabilityDeclError::UnparseableStateMb { value: v.clone() }
-            })?),
-        };
-
-        // R850-F1: the engine axis. Required by every tier that ships bytes,
-        // because the three tier names are turso-backup's and a spec that means
-        // something else must say so rather than be discovered at restore time.
-        let engine = match self.annotations.get(DURABILITY_ENGINE_ANNOTATION) {
-            Some(v) => {
-                let e = DurabilityEngine::parse(v.trim()).ok_or_else(|| {
-                    DurabilityDeclError::UnknownEngine {
-                        value: v.clone(),
-                    }
-                })?;
-                if !tier.ships_bytes() {
-                    return Err(DurabilityDeclError::EngineWithoutTier);
-                }
-                Some(e)
-            }
-            None if tier.ships_bytes() => return Err(DurabilityDeclError::MissingEngine { tier }),
-            None => None,
-        };
-
-        let subjects = match self.annotations.get(DURABILITY_SUBJECTS_ANNOTATION) {
-            Some(v) => {
-                if !tier.ships_bytes() {
-                    return Err(DurabilityDeclError::SubjectsWithoutTier);
-                }
-                parse_durability_subjects(v)?
-            }
-            None if tier.ships_bytes() => {
-                return Err(DurabilityDeclError::MissingSubjects { tier })
-            }
-            None => Vec::new(),
-        };
-
-        Ok(Some(Durability {
-            tier,
-            engine,
-            store,
-            subjects,
-            rpo_seconds,
-            state_mb,
-        }))
+    /// The first annotation (in key order) this spec still carries from a
+    /// family R896-F3 moved into typed fields, paired with the field that
+    /// replaced it. `None` for every spec written against the fields.
+    ///
+    /// [`validate::shape`] refuses on it. It exists because nothing reads
+    /// those keys any more, and a key nothing reads fails silently: a
+    /// `yah.limits.pids-max` would quietly fall back to the default bound, and
+    /// a `yah.durability.tier` would quietly mean "no backup".
+    pub fn retired_annotation(&self) -> Option<(&str, &'static str)> {
+        self.annotations
+            .keys()
+            .filter_map(|k| retired_annotation_field(k).map(|field| (k.as_str(), field)))
+            .min()
     }
 }
 
-/// Split and validate [`DURABILITY_SUBJECTS_ANNOTATION`].
+/// The typed field that replaced a retired annotation key (R896-F3), or `None`
+/// for a key that was never retired.
 ///
-/// Every rule here exists because the result is joined onto a host directory
+/// Unrecognised keys under a retired prefix map to their parent field rather
+/// than to `None`: a misspelled `yah.durability.teir` is still an attempt at a
+/// durability declaration, and passing it would be the silent drop this exists
+/// to prevent.
+pub fn retired_annotation_field(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "yah.placement.memory-request-mb" => "resources.memory_request_mb",
+        "yah.limits.cpu-millis" => "resources.cpu_limit_millis",
+        "yah.limits.pids-max" => "resources.pids_max",
+        "yah.limits.scratch-floor-mb" => "resources.scratch_floor_mb",
+        "yah.durability.tier" => "durability.tier",
+        "yah.durability.engine" => "durability.engine",
+        "yah.durability.store" => "durability.store",
+        "yah.durability.subjects" => "durability.subjects",
+        "yah.durability.rpo-seconds" => "durability.rpo_seconds",
+        "yah.durability.state-mb" => "durability.state_mb",
+        k if k.starts_with("yah.limits.") => "resources",
+        k if k.starts_with("yah.durability.") => "durability",
+        _ => return None,
+    })
+}
+
+/// Validate [`Durability::subjects`].
+///
+/// Every rule here exists because each subject is joined onto a host directory
 /// (`/var/lib/yah/kamaji/volumes/<name>`) by something that then *writes* to
 /// it. An absolute path or a `..` component would put a restore outside the
 /// volume it was scoped to, so those are refused by name rather than
 /// normalized — silently rewriting a path a human typed is how you restore the
 /// right bytes to the wrong place.
-fn parse_durability_subjects(raw: &str) -> Result<Vec<String>, DurabilityDeclError> {
-    let mut out = Vec::new();
-    for part in raw.split(',') {
-        let s = part.trim();
-        if s.is_empty() {
+fn check_durability_subjects(subjects: &[String]) -> Result<(), DurabilityDeclError> {
+    for (i, s) in subjects.iter().enumerate() {
+        if s.trim().is_empty() {
             return Err(DurabilityDeclError::EmptySubject);
         }
         if s.starts_with('/') || s.starts_with('\\') || s.contains(':') {
-            return Err(DurabilityDeclError::AbsoluteSubject {
-                subject: s.to_string(),
-            });
+            return Err(DurabilityDeclError::AbsoluteSubject { subject: s.clone() });
         }
         if s.split('/').any(|c| c == "." || c == "..") {
-            return Err(DurabilityDeclError::TraversingSubject {
-                subject: s.to_string(),
-            });
+            return Err(DurabilityDeclError::TraversingSubject { subject: s.clone() });
         }
-        if out.contains(&s.to_string()) {
-            return Err(DurabilityDeclError::DuplicateSubject {
-                subject: s.to_string(),
-            });
+        if subjects[..i].contains(s) {
+            return Err(DurabilityDeclError::DuplicateSubject { subject: s.clone() });
         }
-        out.push(s.to_string());
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Which database engine a [`DurabilityTier`]'s three tier names refer to
@@ -3457,7 +3818,8 @@ fn parse_durability_subjects(raw: &str) -> Result<Vec<String>, DurabilityDeclErr
 /// from `turso-backup`'s implementation, so an appliance running anything else
 /// gets a refusal at parse time instead of a tier nothing can honour. Adding an
 /// engine means adding a restore path, not adding a string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DurabilityEngine {
     /// Turso / libSQL, via `turso-backup`. `snapshot` is its tier 1a `VACUUM
@@ -3467,13 +3829,6 @@ pub enum DurabilityEngine {
 }
 
 impl DurabilityEngine {
-    fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "turso" => Some(Self::Turso),
-            _ => None,
-        }
-    }
-
     /// The wire/TOML spelling, so a diagnostic and the file it points at agree.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -3495,7 +3850,8 @@ impl fmt::Display for DurabilityEngine {
 /// tiers. They are spelled here rather than imported because `workload-spec`
 /// is a leaf crate every fleet node links and `turso-backup` is a service-side
 /// dependency; the coupling that matters is the vocabulary, not the types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DurabilityTier {
     /// Deliberately no second copy. State lives only where the container runs
@@ -3517,23 +3873,13 @@ pub enum DurabilityTier {
 
     /// `turso-backup` tier 2 — WAL-frame streaming with restore by frame
     /// replay. The only tier with a *bounded, declarable* loss window; see
-    /// [`WorkloadSpec::durability`]'s `rpo-seconds` and
+    /// [`Durability::rpo_seconds`] and
     /// `turso_backup::stream::DEFAULT_RPO_TARGET` (120 s), which is what an
     /// undeclared RPO means in practice.
     Stream,
 }
 
 impl DurabilityTier {
-    fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "none" => Some(Self::None),
-            "snapshot" => Some(Self::Snapshot),
-            "dedup" => Some(Self::Dedup),
-            "stream" => Some(Self::Stream),
-            _ => None,
-        }
-    }
-
     /// The wire/TOML spelling, so a diagnostic and the file it points at agree.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -3557,52 +3903,109 @@ impl fmt::Display for DurabilityTier {
     }
 }
 
-/// A parsed `yah.durability.*` declaration. See [`WorkloadSpec::durability`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A workload's durability declaration — [`WorkloadSpec::durability`].
+///
+/// Every field but `tier` defaults, because which of them are required depends
+/// on the tier, and that is a rule serde cannot express. [`Self::check`] is
+/// where it is enforced; read the declaration through
+/// [`WorkloadSpec::durability`], which applies it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct Durability {
     pub tier: DurabilityTier,
     /// Which engine's tier vocabulary this is. `Some` exactly when
-    /// [`DurabilityTier::ships_bytes`] — enforced by the accessor (R850-F1).
+    /// [`DurabilityTier::ships_bytes`] — enforced by [`Self::check`] (R850-F1).
+    #[serde(default)]
+    #[ts(optional = nullable)]
     pub engine: Option<DurabilityEngine>,
-    /// Object-store URL the copy lives at. `Some` exactly when
-    /// [`DurabilityTier::ships_bytes`] — enforced by the accessor.
+    /// Object-store URL the copy lives at. `Some` (and non-blank) exactly when
+    /// [`DurabilityTier::ships_bytes`] — enforced by [`Self::check`].
+    #[serde(default)]
+    #[ts(optional = nullable)]
     pub store: Option<String>,
     /// Volume-relative paths of the database files this tier covers, in
     /// declaration order. Non-empty exactly when
-    /// [`DurabilityTier::ships_bytes`] — enforced by the accessor (R850-F1).
+    /// [`DurabilityTier::ships_bytes`] — enforced by [`Self::check`] (R850-F1).
     ///
     /// Volume-relative, never absolute: the same string is joined onto the
     /// container's mount target when read as documentation and onto
     /// `/var/lib/yah/kamaji/volumes/<name>` when a hydrate writes it. Each is
     /// also the object-store key suffix under [`Self::store`], so the layout an
     /// operator sees in the bucket mirrors the layout on the volume.
+    #[serde(default)]
     pub subjects: Vec<String>,
     /// Declared recovery-point objective in seconds. [`DurabilityTier::Stream`]
     /// only; `None` there means `turso_backup::stream::DEFAULT_RPO_TARGET`.
+    #[serde(default)]
+    #[ts(optional = nullable)]
     pub rpo_seconds: Option<u32>,
     /// Expected steady-state size of this workload's state, in MiB — the input
     /// a cold-start-from-object-store estimate needs and cannot get anywhere
-    /// else. `resources.ephemeral_storage_mb` is not it: that caps the writable
-    /// layer and tmpfs, and a named volume is neither.
+    /// else. The microVM scratch floor ([`WorkloadSpec::scratch_floor_mb`]) is
+    /// not it: that sizes a job's ephemeral workspace, and a named volume is
+    /// neither ephemeral nor a workspace.
     ///
     /// **Declared, never measured.** Any recovery-time figure derived from it
     /// inherits that, and must say so at the point it is printed.
+    #[serde(default)]
+    #[ts(optional = nullable)]
     pub state_mb: Option<u32>,
 }
 
-/// A `yah.durability.*` declaration that cannot be read as one.
+impl Durability {
+    /// The rules that span fields, which serde cannot enforce. Checked in the
+    /// order a human would fix them: where the copy goes, when, what engine,
+    /// which files.
+    pub fn check(&self) -> Result<(), DurabilityDeclError> {
+        let tier = self.tier;
+        let ships = tier.ships_bytes();
+
+        // A tier that ships bytes needs to name the somewhere. Defaulting it
+        // would put the only copy of a database in a bucket nobody chose.
+        let store = self.store.as_deref().filter(|s| !s.trim().is_empty());
+        if ships && store.is_none() {
+            return Err(DurabilityDeclError::MissingStore { tier });
+        }
+        if !ships && self.store.is_some() {
+            return Err(DurabilityDeclError::StoreWithoutTier);
+        }
+
+        if self.rpo_seconds.is_some() && tier != DurabilityTier::Stream {
+            return Err(DurabilityDeclError::RpoOnNonStreamTier { tier });
+        }
+
+        // R850-F1: the engine axis. Required by every tier that ships bytes,
+        // because the three tier names are turso-backup's and a spec that means
+        // something else must say so rather than be discovered at restore time.
+        match (ships, self.engine) {
+            (true, None) => return Err(DurabilityDeclError::MissingEngine { tier }),
+            (false, Some(_)) => return Err(DurabilityDeclError::EngineWithoutTier),
+            _ => {}
+        }
+
+        match (ships, self.subjects.is_empty()) {
+            (true, true) => return Err(DurabilityDeclError::MissingSubjects { tier }),
+            (false, false) => return Err(DurabilityDeclError::SubjectsWithoutTier),
+            _ => {}
+        }
+        check_durability_subjects(&self.subjects)
+    }
+}
+
+/// A durability declaration that cannot be acted on.
 ///
 /// Every variant is a *refusal to guess*. The alternative — falling back to
 /// "undeclared" on a malformed value, the way [`WorkloadSpec::memory_request_mb`]
 /// falls back to its ceiling — is safe there and unsafe here: a mistyped memory
 /// request costs a placement, a mistyped durability tier costs the database.
+/// (An unknown tier or engine, or a non-numeric RPO, no longer reaches this
+/// type: those are serde refusals on the typed field.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurabilityDeclError {
-    /// `yah.durability.tier` holds something outside the vocabulary.
-    UnknownTier { value: String },
-    /// A `store`/`rpo-seconds` key with no `tier` key beside it — most often
-    /// `tier` spelled wrong.
-    OrphanKey { key: &'static str },
+    /// R896-F3: the spec still declares durability through the retired
+    /// `yah.durability.*` annotations. Nothing reads them, so passing the spec
+    /// would silently mean "no backup".
+    RetiredAnnotation { key: String, field: &'static str },
     /// A tier that ships bytes with nowhere to ship them.
     MissingStore { tier: DurabilityTier },
     /// `tier = "none"` with a store — contradictory, and the reader cannot
@@ -3610,12 +4013,6 @@ pub enum DurabilityDeclError {
     StoreWithoutTier,
     /// An RPO on a tier that has no bounded loss window to state.
     RpoOnNonStreamTier { tier: DurabilityTier },
-    /// `rpo-seconds` is not a number of seconds.
-    UnparseableRpo { value: String },
-    /// `state-mb` is not a number of mebibytes.
-    UnparseableStateMb { value: String },
-    /// R850-F1: `yah.durability.engine` holds something with no restore path.
-    UnknownEngine { value: String },
     /// R850-F1: a bytes-shipping tier with no engine. The tier names are
     /// turso-backup's; a spec that means a different engine has to say so.
     MissingEngine { tier: DurabilityTier },
@@ -3626,8 +4023,8 @@ pub enum DurabilityDeclError {
     MissingSubjects { tier: DurabilityTier },
     /// R850-F1: subjects alongside `tier = "none"`.
     SubjectsWithoutTier,
-    /// R850-F1: an empty entry in the comma-separated subject list — a stray
-    /// or trailing comma. Skipping it silently would hide a truncated list.
+    /// R850-F1: a blank entry in the subject list. Skipping it silently would
+    /// hide a truncated list.
     EmptySubject,
     /// R850-F1: a subject that is not volume-relative.
     AbsoluteSubject { subject: String },
@@ -3641,97 +4038,234 @@ pub enum DurabilityDeclError {
 impl fmt::Display for DurabilityDeclError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownTier { value } => write!(
+            Self::RetiredAnnotation { key, field } => write!(
                 f,
-                "{DURABILITY_TIER_ANNOTATION} = {value:?} is not a known tier \
-                 (none|snapshot|dedup|stream)"
-            ),
-            Self::OrphanKey { key } => write!(
-                f,
-                "{key} is set but {DURABILITY_TIER_ANNOTATION} is not — a store or an RPO \
-                 with no tier backs up nothing; check the spelling of the tier key"
+                "annotation {key:?} is no longer read — durability is the typed `{field}` \
+                 field since R896-F3; move the declaration into a [durability] table, because \
+                 an ignored annotation would silently mean this workload has no backup"
             ),
             Self::MissingStore { tier } => write!(
                 f,
-                "{DURABILITY_TIER_ANNOTATION} = \"{tier}\" needs \
-                 {DURABILITY_STORE_ANNOTATION} — there is no default bucket, because a \
-                 default would put the only copy of this workload's state somewhere \
-                 nobody chose"
+                "durability.tier = \"{tier}\" needs durability.store — there is no default \
+                 bucket, because a default would put the only copy of this workload's state \
+                 somewhere nobody chose"
             ),
             Self::StoreWithoutTier => write!(
                 f,
-                "{DURABILITY_STORE_ANNOTATION} is set alongside \
-                 {DURABILITY_TIER_ANNOTATION} = \"none\"; drop one — either the state is \
-                 backed up or it is deliberately not"
+                "durability.store is set alongside durability.tier = \"none\"; drop one — \
+                 either the state is backed up or it is deliberately not"
             ),
             Self::RpoOnNonStreamTier { tier } => write!(
                 f,
-                "{DURABILITY_RPO_ANNOTATION} applies only to \
-                 {DURABILITY_TIER_ANNOTATION} = \"stream\", not \"{tier}\" — a snapshot \
-                 tier's recovery point is set by whatever schedules the snapshot, not by \
-                 the spec"
-            ),
-            Self::UnparseableRpo { value } => write!(
-                f,
-                "{DURABILITY_RPO_ANNOTATION} = {value:?} is not a whole number of seconds"
-            ),
-            Self::UnparseableStateMb { value } => write!(
-                f,
-                "{DURABILITY_STATE_MB_ANNOTATION} = {value:?} is not a whole number of MiB"
-            ),
-            Self::UnknownEngine { value } => write!(
-                f,
-                "{DURABILITY_ENGINE_ANNOTATION} = {value:?} has no restore path in this tree \
-                 (turso) — the tier names are turso-backup's, so another engine needs its own \
-                 implementation before it can name one"
+                "durability.rpo_seconds applies only to durability.tier = \"stream\", not \
+                 \"{tier}\" — a snapshot tier's recovery point is set by whatever schedules \
+                 the snapshot, not by the spec"
             ),
             Self::MissingEngine { tier } => write!(
                 f,
-                "{DURABILITY_TIER_ANNOTATION} = \"{tier}\" needs \
-                 {DURABILITY_ENGINE_ANNOTATION} = \"turso\" — the tier vocabulary is \
-                 turso-backup's, and a declaration that does not say so cannot be acted on"
+                "durability.tier = \"{tier}\" needs durability.engine = \"turso\" — the tier \
+                 vocabulary is turso-backup's, and a declaration that does not say so cannot \
+                 be acted on"
             ),
             Self::EngineWithoutTier => write!(
                 f,
-                "{DURABILITY_ENGINE_ANNOTATION} is set alongside \
-                 {DURABILITY_TIER_ANNOTATION} = \"none\"; nothing ships, so drop one"
+                "durability.engine is set alongside durability.tier = \"none\"; nothing \
+                 ships, so drop one"
             ),
             Self::MissingSubjects { tier } => write!(
                 f,
-                "{DURABILITY_TIER_ANNOTATION} = \"{tier}\" needs \
-                 {DURABILITY_SUBJECTS_ANNOTATION} — a restore's unit is a database file, not a \
-                 volume, and guessing which files in the volume are databases is guessing \
-                 about the only copy of this workload's state"
+                "durability.tier = \"{tier}\" needs durability.subjects — a restore's unit is \
+                 a database file, not a volume, and guessing which files in the volume are \
+                 databases is guessing about the only copy of this workload's state"
             ),
             Self::SubjectsWithoutTier => write!(
                 f,
-                "{DURABILITY_SUBJECTS_ANNOTATION} is set alongside \
-                 {DURABILITY_TIER_ANNOTATION} = \"none\"; nothing ships, so drop one"
+                "durability.subjects is set alongside durability.tier = \"none\"; nothing \
+                 ships, so drop one"
             ),
             Self::EmptySubject => write!(
                 f,
-                "{DURABILITY_SUBJECTS_ANNOTATION} has an empty entry (a stray or trailing \
-                 comma); every entry must name a database file"
+                "durability.subjects has a blank entry; every entry must name a database file"
             ),
             Self::AbsoluteSubject { subject } => write!(
                 f,
-                "{DURABILITY_SUBJECTS_ANNOTATION} entry {subject:?} must be relative to the \
-                 workload's named volume — an absolute path would restore outside it"
+                "durability.subjects entry {subject:?} must be relative to the workload's \
+                 volume — an absolute path would restore outside it"
             ),
             Self::TraversingSubject { subject } => write!(
                 f,
-                "{DURABILITY_SUBJECTS_ANNOTATION} entry {subject:?} contains a \".\" or \"..\" \
-                 component; it would restore outside the volume it is scoped to"
+                "durability.subjects entry {subject:?} contains a \".\" or \"..\" component; \
+                 it would restore outside the volume it is scoped to"
             ),
-            Self::DuplicateSubject { subject } => write!(
-                f,
-                "{DURABILITY_SUBJECTS_ANNOTATION} names {subject:?} twice"
-            ),
+            Self::DuplicateSubject { subject } => {
+                write!(f, "durability.subjects names {subject:?} twice")
+            }
         }
     }
 }
 
 impl std::error::Error for DurabilityDeclError {}
+
+/// Split and validate [`WRITABLE_PATHS_ANNOTATION`].
+///
+/// Mirrors [`check_durability_subjects`] in shape and in temperament, with the
+/// polarity of the absolute-path rule flipped: a subject is joined onto a volume
+/// root and must therefore be relative, while a writable path names a host
+/// directory outright and must therefore be absolute. Both refuse rather than
+/// normalize, for the same reason — the result is handed to something that
+/// grants access at that path.
+fn parse_writable_paths(raw: &str) -> Result<Vec<PathBuf>, WritablePathsDeclError> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for part in raw.split(',') {
+        let s = part.trim();
+        if s.is_empty() {
+            return Err(WritablePathsDeclError::EmptyPath);
+        }
+        if !s.starts_with('/') {
+            return Err(WritablePathsDeclError::RelativePath {
+                path: s.to_string(),
+            });
+        }
+        if s.split('/').any(|c| c == "." || c == "..") {
+            return Err(WritablePathsDeclError::TraversingPath {
+                path: s.to_string(),
+            });
+        }
+        let path = PathBuf::from(s);
+        if out.contains(&path) {
+            return Err(WritablePathsDeclError::DuplicatePath {
+                path: s.to_string(),
+            });
+        }
+        out.push(path);
+    }
+    Ok(out)
+}
+
+/// Why a [`WRITABLE_PATHS_ANNOTATION`] value could not be read (R885-B11).
+///
+/// Every variant is a refusal to guess, for the reason
+/// [`WorkloadSpec::writable_paths`] records: each entry becomes a *grant*, so a
+/// value nobody can read unambiguously must fail admission rather than resolve
+/// to whichever subtree the ambiguity happened to point at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WritablePathsDeclError {
+    /// An empty entry — a stray or trailing comma. Skipping it silently would
+    /// hide a truncated list.
+    EmptyPath,
+    /// A relative entry. There is no directory for it to be relative *to*: the
+    /// declaration is read on the node, by a daemon whose own working directory
+    /// is whatever systemd gave it.
+    RelativePath { path: String },
+    /// A `.` or `..` component. The resolved path is not the written one.
+    TraversingPath { path: String },
+    /// The same path twice — one of the two is a mistake, and the reader cannot
+    /// tell which.
+    DuplicatePath { path: String },
+}
+
+impl fmt::Display for WritablePathsDeclError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPath => write!(
+                f,
+                "{WRITABLE_PATHS_ANNOTATION} has an empty entry (a stray or trailing comma)"
+            ),
+            Self::RelativePath { path } => write!(
+                f,
+                "{WRITABLE_PATHS_ANNOTATION} entry {path:?} must be an absolute host path"
+            ),
+            Self::TraversingPath { path } => write!(
+                f,
+                "{WRITABLE_PATHS_ANNOTATION} entry {path:?} contains a \".\" or \"..\" component; \
+                 it would grant write access to a directory other than the one written down"
+            ),
+            Self::DuplicatePath { path } => {
+                write!(f, "{WRITABLE_PATHS_ANNOTATION} names {path:?} twice")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WritablePathsDeclError {}
+
+#[cfg(test)]
+mod writable_paths_tests {
+    use super::*;
+
+    fn spec_with(annotation: Option<&str>) -> WorkloadSpec {
+        let image = ImageRef {
+            registry: "localhost".into(),
+            repository: "native/svc".into(),
+            tag: "dev".into(),
+            digest: crate::testing::test_digest(),
+        };
+        let mut spec = WorkloadSpec::for_forge("w1", image, TierTag("infra".into()), vec![]);
+        if let Some(v) = annotation {
+            spec.annotations
+                .insert(WRITABLE_PATHS_ANNOTATION.to_string(), v.to_string());
+        }
+        spec
+    }
+
+    #[test]
+    fn an_undeclared_spec_yields_no_writable_paths() {
+        assert_eq!(
+            spec_with(None).writable_paths().unwrap(),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    #[test]
+    fn a_comma_separated_list_is_split_and_trimmed() {
+        let spec = spec_with(Some("/var/lib/yah/qed, /tmp"));
+        assert_eq!(
+            spec.writable_paths().unwrap(),
+            vec![PathBuf::from("/var/lib/yah/qed"), PathBuf::from("/tmp")]
+        );
+    }
+
+    #[test]
+    fn a_relative_entry_is_refused() {
+        let err = spec_with(Some("var/lib/yah/qed"))
+            .writable_paths()
+            .unwrap_err();
+        assert!(matches!(err, WritablePathsDeclError::RelativePath { .. }));
+    }
+
+    #[test]
+    fn a_traversing_entry_is_refused() {
+        let err = spec_with(Some("/var/lib/yah/qed/../../.."))
+            .writable_paths()
+            .unwrap_err();
+        assert!(matches!(err, WritablePathsDeclError::TraversingPath { .. }));
+    }
+
+    #[test]
+    fn a_trailing_comma_is_refused_rather_than_skipped() {
+        let err = spec_with(Some("/tmp,")).writable_paths().unwrap_err();
+        assert_eq!(err, WritablePathsDeclError::EmptyPath);
+    }
+
+    #[test]
+    fn a_duplicate_entry_is_refused() {
+        let err = spec_with(Some("/tmp,/tmp")).writable_paths().unwrap_err();
+        assert!(matches!(err, WritablePathsDeclError::DuplicatePath { .. }));
+    }
+
+    #[test]
+    fn the_declaration_is_independent_of_the_substrate_marker() {
+        // The two are orthogonal by construction: declaring writes says nothing
+        // about which backend runs the workload, and a native marker does not
+        // imply a declaration (that asymmetry is the whole of the "confine what
+        // describes itself" rule).
+        let spec = spec_with(Some("/tmp"));
+        assert!(!spec.wants_native_exec());
+        assert!(!spec_with(None)
+            .annotations
+            .contains_key(WRITABLE_PATHS_ANNOTATION));
+    }
+}
 
 /// Annotation key requesting a workload share the host network namespace.
 /// See [`WorkloadSpec::wants_host_network`].
@@ -3745,38 +4279,33 @@ pub const HOST_NETWORK_VALUE: &str = "host";
 /// carrying a specific taint. See [`WorkloadSpec::requires_taint`].
 pub const REQUIRES_TAINT_ANNOTATION: &str = "yah.placement.requires-taint";
 
-/// Annotation key carrying a workload's memory **request** in MiB — what a
-/// scheduler must find free on a node — separate from the `memory_mb`
-/// **ceiling** the backend enforces as a cgroup limit. See
-/// [`WorkloadSpec::memory_request_mb`].
-pub const MEMORY_REQUEST_ANNOTATION: &str = "yah.placement.memory-request-mb";
-
-/// Annotation key declaring where a workload's state is copied to, and how far
-/// behind that copy may be. See [`WorkloadSpec::durability`].
-pub const DURABILITY_TIER_ANNOTATION: &str = "yah.durability.tier";
-
-/// Annotation key naming the object store a [`DurabilityTier`] ships to.
-/// Required for every tier except [`DurabilityTier::None`].
-pub const DURABILITY_STORE_ANNOTATION: &str = "yah.durability.store";
-
-/// Annotation key carrying the declared recovery-point objective in seconds.
-/// [`DurabilityTier::Stream`] only.
-pub const DURABILITY_RPO_ANNOTATION: &str = "yah.durability.rpo-seconds";
-
-/// Annotation key naming which engine's tier vocabulary a declaration uses
-/// (R850-F1). Required for every tier except [`DurabilityTier::None`]. See
-/// [`DurabilityEngine`].
-pub const DURABILITY_ENGINE_ANNOTATION: &str = "yah.durability.engine";
-
-/// Annotation key listing the volume-relative database files a tier covers,
-/// comma-separated (R850-F1). Required for every tier except
-/// [`DurabilityTier::None`]. See [`Durability::subjects`].
-pub const DURABILITY_SUBJECTS_ANNOTATION: &str = "yah.durability.subjects";
-
-/// Annotation key carrying the expected size of a workload's state in MiB —
-/// the only declared input a cold-start-from-object-store estimate has. See
-/// [`Durability::state_mb`].
-pub const DURABILITY_STATE_MB_ANNOTATION: &str = "yah.durability.state-mb";
+/// Default `pids.max` for a workload that declares no
+/// [`ResourceLimits::pids_max`] — R885-T2.
+///
+/// `15%` of `4_194_304`, i.e. `629_145`. Both halves are grounded, not
+/// invented:
+///
+/// - **The percentage** is systemd's own `DefaultTasksMax=`, the share of
+///   `pid_max` systemd applies to any unit that does not set `TasksMax=`
+///   explicitly (`systemd-system.conf(5)`). `kamaji.service` is one such
+///   unit — it sets `Delegate=yes` but no `TasksMax=` — so this constant
+///   gives native workloads the same *proportion* systemd would already give
+///   the service itself.
+/// - **The base** is `4_194_304`, the `pid_max` systemd has shipped since
+///   v243 (2019) on every 64-bit host via `/usr/lib/sysctl.d/50-pid-max.conf`
+///   — the fleet's own baseline, since every node here runs kamaji as a
+///   systemd unit.
+///
+/// It does not need to be tight to be useful. A fork bomb today can exhaust
+/// the *entire node's* pid space, denying PIDs to every other cgroup on the
+/// box — sshd, monitoring, kamaji itself. A per-workload ceiling at 15% of
+/// that space turns "the node is down" into "this workload's cgroup is
+/// full", which is the actual blast-radius reduction R885-T2 asks for; it
+/// does not need to also be a tight budget. It is also nowhere near tight
+/// enough to strangle a legitimate workload — the forge build leg
+/// (`cargo build -jN`) fans out to at most a few hundred rustc/linker
+/// processes, several orders of magnitude below this ceiling.
+pub const DEFAULT_PIDS_MAX: u32 = 629_145;
 
 /// The memory request [`WorkloadSpec::for_forge`] declares (MiB).
 ///
@@ -3788,6 +4317,18 @@ pub const DURABILITY_STATE_MB_ANNOTATION: &str = "yah.durability.state-mb";
 /// a measured number rather than a guess, and it keeps the fleet's 8 GiB
 /// build-workers schedulable.
 pub const FORGE_MEMORY_REQUEST_MB: u32 = 2048;
+
+/// The microVM scratch floor [`WorkloadSpec::for_forge`] declares (MiB) — see
+/// [`ResourceLimits::scratch_floor_mb`].
+///
+/// 512 MiB, carried over unchanged from the `ephemeral_storage_mb` R885-T6
+/// deleted, and **inert by construction**: the microVM backend's own
+/// `WORKSPACE_MIN_BYTES` floor is 8 GiB, sixteen times this, and a floor is a
+/// `max`. It is preserved rather than dropped so the deletion of the field is a
+/// pure rename of a declaration and not a silent behaviour change, and so the
+/// number an operator would have to raise is visible in one place if a forge
+/// workspace ever needs to be bigger than the backend default.
+pub const FORGE_SCRATCH_FLOOR_MB: u32 = 512;
 
 /// The cgroup memory ceiling [`WorkloadSpec::for_forge`] sets (MiB).
 ///
@@ -3833,6 +4374,192 @@ pub const NESTED_SANDBOX_ANNOTATION: &str = "yah.sandbox";
 /// nested-sandbox grant (`CAP_SETUID` + `CAP_SETGID`, `no_new_privs` off).
 /// Any other value leaves the workload on the baseline sandbox.
 pub const NESTED_SANDBOX_VALUE: &str = "nested";
+
+/// Annotation key declaring the **host paths a workload writes to**, as a
+/// comma-separated list of absolute paths. See [`WorkloadSpec::writable_paths`].
+///
+/// A top-level key rather than `yah.sandbox.writable-paths`, deliberately:
+/// [`NESTED_SANDBOX_ANNOTATION`] is itself the bare key `yah.sandbox`, and two
+/// keys sharing that prefix while naming policies for two *different* backends
+/// (a container capability grant and a native filesystem confinement) is the
+/// kind of near-collision a reader has to keep straight by memory.
+pub const WRITABLE_PATHS_ANNOTATION: &str = "yah.writable-paths";
+
+/// Annotation key declaring **how much this workload's code is trusted**, from
+/// which admission derives the weakest isolation substrate it may run on
+/// (R894-F1). See [`WorkloadSpec::trust`] and [`TrustLevel`].
+///
+/// # Why a separate key from [`NATIVE_EXEC_ANNOTATION`]
+///
+/// `yah.exec` is a *request*: what the dispatcher wants. `yah.trust` is a
+/// *fact about the code*: where it came from. Folding them together — a fourth
+/// `yah.exec` value meaning "untrusted, so microvm" — would make the fact
+/// unstateable whenever the request is stricter than the minimum, and would
+/// silently discard it if a later ticket widened the substrate set. They are
+/// two different questions and a workload answers both.
+///
+/// The pairing is checked, not merely recorded: `cloud::config::admission_spec`
+/// refuses any spec whose declared trust exceeds what its requested substrate
+/// provides, so a `yah.trust = untrusted` workload cannot reach a node on the
+/// host kernel.
+pub const TRUST_ANNOTATION: &str = "yah.trust";
+
+/// Annotation value (for [`TRUST_ANNOTATION`]) declaring that this workload's
+/// code is **not** trusted to share a kernel with the fleet. Stamped by
+/// whatever ingests the code, never by the code's own author.
+pub const TRUST_UNTRUSTED_VALUE: &str = "untrusted";
+
+/// Annotation value (for [`TRUST_ANNOTATION`]) declaring operator-authored
+/// code. Identical in effect to omitting the key; it exists so an ingest path
+/// can state the fact positively instead of by silence.
+pub const TRUST_TRUSTED_VALUE: &str = "trusted";
+
+/// The execution substrate a workload runs on, **ordered by the isolation it
+/// provides** — `Native < Container < MicroVm`.
+///
+/// The ordering is the type's whole reason to exist, and it is the one kamaji's
+/// `Backend` enum documents widest-first: a native workload is fork+exec'd on
+/// the host with no boundary at all, a container gets namespaces and a cgroup
+/// on the host's kernel, and a microVM gets its own kernel behind hardware
+/// virtualization. `Ord` is derived, so *declaration order below is the
+/// security ordering* — do not reorder these variants, and insert a new one at
+/// the position its isolation actually places it.
+///
+/// This is the same three-way distinction [`crate::admission::GrantRuntime`]
+/// carries; that type stays separate because a grant names a substrate it
+/// *admits* (an unordered label in a signed document) while this one answers
+/// "is what I got at least as strong as what I need". `GrantRuntime::of_spec`
+/// delegates here so the two cannot disagree about how a spec reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExecSubstrate {
+    /// fork+exec on the host's own userland. Host kernel, no namespaces, no
+    /// image — [`WorkloadSpec::wants_native_exec`].
+    Native,
+    /// A container backend: host kernel, namespaces + cgroup, OCI rootfs. The
+    /// default when [`NATIVE_EXEC_ANNOTATION`] is absent or unrecognised.
+    Container,
+    /// A KVM guest with its own kernel — [`WorkloadSpec::wants_microvm`].
+    MicroVm,
+}
+
+impl ExecSubstrate {
+    /// The annotation value that selects this substrate, or `None` for
+    /// [`Self::Container`] (which is selected by saying nothing).
+    pub fn annotation_value(self) -> Option<&'static str> {
+        match self {
+            ExecSubstrate::Native => Some(NATIVE_EXEC_VALUE),
+            ExecSubstrate::MicroVm => Some(MICROVM_EXEC_VALUE),
+            ExecSubstrate::Container => None,
+        }
+    }
+
+    /// How a refusal should name this substrate to an operator. Matches the
+    /// annotation spelling for the two opt-outs; `container` is what every
+    /// message in the tree already calls the default.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExecSubstrate::Native => NATIVE_EXEC_VALUE,
+            ExecSubstrate::Container => "container",
+            ExecSubstrate::MicroVm => MICROVM_EXEC_VALUE,
+        }
+    }
+}
+
+/// How far a workload's code is trusted — the declared input from which
+/// admission derives a **minimum** [`ExecSubstrate`] (R894).
+///
+/// # Absent means trusted, and that is only safe because of where it is stamped
+///
+/// The default direction is the trap this axis exists to close, so it is worth
+/// stating exactly. Every `WorkloadSpec` in the tree today is built by operator
+/// code — a reconciler, an appliance builder, a qed dispatcher — and none of
+/// them declares trust. Making the absent key mean *untrusted* would refuse the
+/// entire fleet on the day this lands; making it mean *trusted* is correct for
+/// exactly that population and wrong for any other.
+///
+/// So the rule is not "absent means trusted". It is: **the single choke point
+/// that ingests code the operator did not write stamps
+/// [`TRUST_UNTRUSTED_VALUE`] as it builds the spec**
+/// ([`WorkloadSpec::stamp_untrusted`]), and a spec that reaches admission
+/// without having passed through operator-authored construction cannot exist.
+/// A tenant does not hand yah a `WorkloadSpec`; it hands yah an image and an
+/// argv, which yah's own code puts into a spec. That is why the marker is not
+/// self-attestable: the untrusted party never holds the pen.
+///
+/// R823 (untrusted camp vending on microVMs) is the first such choke point. If
+/// a second one appears, it stamps too — and the rule to apply is that any
+/// constructor taking third-party bytes calls
+/// [`stamp_untrusted`](WorkloadSpec::stamp_untrusted) in the same function that
+/// takes them, not in a caller that might be forgotten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum TrustLevel {
+    /// Operator-authored code. No substrate floor.
+    #[default]
+    Trusted,
+    /// Third-party code. Must not share a kernel with the fleet.
+    Untrusted,
+}
+
+impl TrustLevel {
+    /// The weakest substrate this trust level may run on.
+    ///
+    /// [`TrustLevel::Untrusted`] maps to [`ExecSubstrate::MicroVm`] because a
+    /// container shares the node's kernel, and "untrusted code never shares a
+    /// kernel with the fleet" is the rule this axis makes checkable. W344's
+    /// isolation table says "containerd or microVM" for higher-risk code; the
+    /// 2026-09-11 operator call resolved that disjunction to the strict side
+    /// for code the operator did not write.
+    ///
+    /// [`TrustLevel::Trusted`] maps to [`ExecSubstrate::Native`], the bottom of
+    /// the ordering — i.e. no constraint, which is what every workload running
+    /// today has.
+    pub fn minimum_substrate(self) -> ExecSubstrate {
+        match self {
+            TrustLevel::Trusted => ExecSubstrate::Native,
+            TrustLevel::Untrusted => ExecSubstrate::MicroVm,
+        }
+    }
+
+    /// The annotation value spelling this level.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrustLevel::Trusted => TRUST_TRUSTED_VALUE,
+            TrustLevel::Untrusted => TRUST_UNTRUSTED_VALUE,
+        }
+    }
+}
+
+/// Why a [`TRUST_ANNOTATION`] value could not be read (R894-F1).
+///
+/// Manual `Display` + `Error` impls in the same shape as
+/// [`WritablePathsDeclError`], so `workload-spec` keeps its no-`thiserror` lib
+/// surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustDeclError {
+    /// The value is neither [`TRUST_TRUSTED_VALUE`] nor
+    /// [`TRUST_UNTRUSTED_VALUE`].
+    ///
+    /// Refused rather than normalised to either side. Reading it as trusted
+    /// would let a typo (`untrused`) turn a microVM requirement off; reading it
+    /// as untrusted would refuse a fleet workload over a typo nobody can see.
+    /// Neither is a guess worth making about a security floor.
+    UnknownLevel(String),
+}
+
+impl std::fmt::Display for TrustDeclError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrustDeclError::UnknownLevel(v) => write!(
+                f,
+                "{TRUST_ANNOTATION} = {v:?} is not a trust level \
+                 (expected {TRUST_TRUSTED_VALUE:?} or {TRUST_UNTRUSTED_VALUE:?}); \
+                 omit the key for operator-authored code"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TrustDeclError {}
 
 // ── ImageRef ─────────────────────────────────────────────────────────────────
 
@@ -4100,6 +4827,20 @@ pub struct VolumeMount {
 
     /// Whether the container sees the volume as read-only.
     pub read_only: bool,
+
+    /// True when this mount was synthesized by yubaba's deploy-time secret
+    /// materializer (`secret_mount::materialize_file_secrets`) rather than
+    /// declared by the operator (R858-B26).
+    ///
+    /// `yah.durability.*`'s "exactly one named-or-bind volume" count
+    /// (`validate::shape`, `kamaji::hydrate::plan`) skips any mount with this
+    /// set, for the same reason it already skips `Tmpfs`: a secret bind is by
+    /// construction not where durable subjects live, and counting it made
+    /// every workload with both durable state and a file secret un-declarable.
+    /// Kamaji still mounts it exactly like any other `Bind` — this flag is
+    /// read only by the two durability-counting sites, nowhere else.
+    #[serde(default)]
+    pub from_secret_mount: bool,
 }
 
 /// Backing source for a volume mount.
@@ -4211,6 +4952,7 @@ pub mod forge_produced {
             },
             target: PathBuf::from(CONTAINER_DIR),
             read_only: false,
+            from_secret_mount: false,
         }
     }
 
@@ -4560,6 +5302,7 @@ pub mod forge_cache {
             },
             target: PathBuf::from(CONTAINER_DIR),
             read_only: false,
+            from_secret_mount: false,
         })
     }
 
@@ -4758,12 +5501,55 @@ pub struct ResourceLimits {
     /// CPU **request** in millicores (k8s convention): `1000` = one full core,
     /// `250` = `.25 CPU`. Unlike a Docker relative weight this is an
     /// allocatable quantity a bin-packer can subtract from a node's budget.
-    /// `0` means "no CPU limit". Backends that speak a relative weight derive
-    /// it via [`ResourceLimits::cpu_shares`].
+    /// `0` means "no declared request" — the workload gets the node's default
+    /// share. Backends that speak a relative weight derive it via
+    /// [`ResourceLimits::cpu_shares`].
+    ///
+    /// **It is not a ceiling.** A request answers "what share of a contended
+    /// node is mine"; nothing here says "stop at this much". A workload
+    /// declaring `250m` must still be able to burst to the whole box when the
+    /// box is idle. The hard ceiling is optional and rides
+    /// [`Self::cpu_limit_millis`] — R885-B5 / W344 Finding 5, filed after this
+    /// field was rendered into a cgroup `cpu.max` and throttled four live
+    /// workloads to a quarter core apiece.
     pub cpu_millis: u32,
 
-    /// Cap on the writable layer + tmpfs footprint, in MiB.
-    pub ephemeral_storage_mb: u32,
+    // The four below were `yah.placement.memory-request-mb` and the
+    // `yah.limits.*` annotations until R896-F3. Each defaults to `None`, which
+    // is exactly what a peer that predates the field meant, so adding them
+    // crossed a kamaji-proto V13 skew without a protocol bump. Read them
+    // through the `WorkloadSpec` accessors named on each: those own the
+    // fallback each one needs.
+    /// Memory **request** in MiB — what a scheduler must find free on a node,
+    /// separate from the [`Self::memory_mb`] ceiling. Read via
+    /// [`WorkloadSpec::memory_request_mb`], which falls back to the ceiling.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub memory_request_mb: Option<u32>,
+
+    /// Optional **hard CPU ceiling** in millicores — the mirror image of
+    /// `memory_request_mb`: [`Self::cpu_millis`] is the request, this is the
+    /// limit. Read via [`WorkloadSpec::cpu_limit_millis`]; `0` means none.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub cpu_limit_millis: Option<u32>,
+
+    /// Hard **process-count ceiling** — cgroup v2 `pids.max`. Read via
+    /// [`WorkloadSpec::pids_limit`], which falls back to [`DEFAULT_PIDS_MAX`]
+    /// rather than to "unbounded".
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub pids_max: Option<u32>,
+
+    /// A **floor** on the microVM scratch disk in MiB — the smallest workspace
+    /// this workload is willing to be given. Note the direction: the other
+    /// limits here are ceilings a backend enforces downward, this is a floor a
+    /// backend raises *up* to, and `floor` is in the name for exactly that
+    /// reason (R885-T6 deleted `ephemeral_storage_mb` because it was documented
+    /// as a cap and read as a floor). Read via [`WorkloadSpec::scratch_floor_mb`].
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub scratch_floor_mb: Option<u32>,
 }
 
 impl ResourceLimits {
@@ -5439,7 +6225,6 @@ mod tests {
     #[test]
     fn mesofact_static_routes_parse_at_the_top_level() {
         let src = r#"
-schema_version = 1
 kind = "mesofact-static"
 routes = "./mesofact.routes.ts"
 
@@ -5467,7 +6252,6 @@ out_dir = "dist"
     #[test]
     fn mesofact_static_routes_inside_build_is_rejected_by_name() {
         let src = r#"
-schema_version = 1
 kind = "mesofact-static"
 
 [build]
@@ -5524,7 +6308,6 @@ render_command = "mesofact-build render . --route {route}"
     #[test]
     fn container_recipe_parses_including_the_other_tier_s_table() {
         let src = r#"
-schema_version = 1
 name = "yah-cloud-admin"
 kind = "container"
 
@@ -5596,7 +6379,6 @@ port = 4325
     #[test]
     fn a_malformed_container_reference_still_names_the_missing_field() {
         let src = r#"
-schema_version = 1
 kind = "container"
 name = "noisetable-api"
 image = "ghcr.io/noisetable/api:v1@sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -5614,7 +6396,6 @@ replicas = 1
     #[test]
     fn a_container_with_neither_image_nor_build_names_both_forms() {
         let src = r#"
-schema_version = 1
 kind = "container"
 name = "yah-cloud-admin"
 
@@ -5633,7 +6414,6 @@ port = 4325
     #[test]
     fn a_recipe_lowers_only_once_a_build_has_produced_a_digest() {
         let recipe = ContainerBuild {
-            schema_version: SchemaVersion::V1,
             name: "yah-cloud-admin".into(),
             build: ContainerBuildStep {
                 dockerfile: "Dockerfile".into(),
@@ -5680,7 +6460,6 @@ port = 4325
     #[test]
     fn a_recipe_round_trips_on_disk_under_the_container_kind() {
         let recipe = Workload::Container(ContainerManifest::Recipe(ContainerBuild {
-            schema_version: SchemaVersion::V1,
             name: "yah-cloud-admin".into(),
             build: ContainerBuildStep::default(),
             run: ContainerRunConfig::default(),
@@ -5820,7 +6599,6 @@ port = 4325
     fn static_asset_workload_round_trips() {
         let src = format!(
             r#"
-schema_version = "V1"
 
 [[asset]]
 filename = "whisper/distil-large-v3-q5_1.bin"
@@ -5911,7 +6689,6 @@ license = "GPL-3.0"
     fn asset_entry_derive_mode_round_trips() {
         let src = format!(
             r#"
-schema_version = "V1"
 
 [[asset]]
 filename = "whisper/distil-large-v3-q5_1.bin"
@@ -5949,7 +6726,6 @@ params = {{ quant = "q5_1" }}
         // without ever emitting an empty `derive = ...` line.
         let src = format!(
             r#"
-schema_version = "V1"
 
 [[asset]]
 filename = "operator-curated.bin"
@@ -6016,7 +6792,6 @@ license = "mit"
             blake3: BlakeHash(HASH_64.into()),
         };
         let w = StaticAssetWorkload {
-            schema_version: SchemaVersion::V1,
             assets: vec![entry],
             aliases: BTreeMap::new(),
         };
@@ -6038,7 +6813,6 @@ license = "mit"
             blake3: BlakeHash(HASH_64.into()),
         };
         let w = StaticAssetWorkload {
-            schema_version: SchemaVersion::V1,
             assets: vec![entry],
             aliases: BTreeMap::new(),
         };
@@ -6074,7 +6848,6 @@ license = "mit"
             blake3: BlakeHash(HASH_64.into()),
         };
         let w = StaticAssetWorkload {
-            schema_version: SchemaVersion::V1,
             assets: vec![legacy, derived],
             aliases: BTreeMap::new(),
         };
@@ -6163,7 +6936,6 @@ license = "mit"
         let src = format!(
             r#"
 kind = "static-asset"
-schema_version = "V1"
 
 [[asset]]
 filename = "foo/bar.bin"
@@ -6175,6 +6947,29 @@ blake3   = "{HASH_64}"
         assert!(matches!(w, Workload::StaticAsset(_)));
     }
 
+    /// R896-T4 deleted `SchemaVersion`. Manifests written before that — any
+    /// camp that has not re-synced, e.g. `~/ss/noisetable`'s workload tomls —
+    /// still carry the key in both spellings it used to accept, and must load
+    /// with it ignored rather than refused.
+    #[test]
+    fn a_legacy_schema_version_key_is_ignored() {
+        for line in ["schema_version = 1", r#"schema_version = "V1""#] {
+            let src = format!(
+                r#"
+{line}
+kind = "static-asset"
+
+[[asset]]
+filename = "foo/bar.bin"
+source   = "sources/bar.bin"
+blake3   = "{HASH_64}"
+"#
+            );
+            let w: Workload = toml::from_str(&src).unwrap_or_else(|e| panic!("{line}: {e}"));
+            assert!(matches!(w, Workload::StaticAsset(_)));
+        }
+    }
+
     /// R546-B7: the format branch, both directions. Human-readable formats get
     /// the flat `kind`-tagged shape; postcard keeps the externally-tagged
     /// variant-index encoding the kamaji UDS depends on (R590-B3). Regressing
@@ -6184,7 +6979,6 @@ blake3   = "{HASH_64}"
         let src = format!(
             r#"
 kind = "static-asset"
-schema_version = "V1"
 
 [[asset]]
 filename = "foo/bar.bin"
@@ -6248,6 +7042,7 @@ blake3   = "{HASH_64}"
                 source: VolumeSource::Named { name: "data".into() },
                 target: PathBuf::from("/data"),
                 read_only: false,
+                from_secret_mount: false,
             }];
             spec.restart_policy = RestartPolicy::Always;
             spec.archetype = Some(archetype);
@@ -6303,6 +7098,7 @@ blake3   = "{HASH_64}"
             source: VolumeSource::Named { name: "pgdata".into() },
             target: PathBuf::from("/var/lib/postgresql/data"),
             read_only: false,
+            from_secret_mount: false,
         }];
         spec.restart_policy = RestartPolicy::Always;
         spec.archetype = None;
@@ -6820,6 +7616,144 @@ blake3   = "{HASH_64}"
         }
     }
 
+    // ─── R894-F1: trust as a declared axis ───────────────────────────────────
+
+    /// The security ordering is the derived `Ord`, so it has to be pinned
+    /// explicitly: a reorder of the variants would silently invert the whole
+    /// trust check in `cloud::config::check_trust_substrate` while compiling
+    /// cleanly.
+    #[test]
+    fn substrates_are_ordered_by_the_isolation_they_provide() {
+        assert!(ExecSubstrate::Native < ExecSubstrate::Container);
+        assert!(ExecSubstrate::Container < ExecSubstrate::MicroVm);
+
+        assert_eq!(
+            TrustLevel::Trusted.minimum_substrate(),
+            ExecSubstrate::Native
+        );
+        assert_eq!(
+            TrustLevel::Untrusted.minimum_substrate(),
+            ExecSubstrate::MicroVm
+        );
+        // Trusted's floor is the bottom of the ordering — i.e. no constraint,
+        // which is what every workload in the fleet has today.
+        for s in [
+            ExecSubstrate::Native,
+            ExecSubstrate::Container,
+            ExecSubstrate::MicroVm,
+        ] {
+            assert!(s >= TrustLevel::Trusted.minimum_substrate());
+        }
+    }
+
+    /// `exec_substrate` must agree with the two booleans it replaces on every
+    /// value, including the unrecognised one — that equivalence is what lets
+    /// `GrantRuntime::of_spec` delegate to it.
+    #[test]
+    fn exec_substrate_agrees_with_the_two_predicates_it_replaces() {
+        for (value, expected) in [
+            (None, ExecSubstrate::Container),
+            (Some(NATIVE_EXEC_VALUE), ExecSubstrate::Native),
+            (Some(MICROVM_EXEC_VALUE), ExecSubstrate::MicroVm),
+            // A typo fails CLOSED: it reads as a container, which an untrusted
+            // spec is refused for, rather than as the microVM it meant.
+            (Some("micro-vm"), ExecSubstrate::Container),
+            (Some(""), ExecSubstrate::Container),
+        ] {
+            let mut spec = archetype_test_spec("substrate");
+            if let Some(v) = value {
+                spec.annotations
+                    .insert(NATIVE_EXEC_ANNOTATION.to_string(), v.to_string());
+            }
+            assert_eq!(spec.exec_substrate(), expected, "yah.exec={value:?}");
+            assert_eq!(
+                spec.wants_native_exec(),
+                expected == ExecSubstrate::Native,
+                "yah.exec={value:?}"
+            );
+            assert_eq!(
+                spec.wants_microvm(),
+                expected == ExecSubstrate::MicroVm,
+                "yah.exec={value:?}"
+            );
+        }
+    }
+
+    /// Absent means trusted (the fleet's population today); an unrecognised
+    /// value is an error rather than a silent fallback to either side.
+    #[test]
+    fn trust_defaults_to_trusted_and_refuses_anything_it_cannot_read() {
+        let spec = archetype_test_spec("trust");
+        assert_eq!(spec.trust().unwrap(), TrustLevel::Trusted);
+
+        for (value, expected) in [
+            (TRUST_TRUSTED_VALUE, TrustLevel::Trusted),
+            (TRUST_UNTRUSTED_VALUE, TrustLevel::Untrusted),
+            // Whitespace around the value is trimmed, not refused.
+            ("  untrusted ", TrustLevel::Untrusted),
+        ] {
+            let mut spec = archetype_test_spec("trust");
+            spec.annotations
+                .insert(TRUST_ANNOTATION.to_string(), value.to_string());
+            assert_eq!(spec.trust().unwrap(), expected, "yah.trust={value:?}");
+        }
+
+        for bad in ["untrused", "UNTRUSTED", "yes", ""] {
+            let mut spec = archetype_test_spec("trust");
+            spec.annotations
+                .insert(TRUST_ANNOTATION.to_string(), bad.to_string());
+            let err = spec.trust().unwrap_err();
+            assert_eq!(err, TrustDeclError::UnknownLevel(bad.trim().to_string()));
+            assert!(
+                err.to_string().contains(bad.trim()),
+                "the error must quote the unreadable value"
+            );
+        }
+    }
+
+    /// The choke-point verb stamps *and* raises, is idempotent, and never
+    /// lowers a substrate a caller already asked for.
+    #[test]
+    fn stamp_untrusted_raises_the_substrate_and_never_lowers_it() {
+        // No marker (container) → raised to microvm.
+        let mut spec = archetype_test_spec("tenant");
+        spec.stamp_untrusted();
+        assert_eq!(spec.trust().unwrap(), TrustLevel::Untrusted);
+        assert_eq!(spec.exec_substrate(), ExecSubstrate::MicroVm);
+
+        // Idempotent: stamping twice changes nothing.
+        let once = spec.annotations.clone();
+        spec.stamp_untrusted();
+        assert_eq!(spec.annotations, once);
+
+        // `native` is a WIDENING when raised — the safe direction — and it
+        // happens here rather than being left for admission to refuse.
+        let mut native = archetype_test_spec("tenant");
+        native.annotations.insert(
+            NATIVE_EXEC_ANNOTATION.to_string(),
+            NATIVE_EXEC_VALUE.to_string(),
+        );
+        native.stamp_untrusted();
+        assert_eq!(native.exec_substrate(), ExecSubstrate::MicroVm);
+
+        // A caller that already asked for at least the floor keeps its request.
+        let mut vm = archetype_test_spec("tenant");
+        vm.annotations.insert(
+            NATIVE_EXEC_ANNOTATION.to_string(),
+            MICROVM_EXEC_VALUE.to_string(),
+        );
+        vm.stamp_untrusted();
+        assert_eq!(vm.exec_substrate(), ExecSubstrate::MicroVm);
+
+        // And the post-condition the whole axis rests on: a stamped spec always
+        // satisfies its own floor, so the choke point cannot emit a spec that
+        // admission will refuse.
+        for spec in [&spec, &native, &vm] {
+            let trust = spec.trust().unwrap();
+            assert!(spec.exec_substrate() >= trust.minimum_substrate());
+        }
+    }
+
     #[test]
     fn microvm_marked_spec_round_trips_through_json_as_a_container_workload() {
         // Same zero-blast-radius claim as the native case: a microVM workload
@@ -6846,26 +7780,160 @@ blake3   = "{HASH_64}"
         }
     }
 
+    // ── R885: resource ceilings ───────────────────────────────────────────────
+
+    /// R885-B5 / W344 Finding 5. The default has to be "no ceiling": every spec
+    /// in the tree predates the ceiling, and reading the request as a ceiling
+    /// is exactly the bug that throttled four live workloads to a quarter core
+    /// apiece on us-east-001.
+    #[test]
+    fn a_spec_that_declares_no_cpu_ceiling_has_none() {
+        let spec = archetype_test_spec("uncapped");
+        assert!(spec.resources.cpu_millis > 0, "premise: it has a request");
+        assert_eq!(spec.cpu_limit_millis(), None);
+    }
+
+    #[test]
+    fn a_declared_cpu_ceiling_is_read_independently_of_the_request() {
+        let mut spec = archetype_test_spec("capped");
+        spec.resources.cpu_limit_millis = Some(2000);
+        assert_eq!(spec.cpu_limit_millis(), Some(2000));
+        // Two independent numbers: the ceiling is not derived from the request,
+        // and reading one must not move the other.
+        assert_ne!(spec.cpu_limit_millis(), Some(spec.resources.cpu_millis));
+    }
+
+    /// An explicit `0` means "no ceiling" rather than "cap it at nothing".
+    /// Capping a workload at zero CPU is the worse failure of the two.
+    #[test]
+    fn a_zero_cpu_ceiling_is_no_ceiling() {
+        let mut spec = archetype_test_spec("odd");
+        spec.resources.cpu_limit_millis = Some(0);
+        assert_eq!(spec.cpu_limit_millis(), None);
+    }
+
+    /// R885-T2 / W344 Finding 3. Opposite default direction from the CPU
+    /// ceiling above: absent must fall back to a real bound, not to "no
+    /// ceiling" — an unbounded `pids.max` is exactly the fork-bomb bug this
+    /// ticket exists to close.
+    #[test]
+    fn a_spec_that_declares_no_pids_limit_gets_the_default() {
+        let spec = archetype_test_spec("uncapped-pids");
+        assert_eq!(spec.pids_limit(), DEFAULT_PIDS_MAX);
+    }
+
+    #[test]
+    fn a_declared_pids_limit_overrides_the_default() {
+        let mut spec = archetype_test_spec("capped-pids");
+        spec.resources.pids_max = Some(256);
+        assert_eq!(spec.pids_limit(), 256);
+    }
+
+    /// Unlike the CPU ceiling, a `0` falls back to the default bound, not to
+    /// "no ceiling".
+    #[test]
+    fn a_zero_pids_limit_falls_back_to_the_default() {
+        let mut spec = archetype_test_spec("odd-pids");
+        spec.resources.pids_max = Some(0);
+        assert_eq!(spec.pids_limit(), DEFAULT_PIDS_MAX);
+    }
+
+    // ── R896-F3: the retired annotations ─────────────────────────────────────
+
+    /// Every key the fields replaced maps to the field that replaced it, and
+    /// the annotations that stayed annotations do not.
+    #[test]
+    fn every_retired_annotation_names_its_replacement_and_the_markers_are_not_retired() {
+        for (key, field) in [
+            ("yah.placement.memory-request-mb", "resources.memory_request_mb"),
+            ("yah.limits.cpu-millis", "resources.cpu_limit_millis"),
+            ("yah.limits.pids-max", "resources.pids_max"),
+            ("yah.limits.scratch-floor-mb", "resources.scratch_floor_mb"),
+            ("yah.durability.tier", "durability.tier"),
+            ("yah.durability.rpo-seconds", "durability.rpo_seconds"),
+            // A typo under a retired prefix is still an attempt at the family.
+            ("yah.durability.teir", "durability"),
+            ("yah.limits.memory", "resources"),
+        ] {
+            assert_eq!(retired_annotation_field(key), Some(field), "{key}");
+        }
+        for key in [
+            "yah.exec",
+            "yah.sandbox",
+            "yah.forge",
+            "yah.placement.requires-taint",
+            "yah.writable-paths",
+        ] {
+            assert_eq!(retired_annotation_field(key), None, "{key}");
+        }
+    }
+
+    /// The backup-loss hazard R896-F3 was filed around: a spec still written
+    /// against the annotation family must not read as "undeclared", even when
+    /// it also carries a valid typed declaration.
+    #[test]
+    fn a_durability_annotation_is_refused_rather_than_read_as_undeclared() {
+        let mut spec = archetype_test_spec("legacy");
+        spec.annotations
+            .insert("yah.durability.tier".into(), "stream".into());
+        let err = spec.durability().unwrap_err();
+        assert_eq!(
+            err,
+            DurabilityDeclError::RetiredAnnotation {
+                key: "yah.durability.tier".into(),
+                field: "durability.tier",
+            }
+        );
+        assert!(err.to_string().contains("no backup"), "{err}");
+
+        spec.durability = Some(stream(&["a.db"]));
+        assert!(matches!(
+            spec.durability(),
+            Err(DurabilityDeclError::RetiredAnnotation { .. })
+        ));
+        assert_eq!(spec.retired_annotation(), Some(("yah.durability.tier", "durability.tier")));
+    }
+
     // ── R850-P4: durability declaration ──────────────────────────────────────
 
-    fn durability_spec(pairs: &[(&str, &str)]) -> WorkloadSpec {
-        let mut spec = archetype_test_spec("durable");
-        for (k, v) in pairs {
-            spec.annotations.insert((*k).into(), (*v).into());
+    fn stream(subjects: &[&str]) -> Durability {
+        Durability {
+            tier: DurabilityTier::Stream,
+            engine: Some(DurabilityEngine::Turso),
+            store: Some("s3://backups/db".into()),
+            subjects: subjects.iter().map(|s| s.to_string()).collect(),
+            rpo_seconds: None,
+            state_mb: None,
         }
-        spec
+    }
+
+    fn none_tier() -> Durability {
+        Durability {
+            tier: DurabilityTier::None,
+            engine: None,
+            store: None,
+            subjects: vec![],
+            rpo_seconds: None,
+            state_mb: None,
+        }
+    }
+
+    fn check(d: Durability) -> Result<(), DurabilityDeclError> {
+        d.check()
     }
 
     /// The distinction the whole surface rests on. Every spec in the tree
-    /// predates the annotation, so `None` has to keep meaning "nobody said" —
+    /// predates the declaration, so `None` has to keep meaning "nobody said" —
     /// and a workload that says `tier = "none"` has to be distinguishable from
     /// one that never considered the question, because only one of those is a
     /// finding.
     #[test]
     fn an_absent_declaration_and_a_declared_none_are_different_answers() {
-        assert_eq!(durability_spec(&[]).durability().unwrap(), None);
+        let mut spec = archetype_test_spec("durable");
+        assert_eq!(spec.durability().unwrap(), None);
 
-        let declared = durability_spec(&[(DURABILITY_TIER_ANNOTATION, "none")])
+        spec.durability = Some(none_tier());
+        let declared = spec
             .durability()
             .unwrap()
             .expect("tier = none is a declaration");
@@ -6873,19 +7941,21 @@ blake3   = "{HASH_64}"
         assert_eq!(declared.store, None);
     }
 
+    /// The authoring shape, parsed the way a workload.toml/JSON spec is: a
+    /// table with snake_case keys and real numbers and lists — no more
+    /// comma-joined strings.
     #[test]
     fn a_stream_tier_carries_its_store_rpo_and_state_size() {
-        let d = durability_spec(&[
-            (DURABILITY_TIER_ANNOTATION, "stream"),
-            (DURABILITY_ENGINE_ANNOTATION, "turso"),
-            (DURABILITY_STORE_ANNOTATION, "s3://backups/db"),
-            (DURABILITY_SUBJECTS_ANNOTATION, "accounts.db"),
-            (DURABILITY_RPO_ANNOTATION, "30"),
-            (DURABILITY_STATE_MB_ANNOTATION, "100"),
-        ])
-        .durability()
-        .unwrap()
-        .expect("declared");
+        let d: Durability = serde_json::from_value(serde_json::json!({
+            "tier": "stream",
+            "engine": "turso",
+            "store": "s3://backups/db",
+            "subjects": ["accounts.db"],
+            "rpo_seconds": 30,
+            "state_mb": 100,
+        }))
+        .expect("a complete declaration decodes");
+        d.check().expect("and is valid");
         assert_eq!(d.tier, DurabilityTier::Stream);
         assert_eq!(d.engine, Some(DurabilityEngine::Turso));
         assert_eq!(d.store.as_deref(), Some("s3://backups/db"));
@@ -6894,65 +7964,52 @@ blake3   = "{HASH_64}"
         assert_eq!(d.state_mb, Some(100));
     }
 
-    /// A misspelled tier must not read as "no backups configured". This is the
-    /// one place the crate's usual permissive-fallback habit
-    /// (`memory_request_mb`, `wants_host_network`) is actively wrong: a
-    /// mistyped memory request costs a placement, a mistyped durability tier
-    /// costs the database.
+    /// A misspelled tier or engine, a non-numeric RPO, and a declaration with
+    /// no tier at all are serde refusals now — the vocabulary checks the
+    /// annotation parser used to hand-roll. Pinned so nobody "helpfully" adds a
+    /// fallback variant and turns `streem` into "no backups".
     #[test]
-    fn a_misspelled_tier_is_refused_rather_than_read_as_undeclared() {
-        let err = durability_spec(&[(DURABILITY_TIER_ANNOTATION, "streem")])
-            .durability()
-            .unwrap_err();
-        assert_eq!(
-            err,
-            DurabilityDeclError::UnknownTier {
-                value: "streem".into()
-            }
-        );
-        assert!(err.to_string().contains("none|snapshot|dedup|stream"));
-    }
-
-    /// The same failure one key over: `yah.durability.teir = "stream"` leaves a
-    /// store behind with no tier, which without this check is indistinguishable
-    /// from a workload that declared nothing at all.
-    #[test]
-    fn a_store_with_no_tier_key_names_the_likely_typo() {
-        let err = durability_spec(&[(DURABILITY_STORE_ANNOTATION, "s3://backups/db")])
-            .durability()
-            .unwrap_err();
-        assert_eq!(
-            err,
-            DurabilityDeclError::OrphanKey {
-                key: DURABILITY_STORE_ANNOTATION
-            }
-        );
-        assert!(err.to_string().contains("spelling"));
+    fn a_malformed_declaration_is_refused_at_decode() {
+        for bad in [
+            serde_json::json!({ "tier": "streem" }),
+            serde_json::json!({ "tier": "stream", "engine": "postgres" }),
+            serde_json::json!({ "tier": "stream", "rpo_seconds": "2m" }),
+            serde_json::json!({ "tier": "none", "state_mb": "100MB" }),
+            serde_json::json!({ "store": "s3://backups/db" }),
+        ] {
+            assert!(
+                serde_json::from_value::<Durability>(bad.clone()).is_err(),
+                "{bad} must not decode"
+            );
+        }
     }
 
     #[test]
     fn a_tier_that_ships_bytes_must_name_where() {
-        let err = durability_spec(&[(DURABILITY_TIER_ANNOTATION, "snapshot")])
-            .durability()
+        for store in [None, Some("  ".to_string())] {
+            let err = check(Durability {
+                store,
+                ..stream(&["a.db"])
+            })
             .unwrap_err();
-        assert_eq!(
-            err,
-            DurabilityDeclError::MissingStore {
-                tier: DurabilityTier::Snapshot
-            }
-        );
-        // The refusal has to say why there is no default, or the next reader
-        // adds one.
-        assert!(err.to_string().contains("nobody chose"));
+            assert_eq!(
+                err,
+                DurabilityDeclError::MissingStore {
+                    tier: DurabilityTier::Stream
+                }
+            );
+            // The refusal has to say why there is no default, or the next
+            // reader adds one.
+            assert!(err.to_string().contains("nobody chose"));
+        }
     }
 
     #[test]
     fn a_store_alongside_tier_none_is_contradictory_and_refused() {
-        let err = durability_spec(&[
-            (DURABILITY_TIER_ANNOTATION, "none"),
-            (DURABILITY_STORE_ANNOTATION, "s3://backups/db"),
-        ])
-        .durability()
+        let err = check(Durability {
+            store: Some("s3://backups/db".into()),
+            ..none_tier()
+        })
         .unwrap_err();
         assert_eq!(err, DurabilityDeclError::StoreWithoutTier);
     }
@@ -6961,12 +8018,11 @@ blake3   = "{HASH_64}"
     /// a snapshot tier would let a report print a bound nothing enforces.
     #[test]
     fn an_rpo_on_a_snapshot_tier_is_refused() {
-        let err = durability_spec(&[
-            (DURABILITY_TIER_ANNOTATION, "snapshot"),
-            (DURABILITY_STORE_ANNOTATION, "s3://backups/db"),
-            (DURABILITY_RPO_ANNOTATION, "30"),
-        ])
-        .durability()
+        let err = check(Durability {
+            tier: DurabilityTier::Snapshot,
+            rpo_seconds: Some(30),
+            ..stream(&["a.db"])
+        })
         .unwrap_err();
         assert_eq!(
             err,
@@ -6976,48 +8032,15 @@ blake3   = "{HASH_64}"
         );
     }
 
+    /// The declaration is a typed field now, carried name-keyed by the V13
+    /// envelope; the annotation map stays empty of it.
     #[test]
-    fn an_unparseable_rpo_or_state_size_is_refused() {
-        assert!(matches!(
-            durability_spec(&[
-                (DURABILITY_TIER_ANNOTATION, "stream"),
-                (DURABILITY_STORE_ANNOTATION, "s3://b"),
-                (DURABILITY_RPO_ANNOTATION, "2m"),
-            ])
-            .durability()
-            .unwrap_err(),
-            DurabilityDeclError::UnparseableRpo { .. }
-        ));
-
-        assert!(matches!(
-            durability_spec(&[
-                (DURABILITY_TIER_ANNOTATION, "none"),
-                (DURABILITY_STATE_MB_ANNOTATION, "100MB"),
-            ])
-            .durability()
-            .unwrap_err(),
-            DurabilityDeclError::UnparseableStateMb { .. }
-        ));
-    }
-
-    /// The declaration rides `annotations`, which is an existing map on an
-    /// existing wire — so an older kamaji decodes a spec carrying it. Pinned
-    /// because the reason this is not a struct field (R590-B3's positional
-    /// postcard wire) is invisible from the call site.
-    #[test]
-    fn a_durability_declaration_round_trips_as_plain_annotations() {
-        let spec = durability_spec(&[
-            (DURABILITY_TIER_ANNOTATION, "stream"),
-            (DURABILITY_ENGINE_ANNOTATION, "turso"),
-            (DURABILITY_STORE_ANNOTATION, "s3://backups/db"),
-            (DURABILITY_SUBJECTS_ANNOTATION, "accounts.db"),
-        ]);
+    fn a_durability_declaration_round_trips_as_a_typed_field() {
+        let mut spec = archetype_test_spec("durable");
+        spec.durability = Some(stream(&["accounts.db"]));
         let json = serde_json::to_string(&spec).expect("serialize");
-        assert!(json.contains("yah.durability.tier"), "{json}");
-        assert!(
-            !json.contains("\"durability\""),
-            "durability must not be a top-level field: {json}"
-        );
+        assert!(json.contains("\"durability\""), "{json}");
+        assert!(!json.contains("yah.durability"), "{json}");
         let back: WorkloadSpec = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.durability().unwrap(), spec.durability().unwrap());
     }
@@ -7029,33 +8052,22 @@ blake3   = "{HASH_64}"
     /// name, because a restore's unit is a file and "the volume" is not one.
     #[test]
     fn three_databases_in_one_volume_are_three_named_subjects() {
-        let d = durability_spec(&[
-            (DURABILITY_TIER_ANNOTATION, "stream"),
-            (DURABILITY_ENGINE_ANNOTATION, "turso"),
-            (DURABILITY_STORE_ANNOTATION, "s3://yah-backups/noisetable-account"),
-            (
-                DURABILITY_SUBJECTS_ANNOTATION,
-                "accounts.db, passkeys.db ,sessions.db",
-            ),
-        ])
-        .durability()
-        .unwrap()
-        .expect("declared");
+        let d = stream(&["accounts.db", "passkeys.db", "sessions.db"]);
+        d.check().expect("three distinct relative subjects are valid");
         assert_eq!(d.subjects, vec!["accounts.db", "passkeys.db", "sessions.db"]);
     }
 
     /// Gotcha (c) on R850-F1, closed: the three tier names are turso-backup's,
     /// so a Postgres appliance saying `tier = "stream"` was declaring something
-    /// no code in this tree can do. It now cannot say it without also naming an
-    /// engine, and the only engine with a restore path is the one that has one.
+    /// no code in this tree can do. It cannot say it without also naming an
+    /// engine, and the only engine that decodes is the one with a restore path
+    /// (see `a_malformed_declaration_is_refused_at_decode`).
     #[test]
-    fn a_bytes_shipping_tier_must_name_an_engine_and_only_turso_has_one() {
-        let err = durability_spec(&[
-            (DURABILITY_TIER_ANNOTATION, "stream"),
-            (DURABILITY_STORE_ANNOTATION, "s3://b"),
-            (DURABILITY_SUBJECTS_ANNOTATION, "a.db"),
-        ])
-        .durability()
+    fn a_bytes_shipping_tier_must_name_an_engine() {
+        let err = check(Durability {
+            engine: None,
+            ..stream(&["a.db"])
+        })
         .unwrap_err();
         assert_eq!(
             err,
@@ -7063,32 +8075,14 @@ blake3   = "{HASH_64}"
                 tier: DurabilityTier::Stream
             }
         );
-
-        let err = durability_spec(&[
-            (DURABILITY_TIER_ANNOTATION, "stream"),
-            (DURABILITY_ENGINE_ANNOTATION, "postgres"),
-            (DURABILITY_STORE_ANNOTATION, "s3://b"),
-            (DURABILITY_SUBJECTS_ANNOTATION, "a.db"),
-        ])
-        .durability()
-        .unwrap_err();
-        assert_eq!(
-            err,
-            DurabilityDeclError::UnknownEngine {
-                value: "postgres".into()
-            }
-        );
-        assert!(err.to_string().contains("no restore path"), "{err}");
     }
 
     #[test]
     fn a_bytes_shipping_tier_must_name_its_databases() {
-        let err = durability_spec(&[
-            (DURABILITY_TIER_ANNOTATION, "snapshot"),
-            (DURABILITY_ENGINE_ANNOTATION, "turso"),
-            (DURABILITY_STORE_ANNOTATION, "s3://b"),
-        ])
-        .durability()
+        let err = check(Durability {
+            tier: DurabilityTier::Snapshot,
+            ..stream(&[])
+        })
         .unwrap_err();
         assert_eq!(
             err,
@@ -7106,20 +8100,18 @@ blake3   = "{HASH_64}"
     #[test]
     fn an_engine_or_subject_list_alongside_tier_none_is_refused() {
         assert_eq!(
-            durability_spec(&[
-                (DURABILITY_TIER_ANNOTATION, "none"),
-                (DURABILITY_ENGINE_ANNOTATION, "turso"),
-            ])
-            .durability()
+            check(Durability {
+                engine: Some(DurabilityEngine::Turso),
+                ..none_tier()
+            })
             .unwrap_err(),
             DurabilityDeclError::EngineWithoutTier
         );
         assert_eq!(
-            durability_spec(&[
-                (DURABILITY_TIER_ANNOTATION, "none"),
-                (DURABILITY_SUBJECTS_ANNOTATION, "a.db"),
-            ])
-            .durability()
+            check(Durability {
+                subjects: vec!["a.db".into()],
+                ..none_tier()
+            })
             .unwrap_err(),
             DurabilityDeclError::SubjectsWithoutTier
         );
@@ -7131,38 +8123,29 @@ blake3   = "{HASH_64}"
     /// the wrong place.
     #[test]
     fn a_subject_cannot_escape_the_volume_it_is_scoped_to() {
-        let bad = |subjects: &str| {
-            durability_spec(&[
-                (DURABILITY_TIER_ANNOTATION, "snapshot"),
-                (DURABILITY_ENGINE_ANNOTATION, "turso"),
-                (DURABILITY_STORE_ANNOTATION, "s3://b"),
-                (DURABILITY_SUBJECTS_ANNOTATION, subjects),
-            ])
-            .durability()
-            .unwrap_err()
-        };
+        let bad = |subjects: &[&str]| check(stream(subjects)).unwrap_err();
         assert_eq!(
-            bad("/etc/passwd"),
+            bad(&["/etc/passwd"]),
             DurabilityDeclError::AbsoluteSubject {
                 subject: "/etc/passwd".into()
             }
         );
         assert_eq!(
-            bad("../../../etc/passwd"),
+            bad(&["../../../etc/passwd"]),
             DurabilityDeclError::TraversingSubject {
                 subject: "../../../etc/passwd".into()
             }
         );
         assert_eq!(
-            bad("data/./a.db"),
+            bad(&["data/./a.db"]),
             DurabilityDeclError::TraversingSubject {
                 subject: "data/./a.db".into()
             }
         );
-        // A trailing comma truncates a list without looking like it did.
-        assert_eq!(bad("a.db,"), DurabilityDeclError::EmptySubject);
+        // A blank entry truncates a list without looking like it did.
+        assert_eq!(bad(&["a.db", " "]), DurabilityDeclError::EmptySubject);
         assert_eq!(
-            bad("a.db,a.db"),
+            bad(&["a.db", "a.db"]),
             DurabilityDeclError::DuplicateSubject {
                 subject: "a.db".into()
             }
@@ -7174,37 +8157,10 @@ blake3   = "{HASH_64}"
     /// without rejecting every path containing a slash.
     #[test]
     fn a_subject_may_sit_in_a_subdirectory_of_the_volume() {
-        let d = durability_spec(&[
-            (DURABILITY_TIER_ANNOTATION, "dedup"),
-            (DURABILITY_ENGINE_ANNOTATION, "turso"),
-            (DURABILITY_STORE_ANNOTATION, "s3://b"),
-            (DURABILITY_SUBJECTS_ANNOTATION, "db/accounts.db"),
-        ])
-        .durability()
-        .unwrap()
-        .expect("declared");
-        assert_eq!(d.subjects, vec!["db/accounts.db".to_string()]);
-    }
-
-    /// `yah.durability.engien = "turso"` must not read as "no backups
-    /// configured" — the same orphan-key guard the store and RPO keys get.
-    #[test]
-    fn an_engine_or_subject_key_with_no_tier_names_the_likely_typo() {
-        assert_eq!(
-            durability_spec(&[(DURABILITY_ENGINE_ANNOTATION, "turso")])
-                .durability()
-                .unwrap_err(),
-            DurabilityDeclError::OrphanKey {
-                key: DURABILITY_ENGINE_ANNOTATION
-            }
-        );
-        assert_eq!(
-            durability_spec(&[(DURABILITY_SUBJECTS_ANNOTATION, "a.db")])
-                .durability()
-                .unwrap_err(),
-            DurabilityDeclError::OrphanKey {
-                key: DURABILITY_SUBJECTS_ANNOTATION
-            }
-        );
+        let d = Durability {
+            tier: DurabilityTier::Dedup,
+            ..stream(&["db/accounts.db"])
+        };
+        d.check().expect("a nested relative subject is valid");
     }
 }

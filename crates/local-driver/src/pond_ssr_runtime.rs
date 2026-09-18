@@ -393,12 +393,11 @@ mod tests {
     use super::*;
     use workload_spec::{
         EnvValue, EnvVar, ExposeSpec, ImageRef, MeshExpose, MeshIdent, ResourceLimits,
-        RestartPolicy, SchemaVersion, StopPolicy, TierTag, VolumeMount, VolumeSource,
+        RestartPolicy, StopPolicy, TierTag, VolumeMount, VolumeSource,
     };
 
     fn minimal_workload_spec() -> WorkloadSpec {
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: "ssr-runtime".into(),
             image: ImageRef {
                 registry: "docker.io".into(),
@@ -427,12 +426,17 @@ mod tests {
                 },
                 target: PathBuf::from("/app/src"),
                 read_only: false,
+                from_secret_mount: false,
             }],
             resources: ResourceLimits {
                 memory_mb: 256,
                 cpu_millis: 512,
-                ephemeral_storage_mb: 256,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
+            durability: None,
             depends_on: vec![],
             requires: vec![],
             healthcheck: None,

@@ -8,7 +8,6 @@ use workload_spec::*;
 /// names — each member of a group keeps its own (W338).
 fn sidecar_spec() -> WorkloadSpec {
     WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: "noisetable-db-replicator".into(),
         image: ImageRef {
             registry: "ghcr.io".into(),
@@ -30,7 +29,10 @@ fn sidecar_spec() -> WorkloadSpec {
         resources: ResourceLimits {
             memory_mb: 64,
             cpu_millis: 128,
-            ephemeral_storage_mb: 32,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on: vec![],
         requires: vec![],
@@ -51,6 +53,7 @@ fn sidecar_spec() -> WorkloadSpec {
             operator: None,
         },
         labels: HashMap::new(),
+        durability: None,
         annotations: HashMap::new(),
         files: Vec::new(),
     }
@@ -59,7 +62,6 @@ fn sidecar_spec() -> WorkloadSpec {
 /// Representative spec with every field family populated.
 fn full_spec() -> WorkloadSpec {
     WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: "noisetable-api".into(),
         image: ImageRef {
             registry: "ghcr.io".into(),
@@ -115,6 +117,7 @@ fn full_spec() -> WorkloadSpec {
                 source: VolumeSource::Named { name: "api-data".into() },
                 target: PathBuf::from("/data"),
                 read_only: false,
+                from_secret_mount: false,
             },
             VolumeMount {
                 source: VolumeSource::Bind {
@@ -122,17 +125,22 @@ fn full_spec() -> WorkloadSpec {
                 },
                 target: PathBuf::from("/config"),
                 read_only: true,
+                from_secret_mount: false,
             },
             VolumeMount {
                 source: VolumeSource::Tmpfs { size_mb: 128 },
                 target: PathBuf::from("/tmp"),
                 read_only: false,
+                from_secret_mount: false,
             },
         ],
         resources: ResourceLimits {
             memory_mb: 512,
             cpu_millis: 1024,
-            ephemeral_storage_mb: 256,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on: vec![MeshIdent("noisetable-db.pdx".into())],
         // R860-T1: both requirement axes, and the `provides` box that makes
@@ -202,6 +210,7 @@ fn full_spec() -> WorkloadSpec {
             m.insert("org.opencontainers.image.source".into(), "https://github.com/noisetable/api".into());
             m
         },
+        durability: None,
         annotations: {
             let mut m = HashMap::new();
             m.insert("yah.created-by".into(), "agent:claude".into());
@@ -275,7 +284,6 @@ fn container_postcard_frame_is_the_variant_index_then_the_bare_spec() {
 #[test]
 fn container_recipe_is_refused_by_postcard_rather_than_encoded() {
     let recipe = Workload::Container(ContainerManifest::Recipe(ContainerBuild {
-        schema_version: SchemaVersion::V1,
         name: "yah-cloud-admin".into(),
         build: ContainerBuildStep {
             dockerfile: "Dockerfile".into(),
@@ -385,6 +393,45 @@ fn jit_spec_derives_the_bind_string_and_the_env_escape_hatch_cannot_override_it(
     );
 }
 
+/// R910-F2: a door that fronts a placed workload discovers its backends from
+/// yubaba. `PASSWAY_UPSTREAM_SOURCE` is derived, so neither form can be reached
+/// through the `env` escape hatch — a stale `PASSWAY_YUBABA_URL` left in `env`
+/// on a static door is removed rather than half-applied.
+#[test]
+fn jit_spec_renders_discovery_as_derived_keys() {
+    let get = |w: &TenantPasswayWorkload, k: &str| -> Option<String> {
+        w.jit_spec("x")
+            .env
+            .iter()
+            .find(|e| e.name == k)
+            .map(|e| match &e.value {
+                EnvValue::Literal { value } => value.clone(),
+                other => panic!("{k} must be a literal, got {other:?}"),
+            })
+    };
+
+    let mut w = tenant_passway();
+    w.env.insert("PASSWAY_UPSTREAM_SOURCE".into(), "yubaba".into());
+    w.env
+        .insert("PASSWAY_YUBABA_URL".into(), "http://stale:7443".into());
+    assert_eq!(get(&w, "PASSWAY_UPSTREAM_SOURCE").as_deref(), Some("static"));
+    assert_eq!(get(&w, "PASSWAY_YUBABA_URL"), None);
+
+    w.discover = Some(TenantPasswayDiscovery {
+        urls: vec!["http://100.64.0.10:7443".into(), "http://100.64.0.8:7443".into()],
+        ident: "shop-app".into(),
+    });
+    assert_eq!(get(&w, "PASSWAY_UPSTREAM_SOURCE").as_deref(), Some("yubaba"));
+    assert_eq!(
+        get(&w, "PASSWAY_YUBABA_URL").as_deref(),
+        Some("http://100.64.0.10:7443,http://100.64.0.8:7443")
+    );
+    assert_eq!(
+        get(&w, "PASSWAY_YUBABA_IDENT").as_deref(),
+        Some("shop.tenant.io=shop-app")
+    );
+}
+
 /// `idle_ttl` rounds UP, and `None` means the variable is absent rather than
 /// zero — passway reads an absent `PASSWAY_IDLE_TTL_SECS` as "never reap" and
 /// a `0` as a timer, so truncating 500ms to 0 would turn a declared-cold
@@ -450,11 +497,17 @@ fn image_ref_round_trips_through_postcard() {
     assert_eq!(original, decoded);
 }
 
+/// R896-T4 deleted `schema_version`. Specs written before that still carry the
+/// key (JSON from an older CLI, or a workload.toml in a camp that has not
+/// re-synced), so it must be ignored on read, never refused, and never written.
 #[test]
-fn schema_version_serializes_as_v1() {
+fn a_legacy_schema_version_key_is_ignored_and_not_written() {
     let spec = full_spec();
-    let json = serde_json::to_value(&spec).expect("to_value");
-    assert_eq!(json["schema_version"], "V1");
+    let mut json = serde_json::to_value(&spec).expect("to_value");
+    assert!(json.get("schema_version").is_none(), "no longer emitted: {json}");
+    json["schema_version"] = serde_json::json!("V1");
+    let back: WorkloadSpec = serde_json::from_value(json).expect("legacy key ignored");
+    assert_eq!(back, spec);
 }
 
 #[test]
@@ -509,7 +562,6 @@ fn health_probe_variants_round_trip() {
 #[test]
 fn minimal_spec_round_trips_through_json_and_postcard() {
     let spec = WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: "minimal".into(),
         image: ImageRef {
             registry: "docker.io".into(),
@@ -528,7 +580,7 @@ fn minimal_spec_round_trips_through_json_and_postcard() {
         env: vec![],
         secrets: vec![],
         volumes: vec![],
-        resources: ResourceLimits { memory_mb: 64, cpu_millis: 256, ephemeral_storage_mb: 64 },
+        resources: ResourceLimits { memory_mb: 64, cpu_millis: 256, memory_request_mb: None, cpu_limit_millis: None, pids_max: None, scratch_floor_mb: None },
         depends_on: vec![],
         requires: vec![],
         healthcheck: None,
@@ -545,6 +597,7 @@ fn minimal_spec_round_trips_through_json_and_postcard() {
             operator: None,
         },
         labels: HashMap::new(),
+        durability: None,
         annotations: HashMap::new(),
         files: Vec::new(),
     };
@@ -726,7 +779,6 @@ fn admits_peer_enforces_deny_by_default_across_tenants() {
 #[test]
 fn mesofact_static_build_table_without_a_command_parses_as_none() {
     let src = r#"
-schema_version = 1
 kind = "mesofact-static"
 routes = "./mesofact.routes.ts"
 
@@ -747,7 +799,6 @@ out_dir = "dist"
 #[test]
 fn an_unknown_build_key_is_still_refused_now_that_command_is_optional() {
     let src = r#"
-schema_version = 1
 kind = "mesofact-static"
 
 [build]
@@ -766,7 +817,6 @@ routes = "./mesofact.routes.ts"
 #[test]
 fn mesofact_static_build_command_round_trips_through_postcard_both_ways() {
     let build = |command: Option<&str>| MesofactStaticWorkload {
-        schema_version: SchemaVersion::V1,
         build: BuildConfig {
             command: command.map(str::to_string),
             out_dir: PathBuf::from("dist"),

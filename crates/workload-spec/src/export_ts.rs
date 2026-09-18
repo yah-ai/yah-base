@@ -38,7 +38,6 @@ pub fn render() -> String {
     }
 
     // Order: leaves first, then composites that reference them.
-    emit!(SchemaVersion);
     emit!(Millis);
     emit!(MachineId);
     emit!(MeshIdent);

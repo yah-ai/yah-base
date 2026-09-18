@@ -9,7 +9,6 @@ use workload_spec::{
     OperatorExpose, PublicExpose, PublicTls, ResourceLimits, RestartPolicy, SecretMount, SecretRef,
     SecretTarget, StopPolicy, TenantId, TierTag, WorkloadSpec,
 };
-use workload_spec::SchemaVersion;
 
 // ── FakeContext ───────────────────────────────────────────────────────────────
 
@@ -145,7 +144,6 @@ fn machine() -> MachineId {
 /// image docker.io/library/alpine:3.19 and capacity=true to pass semantic.
 fn minimal_spec() -> WorkloadSpec {
     WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: "test-svc".into(),
         image: ImageRef {
             registry: "docker.io".into(),
@@ -167,7 +165,10 @@ fn minimal_spec() -> WorkloadSpec {
         resources: ResourceLimits {
             memory_mb: 64,
             cpu_millis: 256,
-            ephemeral_storage_mb: 64,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on: vec![],
         requires: vec![],
@@ -188,6 +189,7 @@ fn minimal_spec() -> WorkloadSpec {
             operator: None,
         },
         labels: Default::default(),
+        durability: None,
         annotations: Default::default(),
         files: Vec::new(),
     }

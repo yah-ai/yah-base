@@ -1,7 +1,6 @@
 {
   "specs": [
     {
-      "schema_version": "V1",
       "name": "api",
       "image": {
         "registry": "ghcr.io",
@@ -31,8 +30,7 @@
       ],
       "resources": {
         "memory_mb": 256,
-        "cpu_millis": 512,
-        "ephemeral_storage_mb": 512
+        "cpu_millis": 512
       },
       "depends_on": [
         "db"
@@ -52,7 +50,6 @@
       }
     },
     {
-      "schema_version": "V1",
       "name": "db",
       "image": {
         "registry": "docker.io",
@@ -74,8 +71,7 @@
       ],
       "resources": {
         "memory_mb": 256,
-        "cpu_millis": 512,
-        "ephemeral_storage_mb": 512
+        "cpu_millis": 512
       },
       "restart_policy": "always",
       "stop_policy": {

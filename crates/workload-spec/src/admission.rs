@@ -127,13 +127,46 @@
 //! [`Policy::Required`] is the end state for a shared build worker: no grant, no
 //! run. It is an operator flip per node (`YAH_ADMISSION=required`), because
 //! turning it on before that node's dispatchers sign is a self-inflicted outage.
+//!
+//! @yah:relay(R894, "Trust as a declared axis: admission derives minimum isolation substrate")
+//! @yah:at(2026-09-11T22:22:59Z)
+//! @yah:status(handoff)
+//! @yah:assignee(agent:user-custom-char-gul2)
+//! @yah:next("Operator call (2026-09-11, chat session:d6fc1d54): workload trust becomes a declared property from which admission derives minimum isolation, making 'untrusted code never shares a kernel with the fleet' one checkable rule instead of a convention distributed across dispatchers. Today only the mechanism is recorded (yah.exec substrate marker) and the sole trust-shaped gate is kamaji's tier==\"infra\" check. R823 (untrusted camp vending on microVMs) is the first consumer of this rule.")
+//! @arch:see(oss/yubaba/crates/cloud/src/config.rs)
+//! @arch:see(.yah/docs/working/W344-native-workloads-run-unbounded.md)
+//! @arch:see(.yah/docs/architecture/A043-yah-on-machine-daemons.md)
+//!
+//! @yah:ticket(R894-F1, "admit_workload refuses any spec whose trust level exceeds its requested substrate")
+//! @yah:phase(P1)
+//! @yah:status(review)
+//! @yah:at(2026-09-14T00:31:45Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R894)
+//! @yah:next("Tier: Wizard — security invariant whose design decisions (declaration point, default direction) matter more than the line count. RULE SHAPE: substrate ordering is already documented widest-first on kamaji's Backend enum (native < container < microvm); trust maps to a MINIMUM substrate; a caller may request stricter, never looser; violation is a REFUSAL at admission, mirroring wants_microvm's no-silent-downgrade semantics. Enforcement seam: CloudConfig::admit_workload (oss/yubaba/crates/cloud/src/config.rs:1957) + admission_spec, where cap:native-exec already lives. TWO DESIGN DECISIONS TO SETTLE FIRST: (1) declaration — annotation (R885 yah.limits.* precedent, crosses the postcard wire free) vs server-side derivation from tenant identity; the marker must NOT be self-attestable by untrusted spec authors, so whatever the spelling, it is stamped at the single choke point that ingests tenant code, and admission treats tenant-origin-without-marker as invalid rather than defaulting to trusted. (2) default direction — absent marker on operator-authored specs means trusted; the unsafe spelling (absent = trusted for ALL origins) is the trap this ticket exists to close. KNOWN CONSEQUENCE, correct not a bug: no fleet node declares cap:microvm yet (deliberate, gated on R605-F14 guest artifacts — see the cleanup note in config.rs), so untrusted workloads refuse fleet-wide until that lands. ACCEPTANCE GATE per W344's lesson: name a call site on the live deploy path, not a test count — a test proving an untrusted-marked spec requesting yah.exec=native (and one requesting no substrate at all) is refused inside admit_workload's real dispatch path.")
+//! @yah:handoff("TRUST IS NOW A DECLARED AXIS AND ADMISSION REFUSES ON IT. New `yah.trust` annotation (TRUST_ANNOTATION / TRUST_TRUSTED_VALUE / TRUST_UNTRUSTED_VALUE) in oss/yah-base/crates/workload-spec/src/lib.rs, with `TrustLevel{Trusted,Untrusted}`, `TrustLevel::minimum_substrate()`, `TrustDeclError` (manual Display+Error, the WritablePathsDeclError shape — no thiserror in that lib), and `WorkloadSpec::trust()`. Untrusted floors at microVM: the 2026-09-11 operator call resolving W344:166's 'containerd or microVM' disjunction to the strict side for code the operator did not write.")
+//! @yah:handoff("DECISION 1 — DECLARATION: an ANNOTATION (R885 yah.limits.* precedent, crosses the postcard wire free), NOT server-side derivation from tenant identity, and NOT a fourth `yah.exec` value. Separate key because `yah.exec` is a REQUEST (what the dispatcher wants) and `yah.trust` is a FACT (where the code came from); folding them makes the fact unstateable whenever the request is stricter than the floor. NOT self-attestable, and the argument is structural rather than cryptographic: a tenant never hands yah a WorkloadSpec, it hands yah an image + argv that yah's OWN code puts into a spec. So the choke point holds the pen. `WorkloadSpec::stamp_untrusted()` is that verb — it stamps the marker AND raises the substrate to the floor in one call, monotonically (a caller already asking for microVM keeps its request; idempotent). R823 is its first caller and has none yet, deliberately.")
+//! @yah:handoff("DECISION 2 — DEFAULT DIRECTION: absent means Trusted, and the doc on TrustLevel states WHY that is not the trap. Every WorkloadSpec in the tree today is operator-built and declares nothing, so absent=untrusted refuses the whole fleet on day one. The unsafe spelling the ticket exists to close is 'absent = trusted for ALL ORIGINS'; what closes it is that the untrusted-origin path stamps in the same function that takes the third-party bytes, not that admission guesses. An UNRECOGNISED value is an Err, never a fallback to either side — reading `untrused` as trusted turns the microVM floor off by typo.")
+//! @yah:handoff("ENFORCEMENT SEAM: `admission_spec` (oss/yubaba/crates/cloud/src/config.rs) now returns `Result<RequiredSpec>` and calls new `check_trust_substrate(&group)` first. Signature change over a note-to-self on purpose: admission_spec is the ONE function admit_workload / admit_workload_candidates / admit_workload_in_group all share, so a Result makes the gate structural — a fourth entry point cannot be added that skips it. Checked per member over the whole placement_group (R860-T4 co-places `local` edges, so an untrusted provider reaching a node is reaching it whether or not the requirer is the untrusted one). A REFUSAL, not a mesh tag: an untrusted+native spec is not unplaceable, it is incoherent — rendering it as 'no node admits this' sends the operator to look at machines.")
+//! @yah:handoff("NEW ExecSubstrate{Native<Container<MicroVm} with derived Ord — the ordering IS the security ordering, pinned by `substrates_are_ordered_by_the_isolation_they_provide` because a variant reorder would invert the whole check while compiling clean. `WorkloadSpec::exec_substrate()` collapses the wants_native_exec/wants_microvm boolean pair into one total function, and `admission::GrantRuntime::of_spec` now DELEGATES to it rather than carrying a second copy of the same ladder (the drift R605-F8's own doc warned about, one level up).")
+//! @yah:verify("ACCEPTANCE GATE PER W344's LESSON — a call site on the live deploy path, not a test count. The refusal fires inside `CloudConfig::admit_workload` / `admit_workload_candidates`, which are the real dispatch path: `MeshYubabaClient::elect_node` calls admit_workload_candidates at app/yah/cli/src/yubaba_client.rs:236, and `yah cloud workload deploy` calls admit_workload at app/yah/cli/src/cloud.rs:3828. `admit_workload_refuses_untrusted_code_on_a_shared_kernel` drives admit_workload directly on both required shapes — untrusted + yah.exec=native, and untrusted with NO substrate marker at all (the container default, the one an absent=trusted-for-all-origins spelling would have admitted) — against a fleet that CONTAINS a microVM-capable node, then admits the same workload once it asks for microvm. Same fleet, same name: the two refusals provably came from the substrate.")
+//! @yah:verify("cargo test --manifest-path oss/yah-base/Cargo.toml -p yah-workload-spec = 208 lib + 106 integration + 0 doctest, 0 failed, exit 0 (+4 new lib tests). cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib config::tests = 218 passed / 0 failed (+6 new). cargo check -p yah-cloud -p yubaba --all-targets exit 0. ./scripts/check-schema-drift.sh and ./scripts/check-workload-spec-ts.sh both 'in sync' — nothing added is schemars-derived and annotations is already a HashMap<String,String>, so no regen and no ProtocolVersion bump.")
+//! @yah:verify("SIX NEW config.rs TESTS: admit_workload_refuses_untrusted_code_on_a_shared_kernel (the gate); a_trusted_workload_may_still_request_a_stricter_substrate (the rule is one-directional); an_untrusted_provider_refuses_the_whole_placement_group (names the offending MEMBER, and the same requirer without the local edge admits, so the refusal provably came from the group); an_unreadable_trust_declaration_is_refused_rather_than_defaulted; a_group_with_no_microvm_member_does_not_require_the_capability (R860-T5-shaped regression guard); every_admission_entry_point_enforces_the_trust_floor (all three admit_* refuse the same spec). FOUR NEW workload-spec TESTS: the Ord pin, exec_substrate-agrees-with-the-two-predicates-it-replaces (incl. a typo'd `micro-vm` failing CLOSED to Container), trust default/refusal table, and stamp_untrusted raise/idempotence/never-lower plus the post-condition that a stamped spec always satisfies its own floor.")
+//! @yah:gotcha("SCOPE I TOOK BEYOND THE TITLE, LOUDLY: R860-T5's deferred `cap:microvm` axis landed here too, because without it the trust floor lands nowhere real — an untrusted workload would pass the coherence check and then be elected onto a node with no microVM backend and refused at dispatch, which is exactly the 25-hour-outage shape R858 paid for on the native axis. New `MICROVM_MESH_TAG = \"cap:microvm\"` in config.rs and one `if` beside the native one in admission_spec. R860-T5's cleanup note gated this on R605-F14 landing guest artifacts; that precondition IS met — see the next gotcha.")
+//! @yah:gotcha("I DECLARED `cap:microvm` ON .yah/infra/machines/us-west-003.toml — ONE NODE, ON RECORDED EVIDENCE, NOT INFERENCE. That file's own header carries the RESOLVED 2026-09-10T23:27Z block (the /etc/systemd/system/kamaji.service.d/10-microvm.conf drop-in, the journal line 'microVM backend attached', the staged vmlinux + rootfs.ext4 with sha256 sidecars), and oss/kamaji/crates/kamaji-bin/src/main.rs:31 records R605-T24's `.yah/qed/microvm-dispatch-smoke.toml` run on 2026-09-11 driving a forge from qed through yubaba admission into a guest THERE, asserting on /proc/cmdline tokens a container cannot fake. NO OTHER MACHINE FILE WAS TOUCHED. THE TRAP, written into the TOML comment: this capability is NOT visible in ExecStart (the drop-in sets KAMAJI_MICROVM_DIR; read `systemctl show -p Environment kamaji`), and that header also records that rolling the node to a published version REVERTS the staged guest material — so re-check after any roll, harder than for cap:native-exec.")
+//! @yah:gotcha("WITHOUT THAT TOML LINE THE microvm AXIS WOULD HAVE BROKEN A LIVE RECIPE. A node pin does NOT bypass mesh_tags (admission_spec derives `nodes` alongside them deliberately, so a pin is still checked), so `yah qed run microvm-dispatch-smoke --where=node:us-west-003` would have started refusing at admission the moment the axis landed. The tag and the axis had to land together; that is why this is one change and not two.")
+//! @yah:gotcha("PRE-EXISTING FAILURES ON THIS TREE, NEITHER MINE — both confirmed by content, not by assumption. (1) `yah-cloud --lib reconciler::mesofact_static::tests::bundled_worker_walks_the_route_table` fails; that file carries 323 uncommitted insertions from a live peer and my diff is nowhere near it. (2) `cargo test -p xtask --test main cluster_epoch_drift::raft_protocol_surface_matches_the_declared_epochs` fails on MOVED raft lines in oss/yubaba/crates/yubaba/src/lib.rs, a file I did not touch; it needs the breaking/not-breaking call plus `cargo run -p xtask -- cluster-epochs --write`. The other 68 xtask tests pass, including every fleet-placement one that reads the real machine TOMLs, so the us-west-003 edit is clean.")
+//! @yah:gotcha("`stamp_untrusted` HAS NO PRODUCTION CALLER YET, and that is the correct state — R823 (untrusted camp vending on microVMs) is the first choke point and is not built. The rule for whoever writes it is in the verb's doc comment: call it in the SAME function that takes the third-party bytes, not in a caller that can be forgotten. Until then the axis costs the fleet nothing: no spec in the tree sets yah.trust, and absent is Trusted, whose floor is the bottom of the ordering.")
+//! @yah:handoff("Tree anchor at review: e0530813af8f7d86f5eb7ea9a6b5a57d386bf30b. FILES TOUCHED, all four: oss/yah-base/crates/workload-spec/src/lib.rs (the axis + accessors + stamp verb + 4 tests), oss/yah-base/crates/workload-spec/src/admission.rs (GrantRuntime::of_spec delegates to exec_substrate; the import line), oss/yubaba/crates/cloud/src/config.rs (MICROVM_MESH_TAG, admission_spec -> Result, check_trust_substrate, the microvm axis, 6 tests), .yah/infra/machines/us-west-003.toml (cap:microvm + the evidence comment). Quote this SHA rather than 'HEAD' in any revert instruction.")
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::{EnvValue, SecretMount, SecretRef, SecretTarget, VolumeSource, WorkloadSpec};
+use crate::{
+    EnvValue, ExecSubstrate, SecretMount, SecretRef, SecretTarget, VolumeSource, WorkloadSpec,
+};
 
 /// Annotation carrying the admission grant document verbatim.
 ///
@@ -226,13 +259,17 @@ impl GrantRuntime {
     /// verifying site ([`AdmissionGrant::verify_matches`]) cannot disagree —
     /// they were two copies of the same `if` before R605-F8 added a third arm,
     /// which is exactly when a duplicated ladder starts to drift.
+    ///
+    /// R894-F1 took that argument one level further: this was itself the
+    /// *second* copy of the ladder, beside admission's trust check, so it now
+    /// delegates to [`WorkloadSpec::exec_substrate`]. A grant and a trust floor
+    /// disagreeing about which substrate a spec selects is the failure this
+    /// closes.
     fn of_spec(spec: &WorkloadSpec) -> Self {
-        if spec.wants_native_exec() {
-            GrantRuntime::Native
-        } else if spec.wants_microvm() {
-            GrantRuntime::MicroVm
-        } else {
-            GrantRuntime::Container
+        match spec.exec_substrate() {
+            ExecSubstrate::Native => GrantRuntime::Native,
+            ExecSubstrate::Container => GrantRuntime::Container,
+            ExecSubstrate::MicroVm => GrantRuntime::MicroVm,
         }
     }
 }
@@ -1444,6 +1481,7 @@ mod tests {
                 },
                 target: path.clone(),
                 read_only: true,
+                from_secret_mount: true,
             });
         }
     }
@@ -1697,6 +1735,7 @@ mod tests {
             },
             target: PathBuf::from(R2_PATH),
             read_only: true,
+            from_secret_mount: true,
         });
         // The grant here declares no secrets at all: the exemption is keyed on
         // the allow-list, not on the path shape.
@@ -1950,6 +1989,7 @@ mod tests {
             },
             target: PathBuf::from("/host-etc"),
             read_only: false,
+            from_secret_mount: false,
         });
         assert!(matches!(
             grant().covers(&spec).unwrap_err(),

@@ -183,6 +183,7 @@ fn stateful_appliance() -> WorkloadSpec {
         },
         target: "/var/lib/app".into(),
         read_only: false,
+        from_secret_mount: false,
     }];
     spec
 }
@@ -197,7 +198,7 @@ fn a_stateful_appliance_with_no_durability_tier_warns() {
     assert!(
         warnings
             .iter()
-            .any(|w| w.path == FieldPath::Annotation("yah.durability.tier")),
+            .any(|w| w.path == FieldPath::Durability("tier")),
         "expected a durability warning; got {warnings:?}"
     );
 }
@@ -205,13 +206,12 @@ fn a_stateful_appliance_with_no_durability_tier_warns() {
 #[test]
 fn declaring_the_tier_silences_the_warning_even_when_it_is_none() {
     let mut spec = stateful_appliance();
-    spec.annotations
-        .insert("yah.durability.tier".into(), "none".into());
+    spec.durability = Some(none_tier());
     let warnings = validate::shape(&spec).expect("tier = none is valid");
     assert!(
         !warnings
             .iter()
-            .any(|w| w.path == FieldPath::Annotation("yah.durability.tier")),
+            .any(|w| w.path == FieldPath::Durability("tier")),
         "a deliberate `none` is an answer, not a finding; got {warnings:?}"
     );
 }
@@ -222,12 +222,33 @@ fn declaring_the_tier_silences_the_warning_even_when_it_is_none() {
 #[test]
 fn a_malformed_durability_tier_fails_shape_validation() {
     let mut spec = stateful_appliance();
-    spec.annotations
-        .insert("yah.durability.tier".into(), "streem".into());
-    let err = validate::shape(&spec).expect_err("a misspelled tier must not load");
+    declare_stream(&mut spec, &["accounts.db"]);
+    spec.durability.as_mut().unwrap().store = None;
+    let err = validate::shape(&spec).expect_err("a half-written declaration must not load");
     let validate::ShapeError::Field { path, reason } = &err;
-    assert_eq!(*path, FieldPath::Annotation("yah.durability.tier"));
-    assert!(reason.contains("streem"), "{reason}");
+    assert_eq!(*path, FieldPath::Durability("store"));
+    assert!(reason.contains("durability.store"), "{reason}");
+}
+
+/// R896-F3: the annotation families that became typed fields are refused, not
+/// ignored. An ignored `yah.durability.tier` would load clean as "undeclared",
+/// i.e. silently switch a database's backups off; an ignored
+/// `yah.limits.pids-max` would silently fall back to the default bound. The
+/// refusal names the field the value moved to.
+#[test]
+fn a_retired_annotation_fails_shape_validation_and_names_its_replacement() {
+    for (key, value, field) in [
+        ("yah.durability.tier", "stream", "durability.tier"),
+        ("yah.limits.pids-max", "256", "resources.pids_max"),
+        ("yah.placement.memory-request-mb", "2048", "resources.memory_request_mb"),
+    ] {
+        let mut spec = stateful_appliance();
+        spec.annotations.insert(key.into(), value.into());
+        let err = validate::shape(&spec).expect_err("a retired annotation must not load");
+        let validate::ShapeError::Field { path, reason } = &err;
+        assert_eq!(*path, FieldPath::Annotation(key.to_string()));
+        assert!(reason.contains(field), "{key}: {reason}");
+    }
 }
 
 /// A stateless workload is not nagged — the warning is about state with no
@@ -242,7 +263,7 @@ fn a_stateless_workload_is_not_asked_to_declare_durability() {
     assert!(
         !warnings
             .iter()
-            .any(|w| w.path == FieldPath::Annotation("yah.durability.tier")),
+            .any(|w| w.path == FieldPath::Durability("tier")),
         "got {warnings:?}"
     );
 }
@@ -250,26 +271,38 @@ fn a_stateless_workload_is_not_asked_to_declare_durability() {
 // ── R850-F1: subjects are relative to exactly one named volume ──────────────
 
 /// Give `spec` a complete bytes-shipping declaration over `subjects`.
-fn declare_stream(spec: &mut WorkloadSpec, subjects: &str) {
-    for (k, v) in [
-        ("yah.durability.tier", "stream"),
-        ("yah.durability.engine", "turso"),
-        ("yah.durability.store", "s3://yah-backups/acct"),
-        ("yah.durability.subjects", subjects),
-    ] {
-        spec.annotations.insert(k.into(), v.into());
+fn declare_stream(spec: &mut WorkloadSpec, subjects: &[&str]) {
+    spec.durability = Some(workload_spec::Durability {
+        tier: workload_spec::DurabilityTier::Stream,
+        engine: Some(workload_spec::DurabilityEngine::Turso),
+        store: Some("s3://yah-backups/acct".into()),
+        subjects: subjects.iter().map(|s| s.to_string()).collect(),
+        rpo_seconds: None,
+        state_mb: None,
+    });
+}
+
+/// A declared `tier = "none"`.
+fn none_tier() -> workload_spec::Durability {
+    workload_spec::Durability {
+        tier: workload_spec::DurabilityTier::None,
+        engine: None,
+        store: None,
+        subjects: vec![],
+        rpo_seconds: None,
+        state_mb: None,
     }
 }
 
 #[test]
 fn a_complete_stream_declaration_over_one_named_volume_is_valid_and_unwarned() {
     let mut spec = stateful_appliance();
-    declare_stream(&mut spec, "accounts.db,sessions.db");
+    declare_stream(&mut spec, &["accounts.db", "sessions.db"]);
     let warnings = validate::shape(&spec).expect("a complete declaration must load");
     assert!(
         !warnings
             .iter()
-            .any(|w| matches!(w.path, FieldPath::Annotation(k) if k.starts_with("yah.durability"))),
+            .any(|w| matches!(w.path, FieldPath::Durability(_))),
         "got {warnings:?}"
     );
 }
@@ -281,10 +314,10 @@ fn a_complete_stream_declaration_over_one_named_volume_is_valid_and_unwarned() {
 fn a_stream_tier_needs_exactly_one_named_volume_to_be_relative_to() {
     let mut none = stateful_appliance();
     none.volumes.clear();
-    declare_stream(&mut none, "accounts.db");
+    declare_stream(&mut none, &["accounts.db"]);
     let validate::ShapeError::Field { path, reason } =
         &validate::shape(&none).expect_err("no named volume must not load");
-    assert_eq!(*path, FieldPath::Annotation("yah.durability.subjects"));
+    assert_eq!(*path, FieldPath::Durability("subjects"));
     assert!(reason.contains("0 named-or-bind volumes"), "{reason}");
 
     let mut two = stateful_appliance();
@@ -294,11 +327,12 @@ fn a_stream_tier_needs_exactly_one_named_volume_to_be_relative_to() {
         },
         target: "/var/lib/sessions".into(),
         read_only: false,
+        from_secret_mount: false,
     });
-    declare_stream(&mut two, "accounts.db");
+    declare_stream(&mut two, &["accounts.db"]);
     let validate::ShapeError::Field { path, reason } =
         &validate::shape(&two).expect_err("two named volumes must not load");
-    assert_eq!(*path, FieldPath::Annotation("yah.durability.subjects"));
+    assert_eq!(*path, FieldPath::Durability("subjects"));
     // The refusal names the candidates — an operator fixing this needs to know
     // which two it could not choose between.
     assert!(reason.contains("accounts, sessions"), "{reason}");
@@ -324,8 +358,9 @@ fn a_bind_volume_is_a_legitimate_root_for_subjects() {
         },
         target: "/var/lib/headscale".into(),
         read_only: false,
+        from_secret_mount: false,
     }];
-    declare_stream(&mut spec, "db.sqlite");
+    declare_stream(&mut spec, &["db.sqlite"]);
     validate::shape(&spec).expect("a bind-rooted declaration must load");
 }
 
@@ -338,11 +373,42 @@ fn a_tmpfs_does_not_satisfy_a_bytes_shipping_tier() {
         source: workload_spec::VolumeSource::Tmpfs { size_mb: 64 },
         target: "/scratch".into(),
         read_only: false,
+        from_secret_mount: false,
     }];
-    declare_stream(&mut spec, "accounts.db");
+    declare_stream(&mut spec, &["accounts.db"]);
     let validate::ShapeError::Field { reason, .. } =
         &validate::shape(&spec).expect_err("a ramdisk is not durable state");
     assert!(reason.contains("0 named-or-bind volumes"), "{reason}");
+}
+
+/// R858-B26: a workload with a file secret and one named volume must still
+/// declare durability — the secret materializer's injected bind must not be
+/// counted as a second candidate root. This is the exact shape that refused
+/// noisetable-account's deploy: one named volume, one `from_secret_mount`
+/// bind standing in for a `[[secrets]]` file target.
+///
+/// `validate::shape` never actually sees a `from_secret_mount` mount in
+/// production — materialization runs after it — but `hydrate::plan` (kamaji)
+/// does, since it re-derives against the post-materialization spec. This
+/// pins the two checks to agree regardless, per the ticket's own reasoning
+/// for adding the flag. `tier = "infra"` here isolates that from the
+/// unrelated `Bind`-requires-infra rule (validate.rs's other check), which
+/// this ticket does not touch.
+#[test]
+fn a_secret_materializer_bind_is_not_a_second_candidate_root() {
+    let mut spec = stateful_appliance();
+    spec.tier = workload_spec::TierTag("infra".into());
+    spec.volumes.push(workload_spec::VolumeMount {
+        source: workload_spec::VolumeSource::Bind {
+            host_path: "/run/secrets/api-key".into(),
+        },
+        target: "/run/secrets/api-key".into(),
+        read_only: true,
+        from_secret_mount: true,
+    });
+    declare_stream(&mut spec, &["accounts.db"]);
+    validate::shape(&spec)
+        .expect("a secret-materializer bind must not count toward the named-or-bind total");
 }
 
 /// The widening added a second KIND of candidate, not permission to guess
@@ -355,8 +421,9 @@ fn one_named_plus_one_bind_is_still_ambiguous() {
         source: workload_spec::VolumeSource::Bind { host_path: "/srv/acct".into() },
         target: "/srv".into(),
         read_only: false,
+        from_secret_mount: false,
     });
-    declare_stream(&mut spec, "accounts.db");
+    declare_stream(&mut spec, &["accounts.db"]);
     let validate::ShapeError::Field { reason, .. } =
         &validate::shape(&spec).expect_err("two candidate roots must not load");
     assert!(reason.contains("2 named-or-bind volumes"), "{reason}");
@@ -369,7 +436,6 @@ fn one_named_plus_one_bind_is_still_ambiguous() {
 fn tier_none_is_not_subject_to_the_one_volume_rule() {
     let mut spec = stateful_appliance();
     spec.volumes.clear();
-    spec.annotations
-        .insert("yah.durability.tier".into(), "none".into());
+    spec.durability = Some(none_tier());
     validate::shape(&spec).expect("tier = none places no subjects");
 }

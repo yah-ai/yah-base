@@ -20,10 +20,10 @@ pub mod r2;
 
 pub use fallback::FallbackObjectStore;
 pub use http_ro::HttpReadOnlyObjectStore;
-pub use r2::{ObjectMeta, R2ObjectStore};
+pub use r2::{ObjectMeta, R2ObjectStore, StoredHttpMeta};
 
 /// Re-exported so a caller choosing a directive for
-/// [`ObjectStore::put_cached`] never has to retype the string — two publishers
+/// [`ObjectStore::put_with`] never has to retype the string — two publishers
 /// spelling `no-cache, max-age=0` slightly differently is a difference no test
 /// catches and every CDN honours.
 pub use local_driver::s3_sign::{CACHE_CONTROL_IMMUTABLE, CACHE_CONTROL_NO_CACHE};
@@ -33,6 +33,62 @@ use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+/// The response headers one object carries, chosen at write time.
+///
+/// Everything here is a property of how the object is *served*, not of its
+/// bytes — which is why it belongs on the put rather than in the key. Default
+/// is "no headers at all", i.e. what plain [`ObjectStore::put`] does.
+#[derive(Debug, Clone, Default)]
+pub struct PutOptions<'a> {
+    /// `Cache-Control`. [`CACHE_CONTROL_IMMUTABLE`] for versioned or
+    /// content-addressed keys, [`CACHE_CONTROL_NO_CACHE`] for a mutable pointer
+    /// (a `latest.json`, a release manifest, an index).
+    pub cache_control: Option<&'a str>,
+    /// What a browser saves this object AS, regardless of the key it lives at.
+    ///
+    /// Pass the bare filename — `noisetable-orangepi_zero2w-v0.4.0.img.xz` —
+    /// and the store composes the `Content-Disposition` header with
+    /// [`attachment_filename`].
+    ///
+    /// The case this exists for is a **content-addressed** key. A browser names
+    /// a download from the URL's last path segment, so a blob published at
+    /// `images/<blake3>` (which is the only key shape xlb's `cdn_fallback`
+    /// template can express — it substitutes `{blake3}` and nothing else) saves
+    /// as a bare 64-char hash with no extension. Setting the name here keeps
+    /// the key, the xlb identity and the CDN route exactly as they are: R2
+    /// stores the header and replays it on every GET, so nothing in front has
+    /// to rewrite a URL, consult a manifest or proxy the bytes.
+    pub download_name: Option<&'a str>,
+}
+
+/// `Content-Disposition` for a download that should save as `name`.
+///
+/// Returns [`Error::Backend`] rather than quietly sanitizing, because every
+/// rejected character means the caller built the name from something it should
+/// not have: a CR or LF splits the header (response splitting), a `"` or `\`
+/// escapes the quoted-string and lets the rest of the name be read as
+/// parameters, and a `/` is a caller passing a key where a filename belongs —
+/// which would produce a header a client is free to interpret as a path.
+///
+/// Deliberately ASCII-only. RFC 6266 can carry UTF-8 through the separate
+/// `filename*=` parameter, and the day a publisher needs one is the day to add
+/// it here, once, rather than in whichever publisher hit it first.
+pub fn attachment_filename(name: &str) -> Result<String, Error> {
+    if name.is_empty() {
+        return Err(Error::Backend("download name is empty".into()));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !c.is_ascii() || c.is_ascii_control() || matches!(c, '"' | '\\' | '/'))
+    {
+        return Err(Error::Backend(format!(
+            "download name {name:?} contains {bad:?}: a filename here must be \
+             printable ASCII with no quote, backslash or slash"
+        )));
+    }
+    Ok(format!("attachment; filename=\"{name}\""))
+}
 
 /// Errors a backend may raise.
 ///
@@ -95,12 +151,13 @@ pub enum Precondition {
 pub trait ObjectStore: Send + Sync {
     /// Write `data` at `key`. Overwrites any existing object unconditionally.
     ///
-    /// Sets no `Cache-Control`. For an object a browser or CDN will re-read —
-    /// anything at a fixed, mutable key — reach for
-    /// [`put_cached`](ObjectStore::put_cached) instead.
+    /// Sets no response headers beyond `Content-Type`. For an object a browser
+    /// or CDN will re-read, or one a human will download, reach for
+    /// [`put_with`](ObjectStore::put_with) instead.
     fn put(&self, key: &str, data: Vec<u8>) -> Result<(), Error>;
 
-    /// Write `data` at `key` with an explicit `Cache-Control` (R703-B8).
+    /// Write `data` at `key` with the per-object response headers in `opts`
+    /// (R703-B8 `Cache-Control`; R717-B1 `Content-Disposition`).
     ///
     /// Every CLI-driven publish went through [`put`](ObjectStore::put), which
     /// sets no cache directive at all — so `yah-desktop/latest.json`, the object
@@ -108,16 +165,14 @@ pub trait ObjectStore: Send + Sync {
     /// how long it may hold it. `.github/workflows/release.yml` has always
     /// tagged the same objects correctly, which is why the CI-published
     /// manifests answer `no-cache, max-age=0` and the CLI-published ones do not.
-    /// Use [`CACHE_CONTROL_IMMUTABLE`] for versioned, content-addressed keys and
-    /// [`CACHE_CONTROL_NO_CACHE`] for mutable pointers.
     ///
     /// The default impl **fails** rather than falling back to `put`, for the
     /// same reason [`put_if`](ObjectStore::put_if) does: a backend that cannot
-    /// set the header must not report success as though it had. A caller that
+    /// set the headers must not report success as though it had. A caller that
     /// only wants best-effort can call `put` explicitly and mean it.
-    fn put_cached(&self, _key: &str, _data: Vec<u8>, _cache_control: &str) -> Result<(), Error> {
+    fn put_with(&self, _key: &str, _data: Vec<u8>, _opts: &PutOptions<'_>) -> Result<(), Error> {
         Err(Error::Backend(
-            "cache-control on put (put_cached) not supported by this backend".into(),
+            "per-object response headers on put (put_with) not supported by this backend".into(),
         ))
     }
 
@@ -145,7 +200,7 @@ pub trait ObjectStore: Send + Sync {
     /// returned ETag is the comparand for the next [`Precondition::IfMatch`] in
     /// a CAS chain, so a single writer can advance a pointer without re-reading.
     ///
-    /// `cache_control` carries the same directive [`put_cached`](ObjectStore::put_cached)
+    /// `cache_control` carries the same directive [`put_with`](ObjectStore::put_with)
     /// takes, and `None` means "send no header" exactly as [`put`](ObjectStore::put)
     /// does. It is a REQUIRED parameter rather than a second method (R330-B51).
     ///
@@ -221,12 +276,20 @@ fn etag_of(data: &[u8]) -> String {
 pub struct InMemoryObjectStore {
     /// key → (bytes, etag). The etag is recomputed on every write.
     objects: Mutex<HashMap<String, (Vec<u8>, String)>>,
-    /// key → `Cache-Control`, for the keys written through
-    /// [`ObjectStore::put_cached`] (R703-B8). Kept beside `objects` rather than
-    /// widening its tuple so the CAS paths stay untouched. Recorded at all so a
-    /// publish path can be *tested* for its cache directives — the bug this
-    /// exists for shipped precisely because nothing could assert on them.
-    cache_control: Mutex<HashMap<String, String>>,
+    /// key → the [`PutOptions`] headers it was written with, for the keys
+    /// written through [`ObjectStore::put_with`] (R703-B8, R717-B1). Kept
+    /// beside `objects` rather than widening its tuple so the CAS paths stay
+    /// untouched. Recorded at all so a publish path can be *tested* for the
+    /// headers it sets — the bug this exists for shipped precisely because
+    /// nothing could assert on them.
+    put_headers: Mutex<HashMap<String, StoredHeaders>>,
+}
+
+/// What [`InMemoryObjectStore`] remembers about one write's [`PutOptions`].
+#[derive(Debug, Clone, Default)]
+struct StoredHeaders {
+    cache_control: Option<String>,
+    content_disposition: Option<String>,
 }
 
 impl Default for InMemoryObjectStore {
@@ -239,7 +302,7 @@ impl InMemoryObjectStore {
     pub fn new() -> Self {
         Self {
             objects: Mutex::new(HashMap::new()),
-            cache_control: Mutex::new(HashMap::new()),
+            put_headers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -256,7 +319,21 @@ impl InMemoryObjectStore {
     /// `Cache-Control` the last write to `key` carried, or `None` if it was
     /// written through plain [`ObjectStore::put`] (test helper).
     pub fn cache_control(&self, key: &str) -> Option<String> {
-        self.cache_control.lock().unwrap().get(key).cloned()
+        self.put_headers
+            .lock()
+            .unwrap()
+            .get(key)
+            .and_then(|h| h.cache_control.clone())
+    }
+
+    /// `Content-Disposition` the last write to `key` carried, or `None` if it
+    /// set no download name (test helper).
+    pub fn content_disposition(&self, key: &str) -> Option<String> {
+        self.put_headers
+            .lock()
+            .unwrap()
+            .get(key)
+            .and_then(|h| h.content_disposition.clone())
     }
 }
 
@@ -264,19 +341,25 @@ impl ObjectStore for InMemoryObjectStore {
     fn put(&self, key: &str, data: Vec<u8>) -> Result<(), Error> {
         let etag = etag_of(&data);
         self.objects.lock().unwrap().insert(key.to_string(), (data, etag));
-        // An unqualified put clears any directive a prior write set: the object
-        // was replaced, and leaving the old header recorded would let a test
-        // pass on a `Cache-Control` the real store would no longer be sending.
-        self.cache_control.lock().unwrap().remove(key);
+        // An unqualified put clears any header a prior write set: the object
+        // was replaced, and leaving the old ones recorded would let a test pass
+        // on a `Cache-Control` the real store would no longer be sending.
+        self.put_headers.lock().unwrap().remove(key);
         Ok(())
     }
 
-    fn put_cached(&self, key: &str, data: Vec<u8>, cache_control: &str) -> Result<(), Error> {
+    fn put_with(&self, key: &str, data: Vec<u8>, opts: &PutOptions<'_>) -> Result<(), Error> {
+        // Compose before writing anything: a rejected download name must not
+        // leave the bytes stored under a header the real backend refused.
+        let content_disposition = opts.download_name.map(attachment_filename).transpose()?;
         self.put(key, data)?;
-        self.cache_control
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), cache_control.to_string());
+        self.put_headers.lock().unwrap().insert(
+            key.to_string(),
+            StoredHeaders {
+                cache_control: opts.cache_control.map(str::to_string),
+                content_disposition,
+            },
+        );
         Ok(())
     }
 
@@ -328,19 +411,27 @@ impl ObjectStore for InMemoryObjectStore {
         }
         let etag = etag_of(&data);
         g.insert(key.to_string(), (data, etag.clone()));
-        // Recorded the same way `put_cached` records it, so a test can assert the
+        // Recorded the same way `put_with` records it, so a test can assert the
         // directive a conditional write WOULD have sent. Without this the whole
         // class of bug R330-B51 fixes — "the header silently isn't sent" — stays
         // untestable in-memory, which is how it went unnoticed for two releases.
         // Mirrors `put`'s clearing semantics: `None` removes any prior entry
         // rather than leaving a stale directive the real store would not send.
-        let mut cc = self.cache_control.lock().unwrap();
+        let mut headers = self.put_headers.lock().unwrap();
         match cache_control {
             Some(v) => {
-                cc.insert(key.to_string(), v.to_string());
+                headers.insert(
+                    key.to_string(),
+                    StoredHeaders {
+                        cache_control: Some(v.to_string()),
+                        // The R2 conditional path sends none either — see the
+                        // `content_disposition: None` there.
+                        content_disposition: None,
+                    },
+                );
             }
             None => {
-                cc.remove(key);
+                headers.remove(key);
             }
         }
         Ok(etag)
@@ -367,10 +458,17 @@ mod tests {
     // ── Cache-Control on put (R703-B8) ──────────────────────────────────────
 
     #[test]
-    fn put_cached_stores_the_bytes_and_the_directive() {
+    fn put_with_stores_the_bytes_and_the_directive() {
         let s = InMemoryObjectStore::new();
-        s.put_cached("yah-desktop/latest.json", b"{}".to_vec(), CACHE_CONTROL_NO_CACHE)
-            .unwrap();
+        s.put_with(
+            "yah-desktop/latest.json",
+            b"{}".to_vec(),
+            &PutOptions {
+                cache_control: Some(CACHE_CONTROL_NO_CACHE),
+                download_name: None,
+            },
+        )
+        .unwrap();
         assert_eq!(
             s.get("yah-desktop/latest.json").unwrap().as_deref(),
             Some(&b"{}"[..])
@@ -396,7 +494,12 @@ mod tests {
     #[test]
     fn a_plain_put_clears_a_previously_set_directive() {
         let s = InMemoryObjectStore::new();
-        s.put_cached("k", b"a".to_vec(), CACHE_CONTROL_IMMUTABLE).unwrap();
+        s.put_with(
+            "k",
+            b"a".to_vec(),
+            &PutOptions { cache_control: Some(CACHE_CONTROL_IMMUTABLE), download_name: None },
+        )
+        .unwrap();
         assert!(s.cache_control("k").is_some());
         s.put("k", b"b".to_vec()).unwrap();
         assert_eq!(s.cache_control("k"), None);
@@ -432,10 +535,14 @@ mod tests {
             }
         }
         let err = Bare
-            .put_cached("k", b"v".to_vec(), CACHE_CONTROL_NO_CACHE)
+            .put_with(
+                "k",
+                b"v".to_vec(),
+                &PutOptions { cache_control: Some(CACHE_CONTROL_NO_CACHE), download_name: None },
+            )
             .unwrap_err();
         assert!(matches!(err, Error::Backend(_)), "got {err:?}");
-        assert!(err.to_string().contains("put_cached"), "{err}");
+        assert!(err.to_string().contains("put_with"), "{err}");
     }
 
     #[test]
@@ -479,7 +586,7 @@ mod tests {
     }
 
     /// R330-B51: a conditional write records its directive the same way
-    /// `put_cached` does, so a consumer's test can assert what a CAS WOULD have
+    /// `put_with` does, so a consumer's test can assert what a CAS WOULD have
     /// sent. Without this the in-memory store silently reports nothing, and the
     /// exact failure this parameter exists to prevent — "the header is not on
     /// the request" — stays invisible to every test that does not open a socket.
@@ -506,7 +613,12 @@ mod tests {
     #[test]
     fn put_if_with_none_clears_a_previously_recorded_directive() {
         let s = InMemoryObjectStore::new();
-        s.put_cached("k", b"v1".to_vec(), CACHE_CONTROL_NO_CACHE).unwrap();
+        s.put_with(
+            "k",
+            b"v1".to_vec(),
+            &PutOptions { cache_control: Some(CACHE_CONTROL_NO_CACHE), download_name: None },
+        )
+        .unwrap();
         let etag = s.etag("k").unwrap().unwrap();
         s.put_if("k", b"v2".to_vec(), Precondition::IfMatch(etag), None)
             .unwrap();

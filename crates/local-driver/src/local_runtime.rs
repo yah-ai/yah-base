@@ -1287,7 +1287,6 @@ mod tests {
     fn minimal_workload_spec(name: &str) -> workload_spec::WorkloadSpec {
         use workload_spec::*;
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: name.to_string(),
             image: ImageRef {
                 registry: "ghcr.io".into(),
@@ -1306,7 +1305,15 @@ mod tests {
             env: vec![],
             secrets: vec![],
             volumes: vec![],
-            resources: ResourceLimits { memory_mb: 256, cpu_millis: 512, ephemeral_storage_mb: 256 },
+            resources: ResourceLimits {
+                memory_mb: 256,
+                cpu_millis: 512,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
+            },
+            durability: None,
             depends_on: vec![],
             requires: vec![],
             healthcheck: None,

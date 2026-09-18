@@ -1,7 +1,6 @@
 {
   "specs": [
     {
-      "schema_version": "V1",
       "name": "app",
       "image": {
         "registry": "ghcr.io",
@@ -13,8 +12,7 @@
       "replicas": 1,
       "resources": {
         "memory_mb": 256,
-        "cpu_millis": 512,
-        "ephemeral_storage_mb": 512
+        "cpu_millis": 512
       },
       "restart_policy": "always",
       "stop_policy": {

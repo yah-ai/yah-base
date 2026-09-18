@@ -1,5 +1,4 @@
 {
-  "schema_version": "V1",
   "name": "api-svc",
   "image": {
     "registry": "docker.io",
@@ -11,8 +10,7 @@
   "replicas": 1,
   "resources": {
     "memory_mb": 128,
-    "cpu_millis": 512,
-    "ephemeral_storage_mb": 128
+    "cpu_millis": 512
   },
   "restart_policy": "always",
   "stop_policy": {

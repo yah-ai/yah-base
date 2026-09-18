@@ -25,7 +25,6 @@ fn main() {
     // shape (catches schema drift between the scaffold's docstring and
     // the live StaticAssetWorkload type).
     let populated = r#"
-schema_version = "V1"
 kind = "static-asset"
 
 [[asset]]

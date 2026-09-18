@@ -1,8 +1,9 @@
 # shellcheck shell=bash
 # Canonical control-plane roll: fetch → verify → anchor → install → assert →
-# restart. yubaba + kamaji are the supervised pair; yah-scryer (0.8.32) and
-# passway + passway-demux (0.8.33) ride the same tarball, each conditional on
-# the tarball carrying it so a rollback to an older release still succeeds.
+# restart. yubaba + kamaji are the supervised pair; yah-scryer (0.8.32),
+# passway + passway-demux (0.8.33) and the turso-backup durability helpers
+# (0.8.37) ride the same tarball, each conditional on the tarball carrying it
+# so a rollback to an older release still succeeds.
 #
 # THIS FILE IS THE ONE COPY. Three callers consume these exact bytes:
 #   1. `build_install_script` (control_plane_install.rs) include_str!s it for the
@@ -71,10 +72,19 @@ anchor /usr/local/bin/passway
 anchor /usr/local/bin/passway-demux
 anchor /usr/local/bin/passway-http-router
 anchor /usr/local/bin/passway-graceful-upgrade
+anchor /usr/local/bin/turso-backup-hydrate
+anchor /usr/local/bin/turso-backup-tail
 anchor /etc/systemd/system/yubaba.slice
 anchor /etc/systemd/system/kamaji.service
 anchor /etc/systemd/system/yubaba.service
 anchor /etc/systemd/system/yah-scryer.service
+# The durability drop-in is anchored like any other file this script replaces.
+# A `.rollback-YYYYMMDD` sibling inside a `.d` directory is inert — systemd
+# reads only `*.conf` there — so the anchor cannot itself change the unit.
+anchor /etc/systemd/system/kamaji.service.d/50-durability-helpers.conf
+# R858-T24's credential + flag drop-ins, anchored the same way.
+anchor /etc/systemd/system/kamaji.service.d/51-headscale-durability-cred.conf
+anchor /etc/systemd/system/yubaba.service.d/50-headscale-durability.conf
 
 echo "== install (atomic, yubaba + kamaji as one pair) =="
 # Stage next to the target on the SAME filesystem, then rename. A rename within
@@ -146,6 +156,86 @@ if [ -e "$D/passway-graceful-upgrade" ]; then
   HAS_UPGRADE_HELPER=1
   install_atomic "$D/passway-graceful-upgrade" 0755 /usr/local/bin/passway-graceful-upgrade
 fi
+# turso-backup-hydrate + turso-backup-tail (R858-F17), from 0.8.37 — the two
+# helpers kamaji execs to restore and then continuously tail a workload's SQLite
+# state. kamaji HARD-REFUSES to deploy any workload declaring
+# `yah.durability.tier` when either is missing (kamaji-bin/src/hydrate.rs,
+# src/tail.rs), so a node without them is a node where durability can never be
+# switched on — declaring a tier there takes the service DOWN instead of backing
+# it up.
+#
+# R858-T21: until this block they were placed ONLY by provisioning
+# (stand-up-yubaba.sh's "durability helpers" block, mirror.yml's turso-backup
+# block), so a node that was ROLLED rather than freshly stood up could never
+# acquire them, and R858-F17's own "cut a release, roll it, then verify the
+# helpers are on the node" instruction could not pass on any rolled node. This
+# is a transcription of stand-up-yubaba.sh's block, down to the drop-in's bytes.
+#
+# Conditional for the same reason as every block above: a rollback to a
+# pre-0.8.37 release must still succeed, just without durability.
+#
+# THE DROP-IN USES `Environment=`, NEVER `ExecStart=`. A drop-in that redeclares
+# ExecStart= silently drops every flag the unit added after it — measured on
+# us-south-001, half of the 2026-09-03 outage (the 20-bundle.conf note in
+# yubaba's litestream.rs). It no-ops until a workload actually declares a tier,
+# so laying it down on every node this script touches is safe, and it is
+# staged-then-renamed like everything else here rather than written in place.
+HAS_DURABILITY_HELPERS=0
+if [ -e "$D/turso-backup-hydrate" ] && [ -e "$D/turso-backup-tail" ]; then
+  HAS_DURABILITY_HELPERS=1
+  install_atomic "$D/turso-backup-hydrate" 0755 /usr/local/bin/turso-backup-hydrate
+  install_atomic "$D/turso-backup-tail"    0755 /usr/local/bin/turso-backup-tail
+  printf '[Service]\nEnvironment=KAMAJI_HYDRATE_HELPER=/usr/local/bin/turso-backup-hydrate\nEnvironment=KAMAJI_TAIL_HELPER=/usr/local/bin/turso-backup-tail\n' \
+    > "$WORK/50-durability-helpers.conf"
+  $SUDO mkdir -p /etc/systemd/system/kamaji.service.d
+  install_atomic "$WORK/50-durability-helpers.conf" 0644 \
+    /etc/systemd/system/kamaji.service.d/50-durability-helpers.conf
+else
+  echo "  turso-backup helpers absent from this tarball — durability-declaring"
+  echo "  workloads will refuse to deploy on this node (R858-F17)"
+fi
+# R858-T24 — the credential AND the flag, in ONE conditional, never separately.
+# This relay is a 37-hour and a 14-hour outage caused by the same defect twice:
+# a declaration (`yah.durability.tier` / YUBABA_HEADSCALE_DURABILITY) shipped
+# ahead of its prerequisite. kamaji hard-refuses a tier-declaring workload when
+# either helper above is missing (hydrate.rs/tail.rs), and even with both
+# helpers present, the hydrate helper hard-refuses without S3_ACCESS_KEY /
+# S3_SECRET_KEY — so setting the flag without the credential reproduces the
+# exact failure this whole relay exists to close.
+#
+# This script CANNOT MINT the credential — it is not in the release tarball —
+# so it can only detect an operator-placed credential file and wire it,
+# mirroring how /etc/yah-cloud/cert-store.env is delivered for the cert store
+# (us-east-001.toml:148-153: no in-tree writer places that file either, an
+# operator does, and yubaba.service.d/50-cert-store.conf only references it).
+HEADSCALE_DURABILITY_CRED=/etc/yah-cloud/headscale-durability.env
+HEADSCALE_DURABILITY_ON=0
+if [ "$HAS_DURABILITY_HELPERS" = 1 ] && [ -f "$HEADSCALE_DURABILITY_CRED" ]; then
+  # kamaji leg: EnvironmentFile= for the secret pair (S3_ACCESS_KEY /
+  # S3_SECRET_KEY), plus the non-secret R2 endpoint/region as plain
+  # Environment= lines in the same drop-in — never ExecStart=.
+  printf '[Service]\nEnvironmentFile=%s\nEnvironment=S3_ENDPOINT=https://3948dc292e724e71b0deefde0ea95999.r2.cloudflarestorage.com\nEnvironment=S3_REGION=auto\n' \
+    "$HEADSCALE_DURABILITY_CRED" > "$WORK/51-headscale-durability-cred.conf"
+  install_atomic "$WORK/51-headscale-durability-cred.conf" 0644 \
+    /etc/systemd/system/kamaji.service.d/51-headscale-durability-cred.conf
+
+  # yubaba leg: the flag itself, gated on the SAME `if` as the credential above
+  # — this is the whole point, not a stylistic choice. --headscale-durability /
+  # YUBABA_HEADSCALE_DURABILITY defaults OFF (headscale_appliance.rs); this is
+  # the only place in the tree that turns it on, and it can't fire without the
+  # credential leg above having just run in this same pass.
+  $SUDO mkdir -p /etc/systemd/system/yubaba.service.d
+  printf '[Service]\nEnvironment=YUBABA_HEADSCALE_DURABILITY=1\n' \
+    > "$WORK/50-headscale-durability.conf"
+  install_atomic "$WORK/50-headscale-durability.conf" 0644 \
+    /etc/systemd/system/yubaba.service.d/50-headscale-durability.conf
+  HEADSCALE_DURABILITY_ON=1
+elif [ "$HAS_DURABILITY_HELPERS" = 1 ]; then
+  echo "  $HEADSCALE_DURABILITY_CRED absent — headscale durability tier stays OFF."
+  echo "  Place the yah-headscale-scoped R2 credential there (S3_ACCESS_KEY /"
+  echo "  S3_SECRET_KEY) to turn it on; YUBABA_HEADSCALE_DURABILITY is NOT set"
+  echo "  without it (R858-T24)."
+fi
 
 echo "== assert by CONTENT, not by version string =="
 # `--version` prints the workspace version baked in at build time, which says
@@ -180,6 +270,10 @@ fi
 if [ "$HAS_UPGRADE_HELPER" = 1 ]; then
   assert_installed_bytes "$D/passway-graceful-upgrade" /usr/local/bin/passway-graceful-upgrade
 fi
+if [ "$HAS_DURABILITY_HELPERS" = 1 ]; then
+  assert_installed_bytes "$D/turso-backup-hydrate" /usr/local/bin/turso-backup-hydrate
+  assert_installed_bytes "$D/turso-backup-tail"    /usr/local/bin/turso-backup-tail
+fi
 
 echo "== restart supervision tree (kamaji then yubaba, W154 order) =="
 $SUDO systemctl daemon-reload
@@ -204,6 +298,18 @@ if [ "$HAS_PASSWAY" = 1 ]; then
   else
     echo "  Restart the node's own passway unit when a :443 blip is acceptable."
   fi
+fi
+if [ "$HAS_DURABILITY_HELPERS" = 1 ]; then
+  # Live on THIS roll, not the next one: the drop-in landed before the
+  # daemon-reload above, and kamaji was restarted after it, so the running
+  # kamaji already carries KAMAJI_HYDRATE_HELPER / KAMAJI_TAIL_HELPER.
+  echo "  durability helpers installed; kamaji restarted above with"
+  echo "  KAMAJI_{HYDRATE,TAIL}_HELPER set (R858-T21)"
+fi
+if [ "$HEADSCALE_DURABILITY_ON" = 1 ]; then
+  echo "  headscale durability tier ON: kamaji restarted above with S3_ACCESS_KEY/"
+  echo "  S3_SECRET_KEY from $HEADSCALE_DURABILITY_CRED, yubaba restarted above"
+  echo "  with YUBABA_HEADSCALE_DURABILITY=1 (R858-T24)"
 fi
 if [ "$HAS_HTTP_ROUTER" = 1 ]; then
   echo "  passway-http-router bytes are STAGED, not live, for the same reason — and"

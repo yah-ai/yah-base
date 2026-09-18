@@ -47,8 +47,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use workload_spec::{
     EnvValue, EnvVar, ExposeSpec, HealthProbe, Healthcheck, ImageRef, LifecycleArchetype,
-    MeshExpose, MeshIdent, Millis, NamespaceId, ResourceLimits, RestartPolicy, SchemaVersion,
-    SecretMount, SecretRef, SecretTarget, StopPolicy, TenantId, TierTag, VolumeMount, Workload,
+    MeshExpose, MeshIdent, Millis, NamespaceId, ResourceLimits, RestartPolicy,     SecretMount, SecretRef, SecretTarget, StopPolicy, TenantId, TierTag, VolumeMount, Workload,
     WorkloadSpec, HOST_NETWORK_ANNOTATION, HOST_NETWORK_VALUE, PUBLIC_IP_TAINT,
     REQUIRES_TAINT_ANNOTATION,
 };
@@ -167,7 +166,6 @@ impl CloudflaredIngressSpec {
         labels.insert("yah.ingress.tunnel-id".to_string(), self.tunnel_id.clone());
 
         let spec = WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: INGRESS_WORKLOAD_NAME.into(),
             image,
             tier: TierTag("infra".into()),
@@ -184,7 +182,10 @@ impl CloudflaredIngressSpec {
             resources: ResourceLimits {
                 memory_mb: 256,
                 cpu_millis: 512,
-                ephemeral_storage_mb: 128,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -222,6 +223,7 @@ impl CloudflaredIngressSpec {
                 operator: None,
             },
             labels,
+            durability: None,
             annotations,
             files: Vec::new(),
         };

@@ -14,9 +14,9 @@ use regex::Regex;
 use thiserror::Error;
 
 use crate::{
-    EnvValue, EnvVar, ImageRef, LifecycleArchetype, MachineId, MeshIdent, MeshLookup,
+    DurabilityDeclError, EnvValue, EnvVar, ImageRef, LifecycleArchetype, MachineId, MeshIdent, MeshLookup,
     RestartPolicy, SecretRef, SecretTarget, StaticAssetWorkload, Supply, VolumeSource,
-    WorkloadSpec, DURABILITY_SUBJECTS_ANNOTATION, DURABILITY_TIER_ANNOTATION,
+    WorkloadSpec,
 };
 
 // ── Field paths ───────────────────────────────────────────────────────────────
@@ -61,10 +61,11 @@ pub enum FieldPath {
     AssetAlias(String),
     /// `asset[index].<sub>` — e.g. `Asset(0, "source")` for the XOR rule.
     Asset(usize, &'static str),
-    /// `annotations["<key>"]` — a declaration carried as an annotation rather
-    /// than a field, because `WorkloadSpec` crosses a positional postcard wire
-    /// (R590-B3). `yah.durability.tier` is the first.
-    Annotation(&'static str),
+    /// `annotations["<key>"]` — today only a key from a family R896-F3 retired
+    /// into typed fields.
+    Annotation(String),
+    /// `durability.<sub>` — e.g. `Durability("subjects")`.
+    Durability(&'static str),
 }
 
 impl fmt::Display for FieldPath {
@@ -90,7 +91,26 @@ impl fmt::Display for FieldPath {
             FieldPath::AssetAlias(key) => write!(f, "aliases[{key}]"),
             FieldPath::Asset(i, sub) => write!(f, "asset[{i}].{sub}"),
             FieldPath::Annotation(key) => write!(f, "annotations[\"{key}\"]"),
+            FieldPath::Durability(sub) => write!(f, "durability.{sub}"),
         }
+    }
+}
+
+/// The `durability.<sub>` a [`DurabilityDeclError`] is about, so the path in a
+/// refusal points at the key to fix rather than at the whole table.
+fn durability_error_field(e: &DurabilityDeclError) -> &'static str {
+    use DurabilityDeclError as E;
+    match e {
+        E::RetiredAnnotation { .. } => "tier",
+        E::MissingStore { .. } | E::StoreWithoutTier => "store",
+        E::RpoOnNonStreamTier { .. } => "rpo_seconds",
+        E::MissingEngine { .. } | E::EngineWithoutTier => "engine",
+        E::MissingSubjects { .. }
+        | E::SubjectsWithoutTier
+        | E::EmptySubject
+        | E::AbsoluteSubject { .. }
+        | E::TraversingSubject { .. }
+        | E::DuplicateSubject { .. } => "subjects",
     }
 }
 
@@ -566,20 +586,34 @@ pub fn shape(spec: &WorkloadSpec) -> Result<Vec<ShapeWarning>, ShapeError> {
         }
     }
 
-    // yah.durability.*: a malformed declaration is hard, and a stateful
-    // workload with no declaration at all is soft (R850-P4).
+    // R896-F3: the `yah.limits.*` / `yah.placement.memory-request-mb` /
+    // `yah.durability.*` annotations became typed fields. Nothing reads those
+    // keys any more, and a key nothing reads fails silently — a pids ceiling
+    // falls back to the default, a durability tier means "no backup" — so a
+    // surviving one refuses the spec and names where the value goes now.
+    if let Some((key, field)) = spec.retired_annotation() {
+        return Err(ShapeError::Field {
+            path: FieldPath::Annotation(key.to_string()),
+            reason: format!(
+                "annotation {key:?} is no longer read; since R896-F3 it is the typed field \
+                 `{field}` — move the value there, because an ignored annotation silently \
+                 falls back to the default"
+            ),
+        });
+    }
+
+    // durability: a malformed declaration is hard, and a stateful workload with
+    // no declaration at all is soft (R850-P4).
     //
     // The asymmetry is deliberate. Refusing every undeclared appliance would
-    // fail every spec in the tree on the day the annotation shipped; reading a
-    // *malformed* one as "undeclared" would let `tier = "streem"` mean "no
-    // backups" silently, which is the failure this whole surface exists to
+    // fail every spec in the tree on the day the declaration shipped; reading a
+    // *malformed* one as "undeclared" would let a half-written declaration mean
+    // "no backups" silently, which is the failure this whole surface exists to
     // stop. See `WorkloadSpec::durability`.
-    let durability = spec
-        .durability()
-        .map_err(|e| ShapeError::Field {
-            path: FieldPath::Annotation(DURABILITY_TIER_ANNOTATION),
-            reason: e.to_string(),
-        })?;
+    let durability = spec.durability().map_err(|e| ShapeError::Field {
+        path: FieldPath::Durability(durability_error_field(&e)),
+        reason: e.to_string(),
+    })?;
     // R850-F1: a bytes-shipping tier's subjects are volume-relative, so there
     // has to be exactly one volume for them to be relative *to*. Zero means the
     // declaration names files that will never exist; two or more means the
@@ -597,6 +631,10 @@ pub fn shape(spec: &WorkloadSpec) -> Result<Vec<ShapeWarning>, ShapeError> {
         let roots: Vec<String> = spec
             .volumes
             .iter()
+            // A secret-materializer bind (R858-B26) is excluded for the same
+            // reason Tmpfs is: it is not where durable subjects live, it is
+            // just where yubaba parked a decrypted file.
+            .filter(|v| !v.from_secret_mount)
             .filter_map(|v| match &v.source {
                 VolumeSource::Named { name } => Some(name.clone()),
                 VolumeSource::Bind { host_path } => Some(host_path.display().to_string()),
@@ -608,9 +646,9 @@ pub fn shape(spec: &WorkloadSpec) -> Result<Vec<ShapeWarning>, ShapeError> {
             .collect();
         if roots.len() != 1 {
             return Err(ShapeError::Field {
-                path: FieldPath::Annotation(DURABILITY_SUBJECTS_ANNOTATION),
+                path: FieldPath::Durability("subjects"),
                 reason: format!(
-                    "{DURABILITY_TIER_ANNOTATION} = \"{}\" declares subjects {:?}, which are \
+                    "durability.tier = \"{}\" declares subjects {:?}, which are \
                      relative to one volume, but this spec declares {} named-or-bind volumes{}; \
                      a tier that ships bytes needs exactly one (tmpfs does not count — it is a \
                      declaration that the data does not survive)",
@@ -635,13 +673,12 @@ pub fn shape(spec: &WorkloadSpec) -> Result<Vec<ShapeWarning>, ShapeError> {
             .any(|v| matches!(v.source, VolumeSource::Named { .. }))
     {
         warnings.push(ShapeWarning {
-            path: FieldPath::Annotation(DURABILITY_TIER_ANNOTATION),
-            message: format!(
-                "appliance with a yubaba-managed named volume declares no durability \
-                 tier, so that volume is the only copy of its state and losing the node \
-                 loses it; declare {DURABILITY_TIER_ANNOTATION} = \"none\" if that is \
-                 intended, or a real tier if it is not"
-            ),
+            path: FieldPath::Durability("tier"),
+            message: "appliance with a yubaba-managed named volume declares no durability \
+                      tier, so that volume is the only copy of its state and losing the node \
+                      loses it; declare durability.tier = \"none\" if that is intended, or a \
+                      real tier if it is not"
+                .into(),
         });
     }
 
@@ -874,11 +911,8 @@ pub fn semantic(
         return Err(WorkloadValidationError::Semantic(SemanticError::Unknown {
             path: FieldPath::Resources,
             reason: format!(
-                "machine {:?} lacks capacity (memory={}MB cpu_millis={} ephemeral={}MB)",
-                machine_id.0,
-                spec.resources.memory_mb,
-                spec.resources.cpu_millis,
-                spec.resources.ephemeral_storage_mb
+                "machine {:?} lacks capacity (memory={}MB cpu_millis={})",
+                machine_id.0, spec.resources.memory_mb, spec.resources.cpu_millis
             ),
         }));
     }

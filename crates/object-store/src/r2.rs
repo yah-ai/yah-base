@@ -42,7 +42,7 @@ use local_driver::s3_sign::{
     sign_s3_get_with_query, sign_s3_no_body, sign_s3_put_object_with, uri_encode_key, S3PutOptions,
 };
 
-use crate::{Error, ObjectStore, Precondition};
+use crate::{attachment_filename, Error, ObjectStore, Precondition, PutOptions};
 
 /// R2's S3-compat region. The endpoint always accepts `"auto"`.
 const R2_REGION: &str = "auto";
@@ -239,17 +239,16 @@ impl R2ObjectStore {
         format!("{}/{}", self.endpoint(), self.bucket)
     }
 
-    /// The one PUT path, with `Cache-Control` optional (R703-B8).
+    /// The one PUT path; its per-object response headers are optional
+    /// (R703-B8 `Cache-Control`, R717-B1 `Content-Disposition`).
     ///
-    /// `put` and `put_cached` differ only in that header, so they share this
+    /// `put` and `put_with` differ only in those headers, so they share this
     /// rather than each carrying their own signing + status handling — the
     /// shape where one of two copies quietly stops matching the other.
-    fn put_inner(
-        &self,
-        key: &str,
-        data: Vec<u8>,
-        cache_control: Option<&str>,
-    ) -> Result<(), Error> {
+    fn put_inner(&self, key: &str, data: Vec<u8>, opts: &PutOptions<'_>) -> Result<(), Error> {
+        // Composed — and validated — before the request is built, so a rejected
+        // download name costs nothing and cannot reach the wire half-formed.
+        let content_disposition = opts.download_name.map(attachment_filename).transpose()?;
         let url = self.object_url(key);
         let body_sha256 = {
             let mut h = Sha256::new();
@@ -268,7 +267,8 @@ impl R2ObjectStore {
                 // Generic object-store put — the BLAKE3 stamp is a static-asset
                 // catalog concern, not a property of every object (R546-B10).
                 blake3_meta: None,
-                cache_control,
+                cache_control: opts.cache_control,
+                content_disposition: content_disposition.as_deref(),
             },
         )
         .map_err(|e| Error::Backend(format!("sign PUT {key}: {e}")))?;
@@ -284,6 +284,29 @@ impl R2ObjectStore {
     }
 }
 
+/// The stored response headers R2 replays on every GET of one object
+/// ([`R2ObjectStore::head_meta`]).
+///
+/// These are metadata, not content: two objects with identical bytes can
+/// disagree about them, and the only way to change them is to write the object
+/// again. That is exactly why a publisher needs to *read* them — a
+/// content-addressed publish skips the upload when the bytes are already there
+/// (`HEAD`-then-`PUT` idempotency), and without this it would also skip the one
+/// case that genuinely needs rewriting: right bytes, missing or stale
+/// `Content-Disposition`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredHttpMeta {
+    /// `Content-Length`.
+    pub size: Option<u64>,
+    /// `Content-Type` as stored.
+    pub content_type: Option<String>,
+    /// `Cache-Control`, absent when the object was written without one.
+    pub cache_control: Option<String>,
+    /// `Content-Disposition`, absent when the object was written without a
+    /// download name.
+    pub content_disposition: Option<String>,
+}
+
 /// Convert a reqwest error into our generic [`Error`].
 fn io_err(ctx: &str, e: impl std::fmt::Display) -> Error {
     Error::Io(format!("{ctx}: {e}"))
@@ -295,11 +318,11 @@ impl ObjectStore for R2ObjectStore {
     }
 
     fn put(&self, key: &str, data: Vec<u8>) -> Result<(), Error> {
-        self.put_inner(key, data, None)
+        self.put_inner(key, data, &PutOptions::default())
     }
 
-    fn put_cached(&self, key: &str, data: Vec<u8>, cache_control: &str) -> Result<(), Error> {
-        self.put_inner(key, data, Some(cache_control))
+    fn put_with(&self, key: &str, data: Vec<u8>, opts: &PutOptions<'_>) -> Result<(), Error> {
+        self.put_inner(key, data, opts)
     }
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
@@ -443,6 +466,10 @@ impl ObjectStore for R2ObjectStore {
                 content_type: content_type_for_key(key),
                 blake3_meta: None,
                 cache_control,
+                // A conditional write is how a mutable POINTER is updated — a
+                // latest.json, a tenant index. Nothing downloads one by hand,
+                // so there is no filename to carry.
+                content_disposition: None,
             },
         )
         .map_err(|e| Error::Backend(format!("sign PUT {key}: {e}")))?;
@@ -529,6 +556,45 @@ pub struct ObjectMeta {
 }
 
 impl R2ObjectStore {
+    /// `HEAD` `key` and report the response headers R2 has stored for it, or
+    /// `None` when the object does not exist.
+    ///
+    /// The same request [`ObjectStore::head`] makes — that one answers
+    /// "present?" and throws the headers away. Reach for this when the answer
+    /// that matters is "present *and* served how?".
+    pub fn head_meta(&self, key: &str) -> Result<Option<StoredHttpMeta>, Error> {
+        let url = self.object_url(key);
+        // Body-less, so it signs like GET/HEAD — see `ObjectStore::head`.
+        let headers = sign_s3_no_body("HEAD", &url, "", R2_REGION, &self.access_key, &self.secret_key)
+            .map_err(|e| Error::Backend(format!("sign HEAD {key}: {e}")))?;
+
+        let resp = self
+            .client()
+            .head(&url)
+            .headers(headers)
+            .send()
+            .map_err(|e| io_err(&format!("HEAD {key}"), e))?;
+
+        match resp.status() {
+            StatusCode::OK => {
+                let header = |name: &str| {
+                    resp.headers()
+                        .get(name)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string)
+                };
+                Ok(Some(StoredHttpMeta {
+                    size: header("content-length").and_then(|v| v.parse().ok()),
+                    content_type: header("content-type"),
+                    cache_control: header("cache-control"),
+                    content_disposition: header("content-disposition"),
+                }))
+            }
+            StatusCode::NOT_FOUND => Ok(None),
+            s => Err(status_err("HEAD", key, s, None)),
+        }
+    }
+
     /// List objects under `prefix` returning key + size + last-modified.
     ///
     /// Same paginated request as [`ObjectStore::list_prefix`] but parses the
@@ -846,17 +912,20 @@ mod tests {
     /// stops at the `HeaderMap`, which is one `.headers()` call away from being
     /// a test that passes while R2 stores an object with no directive.
     #[test]
-    fn put_cached_sends_the_cache_control_header_on_the_wire() {
+    fn put_with_sends_the_cache_control_header_on_the_wire() {
         let (endpoint, server) = one_shot_http();
         let store = R2ObjectStore::new("acct", "yah-dev", "AK", "SK")
             .unwrap()
             .with_endpoint(endpoint);
 
         store
-            .put_cached(
+            .put_with(
                 "yah-desktop/latest.json",
                 b"{\"version\":\"0.8.22\"}".to_vec(),
-                crate::CACHE_CONTROL_NO_CACHE,
+                &PutOptions {
+                    cache_control: Some(crate::CACHE_CONTROL_NO_CACHE),
+                    download_name: None,
+                },
             )
             .unwrap();
 
@@ -871,6 +940,69 @@ mod tests {
             head.contains("signedheaders=cache-control;content-length;content-type;host;"),
             "{head}"
         );
+    }
+
+    /// R717-B1. The download-name twin of the test above, and it asserts the
+    /// same two things for the same reason: `Content-Disposition` is *stored*
+    /// object metadata, so it must be inside `SignedHeaders` or R2 answers 403
+    /// rather than dropping it. The interesting part is the ORDER — it sorts
+    /// between `cache-control` and `content-length`, and SigV4 hashes the
+    /// canonical block in lexicographic order, so a header appended in the
+    /// obvious place would sign a request R2 cannot reproduce.
+    #[test]
+    fn put_with_sends_the_download_name_as_content_disposition_and_signs_it() {
+        let (endpoint, server) = one_shot_http();
+        let store = R2ObjectStore::new("acct", "noisetable-releases", "AK", "SK")
+            .unwrap()
+            .with_endpoint(endpoint);
+
+        store
+            .put_with(
+                "images/f42a9455a50a4376",
+                b"\xfd7zXZ".to_vec(),
+                &PutOptions {
+                    cache_control: Some(crate::CACHE_CONTROL_IMMUTABLE),
+                    download_name: Some("noisetable-orangepi_zero2w-v0.4.0.img.xz"),
+                },
+            )
+            .unwrap();
+
+        let head = server.join().unwrap().to_lowercase();
+        assert!(
+            head.contains(
+                "content-disposition: attachment; \
+                 filename=\"noisetable-orangepi_zero2w-v0.4.0.img.xz\"\r\n"
+            ),
+            "{head}"
+        );
+        assert!(
+            head.contains(
+                "signedheaders=cache-control;content-disposition;content-length;content-type;host;"
+            ),
+            "{head}"
+        );
+    }
+
+    /// A rejected download name must cost nothing: no socket, no object. The
+    /// store is pointed at an endpoint nothing is listening on, so a request
+    /// would fail loudly rather than pass this test by accident.
+    #[test]
+    fn put_with_rejects_a_download_name_that_would_split_the_header() {
+        let store = R2ObjectStore::new("acct", "yah-dev", "AK", "SK")
+            .unwrap()
+            .with_endpoint("http://127.0.0.1:1".to_string());
+
+        let err = store
+            .put_with(
+                "images/abc",
+                b"x".to_vec(),
+                &PutOptions {
+                    cache_control: None,
+                    download_name: Some("ok.img.xz\r\nx-evil: 1"),
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("download name"), "{err}");
     }
 
     /// R330-B51, the conditional twin of the test above — and the one that would

@@ -1,5 +1,4 @@
 {
-  "schema_version": "V1",
   "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "image": {
     "registry": "docker.io",
@@ -11,8 +10,7 @@
   "replicas": 1,
   "resources": {
     "memory_mb": 64,
-    "cpu_millis": 256,
-    "ephemeral_storage_mb": 64
+    "cpu_millis": 256
   },
   "restart_policy": "always",
   "stop_policy": {

@@ -13,10 +13,21 @@ description = "Local-tier infrastructure primitives shared by cloud (sim/pond re
 name = "local_driver"
 path = "src/lib.rs"
 
+[features]
+# Derive JsonSchema on the config types a mirror can spell — today just
+# `PasswayAuth`, which `IngressEdge::auth` embeds verbatim (R870-F26) so the
+# five bearer-auth settings have ONE definition rather than a config-side copy
+# that can drift from the renderer. Off by default, mirroring workload-spec:
+# the runtime callers of this crate don't pull schemars.
+json-schema = ["dep:schemars", "workload-spec/json-schema"]
+
 [dependencies]
 # WorkloadSpec — LocalDockerRuntime implements workload_spec::WorkloadRuntime
 # to plug the docker-CLI driver into the yubaba seam (R256-F10).
-workload-spec = { package = "yah-workload-spec", path = "../workload-spec", version = "0.8.37" }
+workload-spec = { package = "yah-workload-spec", path = "../workload-spec", version = "0.8.40" }
+
+# Only under `json-schema` — see the feature's comment above.
+schemars = { version = "0.8", optional = true }
 
 anyhow = "1.0"
 async-trait = "0.1"
