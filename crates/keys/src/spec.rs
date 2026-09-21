@@ -974,6 +974,63 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         onepassword: None,
     },
     CredentialSpec {
+        slot: "cloudflare-r2-yah-dev-access-key-id",
+        // No env fallback on purpose: nothing reads this pair yet. Its intended
+        // consumer is the mesofact revalidate receiver, which mounts cluster
+        // secrets as FILES (`MESOFACT_S3_ACCESS_KEY_ID_FILE`), so an env name
+        // here would describe a variable nothing sets.
+        env: None,
+        purpose: "R2 access key id scoped to the `yah-dev` bucket alone (CF token \
+                  yah-marketing-revalidate-r2, item read + write), minted 2026-09-20 to \
+                  replace the account-wide pair in the yah-marketing revalidate receiver. \
+                  READ THE SCOPE HONESTLY: `yah-dev` holds BOTH the marketing site \
+                  (`yah-marketing/cloud/`) and the public release channel (`yah/`), and an \
+                  R2 token scopes to a bucket and never to a prefix — so this still permits \
+                  rewriting yah/index.json (measured: PUT+DELETE on yah-dev/yah/.scope-probe \
+                  -> 200/204). What it DOES close is the cross-bucket radius: yah-fleet, \
+                  yah-headscale and yah-cert-store all answer 403. Closing the rest needs \
+                  the marketing site in a bucket of its own, which is what the noisetable \
+                  camp already does (token noisetable-marketing-revalidate-r2)",
+        consumers: &[
+            "(none yet) — intended for the cluster-secret mount in \
+             app/yah/cli/src/cloud.rs deploy_mesofact_bundle, blocked on the shared \
+             cluster-secret name `cloudflare-r2-access-key-id` being owned by another camp",
+        ],
+        provider: Provider::Cloudflare,
+        domain: Domain::Infra,
+        // `cloudflare-legacy-yah` is user-owned and can mint account tokens, so
+        // replacing this is an API call, not a dashboard visit.
+        band: Band::Automatable,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
+        slot: "cloudflare-r2-yah-dev-secret-key",
+        env: None,
+        purpose: "secret half of the bucket-scoped yah-dev R2 pair. As with every R2 \
+                  credential here it is the SHA-256 of the Cloudflare token value, which is \
+                  how R2 derives an S3 secret from a token — the token value itself is not \
+                  stored anywhere",
+        consumers: &["(none yet) — see the access-key-id half above"],
+        provider: Provider::Cloudflare,
+        domain: Domain::Infra,
+        band: Band::Automatable,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
         slot: "cloudflare-static-yah-dev",
         env: None,
         purpose: "Cloudflare token named for the yah.dev static site. Measured 2026-08-09 \
