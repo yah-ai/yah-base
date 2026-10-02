@@ -460,7 +460,61 @@ impl PasswayAuth {
                  comma-separated, so this would silently split into two different prefixes"
             ));
         }
+        // passway refuses at boot any entry that is neither `/prefix` nor
+        // `<hostname>=/prefix` (R556-F6), so refuse it here in the terminal of
+        // whoever typed it. A mirror table takes the bare form ONLY: its
+        // edge's hostnames are the scope, and collation writes the
+        // `<hostname>=` half (`collate_front_doors`) — a hand-written host
+        // there could name a hostname the edge does not even front.
+        for p in self.require_prefixes.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+            let host_form = p
+                .split_once('=')
+                .is_some_and(|(h, rest)| !h.trim().is_empty() && rest.trim().starts_with('/'));
+            let ok = p.starts_with('/') || (spelling == AuthSpelling::Flags && host_form);
+            if !ok {
+                return Err(match spelling {
+                    AuthSpelling::Flags => format!(
+                        "{require} {p:?} is neither a path prefix starting with '/' nor \
+                         <hostname>=/<prefix>"
+                    ),
+                    AuthSpelling::MirrorTable => format!(
+                        "{require} {p:?} must be a path prefix starting with '/'; the edge's own \
+                         hostnames scope it, so there is no <hostname>= form here"
+                    ),
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// This auth's `require_prefixes` scoped to `hostnames` — every bare
+    /// `/prefix` becomes one `<hostname>=/prefix` entry per hostname
+    /// (R556-F6). Entries already host-scoped pass through unchanged.
+    ///
+    /// This is what lets one passway process front a confidential tenant and
+    /// a public site together: the policy protects the tenant's hostnames and
+    /// nothing else. Output is sorted and deduplicated so a collated door's
+    /// env is a pure function of its inputs.
+    pub fn scoped_to<'a>(&self, hostnames: impl IntoIterator<Item = &'a str> + Clone) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for p in self.require_prefixes.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+            if p.starts_with('/') {
+                out.extend(hostnames.clone().into_iter().map(|h| format!("{h}={p}")));
+            } else {
+                out.push(p.to_string());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Same verifier — key, kid, iss, aud. passway holds exactly ONE
+    /// `CheersAuth` per process, so two contributors to one door must agree on
+    /// these four even though their protected prefixes may differ.
+    pub fn same_verifier(&self, other: &Self) -> bool {
+        (&self.key_secret, &self.kid, &self.iss, &self.aud)
+            == (&other.key_secret, &other.kid, &other.iss, &other.aud)
     }
 }
 
@@ -1272,6 +1326,38 @@ mod tests {
                 .filter(|e| e.name == "PASSWAY_AUTH_REQUIRED_PREFIXES")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn prefixes_follow_passways_grammar_per_spelling() {
+        let base = authed_spec().auth.unwrap();
+        let with = |p: &str| PasswayAuth {
+            require_prefixes: vec![p.into()],
+            ..base.clone()
+        };
+        // Flags: both forms passway parses.
+        assert!(with("/").validate(AuthSpelling::Flags).is_ok());
+        assert!(with("analytics.yah.dev=/").validate(AuthSpelling::Flags).is_ok());
+        assert!(with("admin").validate(AuthSpelling::Flags).is_err());
+        assert!(with("=/").validate(AuthSpelling::Flags).is_err());
+        // Mirror table: bare only — the edge's hostnames are the scope.
+        assert!(with("/").validate(AuthSpelling::MirrorTable).is_ok());
+        let err = with("analytics.yah.dev=/")
+            .validate(AuthSpelling::MirrorTable)
+            .unwrap_err();
+        assert!(err.contains("[ingress.auth].require_prefixes"), "{err}");
+    }
+
+    #[test]
+    fn scoped_to_writes_one_host_entry_per_hostname_and_prefix() {
+        let auth = PasswayAuth {
+            require_prefixes: vec!["/".into(), "/api".into(), "x.test=/y".into()],
+            ..authed_spec().auth.unwrap()
+        };
+        assert_eq!(
+            auth.scoped_to(["b.test", "a.test"]),
+            vec!["a.test=/", "a.test=/api", "b.test=/", "b.test=/api", "x.test=/y"]
         );
     }
 

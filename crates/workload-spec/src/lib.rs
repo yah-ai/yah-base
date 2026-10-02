@@ -3415,6 +3415,21 @@ impl WorkloadSpec {
             .unwrap_or(false)
     }
 
+    /// Whether this workload asks its node's kamaji to replay it after kamaji
+    /// restarts. See [`RESUME_AFTER_RESTART_ANNOTATION`] for why it is opt-in.
+    pub fn wants_resume_after_restart(&self) -> bool {
+        self.annotations
+            .get(RESUME_AFTER_RESTART_ANNOTATION)
+            .is_some_and(|v| v == RESUME_AFTER_RESTART_VALUE)
+    }
+
+    /// Whether this workload is a cluster floater. See [`FLOAT_ANNOTATION`].
+    pub fn wants_float(&self) -> bool {
+        self.annotations
+            .get(FLOAT_ANNOTATION)
+            .is_some_and(|v| v == FLOAT_VALUE)
+    }
+
     /// Whether this workload must be run by kamaji's **microVM** backend —
     /// booted in its own KVM guest with its own kernel, rather than sharing the
     /// host kernel with every other workload on the node (R605-F8 / W325 §5).
@@ -4364,6 +4379,44 @@ pub const NATIVE_EXEC_VALUE: &str = "native";
 /// the workload boots in its own KVM guest rather than sharing the host
 /// kernel. See [`WorkloadSpec::wants_microvm`].
 pub const MICROVM_EXEC_VALUE: &str = "microvm";
+
+/// Annotation key asking the node's kamaji to **resume** this native-exec
+/// workload after kamaji itself restarts (a reboot, a control-plane roll).
+///
+/// Native workloads live in `kamaji.service`'s cgroup, so every kamaji restart
+/// kills them, and nothing else on the node remembers them: yubaba keeps no
+/// spec for a direct `/workloads/deploy`. Serve bundles have always been
+/// replayed (R755-B5); this is the same replay for a native workload that asks
+/// for it (R936-B11).
+///
+/// **Opt-in, not the default, and that is load-bearing.** A workload whose
+/// placement yubaba decides — the headscale appliance follows the raft ingress
+/// owner — must NOT come back on a node just because it last ran there: after
+/// a failover that is a second coordinator. Only a workload pinned to this
+/// node by construction (a front door's inner door) sets this.
+pub const RESUME_AFTER_RESTART_ANNOTATION: &str = "yah.resume";
+
+/// Annotation value (for [`RESUME_AFTER_RESTART_ANNOTATION`]) meaning "this
+/// node's kamaji replays me after it restarts".
+pub const RESUME_AFTER_RESTART_VALUE: &str = "node";
+
+/// Annotation key marking a workload as a **floater** (R936-B12): its placement
+/// belongs to the cluster, not to the node it was deployed through.
+///
+/// Admitting one records its spec on every raft member and makes it a raft
+/// tenant. The tenant's owner runs it, every other member keeps the spec and
+/// stops any copy it holds, and yubaba's scheduler moves the tenant off an
+/// owner the lease channel confirms dead. A stateful floater re-hydrates on its
+/// new node through its own `[durability]` declaration, the same hydrate-on-place
+/// a plain deploy gets.
+///
+/// Mutually exclusive in spirit with [`RESUME_AFTER_RESTART_ANNOTATION`]: a
+/// floater must never come back on a node just because it last ran there.
+pub const FLOAT_ANNOTATION: &str = "yah.float";
+
+/// Annotation value (for [`FLOAT_ANNOTATION`]) meaning "any live raft member
+/// may run me, one at a time".
+pub const FLOAT_VALUE: &str = "cluster";
 
 /// Annotation key requesting the capabilities a workload needs to stand up an
 /// unprivileged container sandbox of its own.

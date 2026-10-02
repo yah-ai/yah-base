@@ -217,6 +217,19 @@ pub fn materialize_bundle(
 /// least-recently-ensured bundles until the cache is within `budget_bytes`
 /// (never evicting the bundle it just ensured). A `budget_bytes` of 0 disables
 /// eviction (unbounded cache).
+///
+/// @yah:ticket(R702-B2, "kamaji bundle-cache eviction is disabled in production — cache_budget defaults to 0 (unbounded), no CLI flag to set it")
+/// @yah:at(2026-09-22T05:26:36Z)
+/// @yah:status(open)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:parent(R702)
+/// @yah:severity(high)
+/// @yah:next("Tier: Warrior -- picking a safe non-zero default budget and threading a new CLI flag through kamaji-bin without breaking the live us-east-001 drop-in needs care, not just typing.")
+/// @yah:next("Add --bundle-cache-budget to kamaji-bin/src/main.rs, wire it to BundleBackend::cache_budget.")
+/// @yah:next("Make the DEFAULT non-zero rather than shipping another opt-in bound (an opt-in ceiling is how this happened). If 0-means-unbounded stays as an escape hatch, require passing 0 explicitly so the default path is always bounded.")
+/// @yah:next("Update /etc/systemd/system/kamaji.service.d/20-bundle.conf on us-east-001 (or confirm the new default is sufficient without it) once the flag lands.")
+/// @yah:gotcha("BundleCache::evict_to_budget (this file, ~line 243) is working and unit-tested, but BundleBackend::cache_budget defaults to 0 at oss/kamaji/crates/kamaji-bin/src/server.rs:297, and 0 explicitly means 'unbounded, eviction off' (store.rs:207). There is no --bundle-cache-budget CLI flag in kamaji-bin/src/main.rs, and the live drop-in /etc/systemd/system/kamaji.service.d/20-bundle.conf on us-east-001 passes only --bundle-cache-dir and --bundle-origin. Every release wave materializes a new digest-keyed tree under /var/lib/yah/kamaji/bundles/ that nothing ever removes. Only 6.3M on us-east-001 as of 2026-08-02 because there have been few release waves so far -- it grows monotonically with release count, forever.")
+/// @yah:gotcha("oss/kamaji/crates/kamaji-bin/src/server.rs is dirty (uncommitted) as of 2026-09-21 -- check for a live peer or recent in-flight change there before editing cache_budget's default; don't fight an in-flight edit, coordinate or wait.")
 pub struct BundleCache {
     root: PathBuf,
     budget_bytes: u64,

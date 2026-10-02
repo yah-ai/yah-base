@@ -21,6 +21,7 @@ fn expected_errors() -> HashMap<&'static str, FieldPath> {
     m.insert("tailscale_tag_no_prefix", FieldPath::TailscaleTag);
     m.insert("replicas_too_high", FieldPath::Replicas);
     m.insert("image_tag_empty", FieldPath::ImageTag);
+    m.insert("image_digest_empty_no_native_marker", FieldPath::Image);
     m.insert("bind_volume_non_infra", FieldPath::Volume(0, "source"));
     m.insert("public_port_not_in_mesh", FieldPath::ExposeMeshPort(9000));
     m.insert("secret_target_relative_path", FieldPath::Secret(0, "target.path"));

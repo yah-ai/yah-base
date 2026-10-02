@@ -487,12 +487,46 @@ pub fn shape(spec: &WorkloadSpec) -> Result<Vec<ShapeWarning>, ShapeError> {
         });
     }
 
-    // image.tag: non-empty (informational identifier; digest is the source of
-    // truth and is structurally required at the type level).
+    // image.tag: non-empty (informational identifier; digest is normally the
+    // source of truth — but see the digest check just below, which is where
+    // "normally" earns its qualifier).
     if spec.image.tag.is_empty() {
         return Err(ShapeError::Field {
             path: FieldPath::ImageTag,
             reason: "tag is empty; provide a human-readable tag alongside the digest".into(),
+        });
+    }
+
+    // image.digest: empty is legal ONLY for a spec whose exec substrate never
+    // pulls the image — `wants_native_exec` and `wants_microvm` both document
+    // their `image` as "identity metadata only, nothing is pulled". A
+    // Container-substrate spec has no such backend: it reaches containerd or
+    // docker, both of which resolve the ref by digest before doing anything
+    // else. An empty digest there is not a missing image, it is a
+    // construction bug — a spec built for native/microVM that never got the
+    // `yah.exec` marker (R931-B4: `InnerDoorPlan::workload` did exactly this,
+    // and the failure surfaced as containerd 500ing on a cr-less pull of
+    // `local/passway:inner-door@`, an empty-digest ref containerd was never
+    // meant to see). Caught here, at the one shape gate every deploy and
+    // `/workloads/validate` call runs before admission or the backend, so a
+    // future construction site that forgets the annotation is refused by name
+    // instead of reaching a backend that mis-reads "nothing to pull" as
+    // "pull it and 500".
+    if spec.image.digest.is_empty() && spec.exec_substrate() == crate::ExecSubstrate::Container {
+        return Err(ShapeError::Field {
+            path: FieldPath::Image,
+            reason: format!(
+                "digest is empty, which is only valid for a spec marked for native or \
+                 microVM execution (annotations[{:?}] = {:?} or {:?}) — this spec requests \
+                 the container substrate, which pulls {}/{}:{} by digest and has nothing to \
+                 pull",
+                crate::NATIVE_EXEC_ANNOTATION,
+                crate::NATIVE_EXEC_VALUE,
+                crate::MICROVM_EXEC_VALUE,
+                spec.image.registry,
+                spec.image.repository,
+                spec.image.tag,
+            ),
         });
     }
 

@@ -1,0 +1,31 @@
+{
+  "name": "test-svc",
+  "image": {
+    "registry": "local",
+    "repository": "passway",
+    "tag": "inner-door",
+    "digest": ""
+  },
+  "annotations": {
+    "yah.exec": "native"
+  },
+  "tier": "infra",
+  "replicas": 1,
+  "resources": {
+    "memory_mb": 64,
+    "cpu_millis": 256
+  },
+  "restart_policy": "always",
+  "stop_policy": {
+    "signal": 15,
+    "grace_period": 5000
+  },
+  "expose": {
+    "mesh": {
+      "identity": "test-svc",
+      "ports": [
+        8080
+      ]
+    }
+  }
+}

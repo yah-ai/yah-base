@@ -111,12 +111,16 @@ use std::collections::BTreeMap;
 #[serde(rename_all = "kebab-case")]
 pub enum Provider {
     Anthropic,
+    /// App Store Connect API keys (Users and Access → Integrations).
+    Apple,
     Cloudflare,
     CratesIo,
     DeepSeek,
     DigitalOcean,
     DockerHub,
     GitHub,
+    /// Google Cloud service accounts, as granted in Play Console.
+    Google,
     Groq,
     Headscale,
     Hetzner,
@@ -138,12 +142,14 @@ impl Provider {
     pub const fn as_str(self) -> &'static str {
         match self {
             Provider::Anthropic => "anthropic",
+            Provider::Apple => "apple",
             Provider::Cloudflare => "cloudflare",
             Provider::CratesIo => "crates-io",
             Provider::DeepSeek => "deepseek",
             Provider::DigitalOcean => "digitalocean",
             Provider::DockerHub => "docker-hub",
             Provider::GitHub => "github",
+            Provider::Google => "google",
             Provider::Groq => "groq",
             Provider::Headscale => "headscale",
             Provider::Hetzner => "hetzner",
@@ -1571,6 +1577,131 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required: false,
         onepassword: None,
     },
+    // R929-F3: store publishing (W356). Each of these is `<name> @
+    // tenant:noisetable` in W345's model, spelled as the flat prefixed slot
+    // until the tag migration lands (crates/yah/store-plugin/src/creds.rs
+    // `scoped_slot`). Scoped, so `env` is None on every one: W345 makes a
+    // scoped credential vault-only. The ASC trio predates this ticket (it was
+    // populated but unregistered). The three Play slots are new and are not
+    // populated as of 2026-09-22.
+    CredentialSpec {
+        slot: "noisetable-asc-issuer-id",
+        env: None,
+        purpose: "App Store Connect API issuer id (the ES256 JWT `iss`) for noisetable. Not a \
+                  secret on its own, but useless without, and stored beside, the key it \
+                  identifies. Also read out of tree by noisetable's \
+                  scripts/lib/apple-asc-credentials.sh for TestFlight delivery",
+        consumers: &["crates/yah/store-plugin/src/creds.rs"],
+        provider: Provider::Apple,
+        domain: Domain::Publish,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
+        slot: "noisetable-asc-key-id",
+        env: None,
+        purpose: "App Store Connect API key id (the ES256 JWT `kid`) for noisetable. Paired with \
+                  noisetable-asc-p8; see noisetable-asc-issuer-id for the out-of-tree reader",
+        consumers: &["crates/yah/store-plugin/src/creds.rs"],
+        provider: Provider::Apple,
+        domain: Domain::Publish,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
+        slot: "noisetable-asc-p8",
+        env: None,
+        purpose: "App Store Connect API private key (.p8 PEM) for noisetable: the listing \
+                  adapter (R929-F4) signs its ES256 JWTs with it, and noisetable's altool \
+                  TestFlight delivery uses it too. Apple lets you download a .p8 once only, so \
+                  losing this copy means minting a new key",
+        consumers: &["crates/yah/store-plugin/src/creds.rs"],
+        provider: Provider::Apple,
+        domain: Domain::Publish,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
+        slot: "noisetable-play-publisher-sa-key",
+        env: None,
+        purpose: "Google service-account JSON key the yah-store plugin publishes noisetable to \
+                  Google Play with (R929-F2 adapter). The account is granted in Play Console → \
+                  Users & permissions; it is not a GCP IAM role. W341 layer 3 #3 (secret \
+                  vending) is unbuilt, so the plugin receives this raw key instead of a \
+                  host-minted OAuth token",
+        consumers: &["crates/yah/store-plugin/src/creds.rs"],
+        provider: Provider::Google,
+        domain: Domain::Publish,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        // Needs the `androidpublisher` OAuth scope (W356), but no prober reads
+        // a Google scope back yet, so there is no baseline to drift from.
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
+        slot: "noisetable-play-upload-keystore",
+        env: None,
+        purpose: "noisetable's Play UPLOAD keystore, base64-encoded; Play App Signing holds the \
+                  app signing key. Used build-side to sign the AAB (noisetable relay R741-T1), \
+                  never sent to Google. Nothing in this tree reads it",
+        consumers: &[],
+        provider: Provider::Google,
+        domain: Domain::Publish,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
+        slot: "noisetable-play-upload-keystore-password",
+        env: None,
+        purpose: "password for noisetable-play-upload-keystore (noisetable relay R741-T1). \
+                  Nothing in this tree reads it",
+        consumers: &[],
+        provider: Provider::Google,
+        domain: Domain::Publish,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Unverified,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
     CredentialSpec {
         slot: "npm-api-token",
         env: Some("NPM_TOKEN"),
@@ -1994,6 +2125,26 @@ mod tests {
                 spec.slot
             );
             prev = spec.slot;
+        }
+    }
+
+    /// R929-F3 / W345: a tenant-scoped credential resolves vault-only, so no
+    /// store-publishing slot may declare an env fallback. One env name cannot
+    /// mean two tenants at once.
+    #[test]
+    fn store_publishing_slots_are_scoped_and_vault_only() {
+        for slot in [
+            "noisetable-asc-issuer-id",
+            "noisetable-asc-key-id",
+            "noisetable-asc-p8",
+            "noisetable-play-publisher-sa-key",
+            "noisetable-play-upload-keystore",
+            "noisetable-play-upload-keystore-password",
+        ] {
+            let s = spec(slot).unwrap_or_else(|| panic!("{slot} must be specced"));
+            assert_eq!(s.env, None, "{slot} is tenant-scoped: vault-only (W345)");
+            assert_eq!(s.domain, Domain::Publish);
+            assert!(!s.required, "{slot} must not block the core cloud commands");
         }
     }
 
