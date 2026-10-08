@@ -220,11 +220,10 @@ pub fn materialize_bundle(
 ///
 /// @yah:ticket(R702-B2, "kamaji bundle-cache eviction is disabled in production — cache_budget defaults to 0 (unbounded), no CLI flag to set it")
 /// @yah:at(2026-09-22T05:26:36Z)
-/// @yah:status(open)
 /// @yah:assignee(agent:bundle-anthropic-miravel)
 /// @yah:parent(R702)
 /// @yah:severity(high)
-/// @yah:next("Tier: Warrior -- picking a safe non-zero default budget and threading a new CLI flag through kamaji-bin without breaking the live us-east-001 drop-in needs care, not just typing.")
+/// @yah:next("Tier: Cleric -- picking a safe non-zero default budget and threading a new CLI flag through kamaji-bin without breaking the live us-east-001 drop-in needs care, not just typing.")
 /// @yah:next("Add --bundle-cache-budget to kamaji-bin/src/main.rs, wire it to BundleBackend::cache_budget.")
 /// @yah:next("Make the DEFAULT non-zero rather than shipping another opt-in bound (an opt-in ceiling is how this happened). If 0-means-unbounded stays as an escape hatch, require passing 0 explicitly so the default path is always bounded.")
 /// @yah:next("Update /etc/systemd/system/kamaji.service.d/20-bundle.conf on us-east-001 (or confirm the new default is sufficient without it) once the flag lands.")

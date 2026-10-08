@@ -53,7 +53,6 @@
 //!
 //! @yah:relay(R335, "Almanac mirror-binding — scope a feed to the mirror it affects")
 //! @yah:at(2026-05-27T02:19:09Z)
-//! @yah:status(open)
 //! @arch:see(.yah/docs/working/W058-almanac-mirror-binding.md)
 //! @yah:depends_on(R256-F9)
 //!
@@ -285,7 +284,6 @@
 //!
 //! @yah:relay(R658, "workload.toml envelope: two type-vs-reality mismatches R546-B7 uncovered but did not fix")
 //! @yah:at(2026-08-03T00:43:00Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R546)
 //!
@@ -1177,6 +1175,8 @@ impl ContainerBuild {
             },
             labels: HashMap::new(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: HashMap::new(),
             files: Vec::new(),
         })
@@ -1992,6 +1992,8 @@ impl TenantPasswayWorkload {
             },
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: Vec::new(),
         }
@@ -2948,6 +2950,35 @@ pub struct WorkloadSpec {
     #[ts(optional = nullable)]
     pub durability: Option<Durability>,
 
+    /// Databases this workload declares for the data workbench (R960-F6, W358
+    /// decision 7). Each row with `workbench != none` surfaces in the camp's
+    /// catalog as `fleet:<workload>:<name>`; the row itself starts no
+    /// connection. Read through [`WorkloadSpec::db_rows`], which also enforces
+    /// the cross-field rules serde cannot.
+    ///
+    /// Additive and defaulted: a peer that predates the field ignores it (no
+    /// `deny_unknown_fields`), which is safe — `db` only feeds the camp-side
+    /// catalog, never a node's behaviour.
+    ///
+    /// **Always serialized, even when empty.** `skip_serializing_if` would be
+    /// the obvious way to keep an empty `db` out of the kamaji spec digest, but
+    /// this struct rides positional postcard too (`tests/round_trip.rs`), where
+    /// it misaligns the frame. The digest strips an empty `db` itself — see
+    /// `kamaji_proto::digest::spec_digest`.
+    #[serde(default)]
+    pub db: Vec<WorkloadDb>,
+
+    /// What this workload offers the mesh, each bound to one of its named
+    /// `expose.mesh.ports` (R960-F8, W358). The node running it publishes
+    /// these on `GET /services`. A `vend` [`WorkloadDb`] row adds its own
+    /// `sql.hrana` capability; it is not repeated here. Read through
+    /// [`WorkloadSpec::served_capabilities`].
+    ///
+    /// Always serialized, and stripped from the kamaji digest when empty, for
+    /// the same postcard reason as [`Self::db`].
+    #[serde(default)]
+    pub capabilities: Vec<WorkloadCapability>,
+
     /// OCI-style labels, passed through to the container. Opaque to yubaba.
     #[serde(default)]
     pub labels: HashMap<String, String>,
@@ -3140,6 +3171,8 @@ impl WorkloadSpec {
                 operator: None,
             },
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             labels: HashMap::new(),
             annotations,
             files: Vec::new(),
@@ -3740,6 +3773,73 @@ impl WorkloadSpec {
     /// `cloud::topology` can tell an operator, *before* the topology is
     /// committed, which of their stateful workloads has no second copy of its
     /// bytes anywhere.
+    /// The `[[db]]` rows, after the rules serde cannot enforce: names are
+    /// non-blank and unique, and a `snapshot` row needs a `[durability]` whose
+    /// subjects include its subject. A `vend` row needs a mesh port named
+    /// `sql` and a verify-key secret mount (R960-F8), and every
+    /// `capabilities` row must name a declared mesh port.
+    pub fn db_rows(&self) -> Result<&[WorkloadDb], DbDeclError> {
+        let port_names = self.expose.mesh.names();
+        for c in &self.capabilities {
+            if !port_names.contains(&c.port.as_str()) {
+                return Err(DbDeclError::CapabilityPortUndeclared {
+                    capability: c.name.clone(),
+                    port: c.port.clone(),
+                });
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (index, row) in self.db.iter().enumerate() {
+            if row.name.trim().is_empty() {
+                return Err(DbDeclError::BlankName { index });
+            }
+            if !seen.insert(row.name.as_str()) {
+                return Err(DbDeclError::DuplicateName { name: row.name.clone() });
+            }
+            if row.workbench == WorkbenchKind::Snapshot {
+                let Some(d) = &self.durability else {
+                    return Err(DbDeclError::SnapshotWithoutDurability { name: row.name.clone() });
+                };
+                if !d.subjects.iter().any(|s| s == &row.subject) {
+                    return Err(DbDeclError::SnapshotSubjectNotDurable {
+                        name: row.name.clone(),
+                        subject: row.subject.clone(),
+                    });
+                }
+            }
+            if row.workbench == WorkbenchKind::Vend {
+                if !port_names.contains(&SQL_PORT_NAME) {
+                    return Err(DbDeclError::VendWithoutSqlPort { name: row.name.clone() });
+                }
+                if !self.secrets.iter().any(SecretMount::is_verify_key) {
+                    return Err(DbDeclError::VendWithoutVerifyKey { name: row.name.clone() });
+                }
+            }
+        }
+        Ok(&self.db)
+    }
+
+    /// Everything a node running this spec publishes on `GET /services`:
+    /// the declared [`Self::capabilities`], then one `sql.hrana` row per
+    /// `vend` [`WorkloadDb`] on the `sql` port.
+    pub fn served_capabilities(&self) -> Vec<ServedCapability> {
+        let declared = self.capabilities.iter().map(|c| ServedCapability {
+            capability: c.name.clone(),
+            port: c.port.clone(),
+            db: None,
+        });
+        let vended = self
+            .db
+            .iter()
+            .filter(|d| d.workbench == WorkbenchKind::Vend)
+            .map(|d| ServedCapability {
+                capability: SQL_HRANA_CAPABILITY.to_string(),
+                port: SQL_PORT_NAME.to_string(),
+                db: Some(d.name.clone()),
+            });
+        declared.chain(vended).collect()
+    }
+
     pub fn durability(&self) -> Result<Option<&Durability>, DurabilityDeclError> {
         if let Some(key) = self
             .annotations
@@ -3918,12 +4018,165 @@ impl fmt::Display for DurabilityTier {
     }
 }
 
+/// One database a workload declares for the data workbench (W358 decision 7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WorkloadDb {
+    /// The `name` segment of the derived id `fleet:<workload>:<name>`.
+    pub name: String,
+    /// The database file, volume-relative. For `snapshot` it must be one of
+    /// `durability.subjects`.
+    pub subject: String,
+    /// How the workbench reaches it. Absent = [`WorkbenchKind::None`].
+    #[serde(default)]
+    pub workbench: WorkbenchKind,
+}
+
+/// One capability a workload offers on one of its named mesh ports (R960-F8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WorkloadCapability {
+    /// Dotted capability name, e.g. `events.query`.
+    pub name: String,
+    /// The `expose.mesh.ports` name it is served on.
+    pub port: String,
+}
+
+/// A capability as a node publishes it: [`WorkloadSpec::capabilities`] plus
+/// the `sql.hrana` row each `vend` [`WorkloadDb`] implies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedCapability {
+    pub capability: String,
+    pub port: String,
+    /// The `[[db]]` name, for a vended database.
+    #[serde(default)]
+    pub db: Option<String>,
+}
+
+/// The capability a `vend` [`WorkloadDb`] publishes.
+pub const SQL_HRANA_CAPABILITY: &str = "sql.hrana";
+/// The mesh port name a `vend` [`WorkloadDb`] is served on.
+pub const SQL_PORT_NAME: &str = "sql";
+/// The final path segment of the secret a `vend` workload verifies camp
+/// tokens with (`cheers/.../verify-key`, W358 §Auth).
+pub const VERIFY_KEY_SECRET: &str = "verify-key";
+
+impl SecretMount {
+    /// Whether this mount delivers a cheers verify key — its source's last
+    /// path segment is [`VERIFY_KEY_SECRET`].
+    pub fn is_verify_key(&self) -> bool {
+        let last = match &self.source {
+            SecretRef::LocalFile { path } => path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            SecretRef::Cluster { name } => name.rsplit('/').next().unwrap_or_default().to_string(),
+        };
+        last == VERIFY_KEY_SECRET
+    }
+}
+
+/// How a [`WorkloadDb`] is exposed to the workbench.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+#[ts(rename_all = "kebab-case")]
+pub enum WorkbenchKind {
+    /// Declared, not listed.
+    #[default]
+    None,
+    /// The latest object-store backup, opened read-only.
+    Snapshot,
+    /// A live connection vended by the workload's own `sql.hrana` service.
+    Vend,
+}
+
+/// A `[[db]]` row that cannot be acted on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbDeclError {
+    BlankName { index: usize },
+    DuplicateName { name: String },
+    /// `snapshot` restores from `durability.store`; with no `[durability]`
+    /// there is nothing to restore from.
+    SnapshotWithoutDurability { name: String },
+    SnapshotSubjectNotDurable { name: String, subject: String },
+    /// `vend` serves on the mesh port named `sql`; none is declared.
+    VendWithoutSqlPort { name: String },
+    /// `vend` verifies camp tokens; no verify-key secret is mounted.
+    VendWithoutVerifyKey { name: String },
+    /// A `capabilities` row names a port `expose.mesh.ports` does not.
+    CapabilityPortUndeclared { capability: String, port: String },
+}
+
+impl fmt::Display for DbDeclError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BlankName { index } => write!(f, "db[{index}].name is blank"),
+            Self::DuplicateName { name } => write!(f, "db names {name:?} twice"),
+            Self::SnapshotWithoutDurability { name } => write!(
+                f,
+                "db {name:?} has workbench = \"snapshot\" but the spec declares no [durability]; \
+                 a snapshot is the latest backup, and there is no backup to open"
+            ),
+            Self::SnapshotSubjectNotDurable { name, subject } => write!(
+                f,
+                "db {name:?} has workbench = \"snapshot\" with subject {subject:?}, which is \
+                 not in durability.subjects; only a subject the backup covers can be opened"
+            ),
+            Self::VendWithoutSqlPort { name } => write!(
+                f,
+                "db {name:?} has workbench = \"vend\" but expose.mesh.ports names no \
+                 \"{SQL_PORT_NAME}\" port; the vended listener is served on it"
+            ),
+            Self::VendWithoutVerifyKey { name } => write!(
+                f,
+                "db {name:?} has workbench = \"vend\" but no secret mount sources a \
+                 \"{VERIFY_KEY_SECRET}\"; the listener cannot check camp tokens without it"
+            ),
+            Self::CapabilityPortUndeclared { capability, port } => write!(
+                f,
+                "capability {capability:?} is bound to port {port:?}, which \
+                 expose.mesh.ports does not name"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DbDeclError {}
+
 /// A workload's durability declaration — [`WorkloadSpec::durability`].
 ///
 /// Every field but `tier` defaults, because which of them are required depends
 /// on the tier, and that is a rule serde cannot express. [`Self::check`] is
 /// where it is enforced; read the declaration through
 /// [`WorkloadSpec::durability`], which applies it.
+///
+/// @yah:ticket(R960-F6, "[[db]] on WorkloadSpec (name, subject, workbench = none|snapshot|vend) + catalog derives fleet:<workload>:<name> from the camp's own load_workloads")
+/// @yah:status(review)
+/// @yah:at(2026-10-08T00:39:23Z)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:phase(P2)
+/// @yah:parent(R960)
+/// @yah:next("Add `db: Vec<WorkloadDb>` beside durability/expose.mesh (W358 decision 7). Spec validation refuses a `snapshot` row whose subject is not in durability.subjects, and `snapshot` on a spec with no [durability]. `vend` validation (sql mesh port + verify-key mount) belongs to R960-F8, which also edits this file.")
+/// @yah:next("Catalog derivation: for each camp workload TOML read by load_workloads (config.rs:3151), each [[db]] with workbench != none yields a Connection constructed (not parsed) with id fleet:<workload>:<name> - the same struct R960-F1 parses. Listing makes no fleet call.")
+/// @yah:next("Regen both generated artifacts by hand: `cargo run -p xtask -- emit-schemas` and `cargo run --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --bin export-ts` (workload-spec-drift-guard).")
+/// @yah:gotcha("Rolling fleet: nodes on the old binary will see `db` on specs. Carrying structs don't deny unknown keys (R896-T4 note on WorkloadSpec), so it should be ignored - but check kamaji-proto's digest + tests/tolerant_field_policy.rs before assuming a new field leaves existing spec digests (and thus deploy no-ops) unchanged. Unverified.")
+/// @yah:gotcha("R959 (service -> workload lowering) must round-trip this block; it is design-phase, so no edge - R959 already names [[db]] in its next.")
+/// @arch:see(.yah/docs/working/W358-data-connections-remote-dbs-through-the-vault.md)
+/// @yah:depends_on(R960-F1)
+/// @yah:files(oss/yah-base/crates/workload-spec/src/lib.rs)
+/// @yah:files(packages/yah/workload-spec/index.ts)
+/// @yah:files(oss/yubaba/crates/cloud/src/config.rs)
+/// @yah:handoff("Landed (uncommitted, git policy defer): WorkloadSpec.db: Vec<WorkloadDb{name,subject,workbench: WorkbenchKind none|snapshot|vend (default none)}> in workload-spec lib.rs; WorkloadSpec::db_rows() enforces non-blank/unique names, snapshot needs [durability], snapshot subject must be in durability.subjects (DbDeclError); validate::shape calls it (FieldPath::Db). vend validation left to R960-F8. Catalog: Connection::derive_fleet(camp_root) + fleet_from_specs in cloud config.rs read load_workloads over .yah/infra/workloads, construct fleet:<workload>:<db> (name = '<workload>:<db>', group fleet, Snapshot->public/auth none, vend->Service/mesh/camp-token, policy deny/deny); desktop db_catalog_for_camp extends its connection list with it. All WorkloadSpec literals in oss/yah-base, kamaji, yubaba, roadcase, app/desktop, crates/hub gained db: Vec::new(). Regenerated schemas + packages/yah/workload-spec/index.ts; both drift scripts ok.")
+/// @yah:gotcha("Digest finding: kamaji spec_digest = SHA-256 over canonical JSON of the Workload, so an always-serialized empty `db: []` would change every spec digest (redeploy-everything, and a per-sweep redeploy loop against not-yet-rolled kamajis whose digest is of a struct without db). skip_serializing_if is NOT usable: WorkloadSpec rides positional postcard (tests/round_trip.rs 3 tests broke when I tried it). Fix: db is always serialized; kamaji-proto digest.rs spec_digest drops an empty `db` array before hashing, so empty db digests byte-identical to pre-field (test an_empty_db_digests_as_if_the_field_did_not_exist). Non-empty db changes the digest; an un-rolled kamaji (ignores db) will mismatch for specs that declare db until rolled - roll kamaji before adding [[db]] to a live spec. tolerant_field_policy.rs unchanged and green (db has serde default, so absence does not break decode).")
+/// @yah:gotcha("Unrelated pre-existing red seen: oss/yubaba crates/yubaba/tests/raft_appliance_ownership.rs:195/208 E0061 (5 args expected, 4 given) - a peer's in-flight change, not touched.")
+/// @yah:assumes("Derived snapshot connection uses auth.kind=none (validate() permits it for snapshot sources); the R2 pair is resolved by the snapshot opener (R960-F7) from durability.store, not named on the Connection. vend derives camp-token auth, channel mesh, source Service{workload, db}.")
+/// @yah:assumes("Derivation failure (any workload TOML failing shape validation) skips all fleet entries with a tracing warning in the desktop catalog, matching how a bad connections dir is handled.")
+/// @yah:verify("workload-spec cargo test: 211 lib + 108 integration, 0 failed (before my change the ts_drift test was the only red after adding the field; regenerated). yah-cloud --lib: 1311 passed / 0 failed / 6 ignored incl. fleet_derivation_* x2. kamaji-proto: 44+4+6 passed incl. an_empty_db_digests_as_if_the_field_did_not_exist; tolerant_field_policy green. cargo check -p yah -p desktop EXIT=0. scripts/check-schema-drift.sh and check-workload-spec-ts.sh ok. cargo check --workspace --all-targets green for oss/yah-base and oss/kamaji; oss/yubaba red only at tests/raft_appliance_ownership.rs (not mine). Skew advisory: workload-spec lib.rs was modified mid-run on the last build (peer, likely R960-F8 sharing the file) - re-verify before trusting. Root workspace --all-targets, roadcase, and the desktop catalog test for fleet entries were not run/added.")
+/// @yah:handoff("Leader (Fable session:62240105) re-verified 2026-10-07 after courier Miravel session:ad659ea1 returned: yah-workload-spec 319 passed / 0 failed (lib + integration), yah-cloud --lib fleet 6/0, kamaji-proto 54/0 incl. the empty-db digest test, check-schema-drift.sh and check-workload-spec-ts.sh both ok. The digest decision (always serialize db; kamaji-proto drops an empty db before hashing; roll kamaji before any live spec declares [[db]]) is accepted and carried to R960-T12's roll sequencing. The oss/yubaba raft_appliance_ownership.rs E0061 is a peer's in-flight change, not this ticket's.")
+/// @yah:verify("Leader re-run: cargo test --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml -> 319 passed, 0 failed; cd oss/yubaba && cargo test -p yah-cloud --lib fleet -> 6 passed; cd oss/kamaji && cargo test -p kamaji-proto -> 54 passed, 0 failed; scripts/check-schema-drift.sh EXIT=0; scripts/check-workload-spec-ts.sh EXIT=0.")
+/// @yah:handoff("Validation answer (courier Miravel): `yah cloud validate` (handle_validate, app/yah/cli/src/cloud.rs:14214) calls CloudConfig::load -> load_workloads (oss/yubaba/crates/cloud/src/config.rs:3195) -> workload_spec::validate::shape, which ends in spec.db_rows() (oss/yah-base/crates/workload-spec/src/validate.rs:654). So no gap: new test cloud::validate_db_rows_tests proves a [[db]] subject outside durability.subjects fails the verb (and a covered one passes). No wiring needed.")
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct Durability {
@@ -4381,19 +4634,23 @@ pub const NATIVE_EXEC_VALUE: &str = "native";
 pub const MICROVM_EXEC_VALUE: &str = "microvm";
 
 /// Annotation key asking the node's kamaji to **resume** this native-exec
-/// workload after kamaji itself restarts (a reboot, a control-plane roll).
+/// workload, or this service-shaped microVM, after kamaji itself restarts (a
+/// reboot, a control-plane roll).
 ///
-/// Native workloads live in `kamaji.service`'s cgroup, so every kamaji restart
-/// kills them, and nothing else on the node remembers them: yubaba keeps no
-/// spec for a direct `/workloads/deploy`. Serve bundles have always been
-/// replayed (R755-B5); this is the same replay for a native workload that asks
-/// for it (R936-B11).
+/// Native workloads and microVM Firecracker processes live in
+/// `kamaji.service`'s cgroup, so every kamaji restart kills them, and nothing
+/// else on the node remembers them: yubaba keeps no spec for a direct
+/// `/workloads/deploy`. Serve bundles have always been replayed (R755-B5); this
+/// is the same replay for a native workload (R936-B11) or a service-shaped
+/// microVM (R605-F16) that asks for it. A job-shaped microVM is never replayed,
+/// annotation or not: its completion is its exit.
 ///
 /// **Opt-in, not the default, and that is load-bearing.** A workload whose
 /// placement yubaba decides — the headscale appliance follows the raft ingress
 /// owner — must NOT come back on a node just because it last ran there: after
 /// a failover that is a second coordinator. Only a workload pinned to this
-/// node by construction (a front door's inner door) sets this.
+/// node by construction sets this: a front door's inner door, or a dev-cluster
+/// member VM whose writable root exists on this node's disk and nowhere else.
 pub const RESUME_AFTER_RESTART_ANNOTATION: &str = "yah.resume";
 
 /// Annotation value (for [`RESUME_AFTER_RESTART_ANNOTATION`]) meaning "this
@@ -5042,15 +5299,12 @@ pub mod forge_produced {
 pub mod forge_state {
     use std::path::Path;
 
-    /// Root of the forge's host-persistent state. Both
-    /// [`super::forge_produced::HOST_ROOT`] and [`BUILD_OUT_DIR`] are under it.
+    /// Root of the forge's host-persistent state.
+    /// [`super::forge_produced::HOST_ROOT`] and
+    /// [`super::forge_cache::HOST_ROOT`] are under it. (A shared `build-out/`
+    /// for build-image OCI archives used to be too; R636 moved those into the
+    /// per-forge produced dir, where they are retrievable and reaped.)
     pub const HOST_ROOT: &str = "/var/lib/yah/qed";
-
-    /// Host directory a `build-image` step's OCI archive is written to, bound
-    /// at `/yah/build/out` in the BuildKit container. Shared (rather than
-    /// per-forge like `produced/`) because the archive is named after the image
-    /// tag, which is already unique per build.
-    pub const BUILD_OUT_DIR: &str = "/var/lib/yah/qed/build-out";
 
     /// Whether yubaba may create `host_path` on behalf of a forge workload.
     ///
@@ -5510,7 +5764,7 @@ mod forge_state_tests {
         assert!(is_forge_state_path(Path::new(
             super::forge_produced::HOST_ROOT
         )));
-        assert!(is_forge_state_path(Path::new(BUILD_OUT_DIR)));
+        assert!(is_forge_state_path(Path::new(super::forge_cache::HOST_ROOT)));
         assert!(is_forge_state_path(&super::forge_produced::host_dir(
             "abc-123"
         )));
@@ -8096,6 +8350,116 @@ blake3   = "{HASH_64}"
         assert!(!json.contains("yah.durability"), "{json}");
         let back: WorkloadSpec = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.durability().unwrap(), spec.durability().unwrap());
+    }
+
+    // ── R960-F6: [[db]] rows ─────────────────────────────────────────────────
+
+    fn db_row(name: &str, subject: &str, workbench: WorkbenchKind) -> WorkloadDb {
+        WorkloadDb { name: name.into(), subject: subject.into(), workbench }
+    }
+
+    #[test]
+    fn a_snapshot_db_row_needs_a_durability_declaration() {
+        let mut spec = archetype_test_spec("db-no-durability");
+        spec.db = vec![db_row("account", "accounts.db", WorkbenchKind::Snapshot)];
+        assert_eq!(
+            spec.db_rows().unwrap_err(),
+            DbDeclError::SnapshotWithoutDurability { name: "account".into() }
+        );
+        // `none` needs no backup: it is declared, not listed.
+        spec.db = vec![db_row("account", "accounts.db", WorkbenchKind::None)];
+        assert_eq!(spec.db_rows().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_snapshot_db_row_subject_must_be_a_durability_subject() {
+        let mut spec = archetype_test_spec("db-bad-subject");
+        spec.durability = Some(stream(&["accounts.db"]));
+        spec.db = vec![db_row("account", "sessions.db", WorkbenchKind::Snapshot)];
+        assert_eq!(
+            spec.db_rows().unwrap_err(),
+            DbDeclError::SnapshotSubjectNotDurable {
+                name: "account".into(),
+                subject: "sessions.db".into()
+            }
+        );
+        spec.db = vec![db_row("account", "accounts.db", WorkbenchKind::Snapshot)];
+        spec.db_rows().expect("a covered subject is accepted");
+    }
+
+    #[test]
+    fn db_rows_must_have_unique_non_blank_names() {
+        let mut spec = archetype_test_spec("db-names");
+        spec.db = vec![db_row(" ", "a.db", WorkbenchKind::None)];
+        assert_eq!(spec.db_rows().unwrap_err(), DbDeclError::BlankName { index: 0 });
+        spec.db = vec![
+            db_row("a", "a.db", WorkbenchKind::None),
+            db_row("a", "b.db", WorkbenchKind::None),
+        ];
+        assert_eq!(spec.db_rows().unwrap_err(), DbDeclError::DuplicateName { name: "a".into() });
+    }
+
+    fn verify_key_mount() -> SecretMount {
+        SecretMount {
+            source: SecretRef::Cluster { name: "cheers/accounts/verify-key".into() },
+            target: SecretTarget::File { path: "/run/secrets/verify-key".into(), mode: 0o400 },
+        }
+    }
+
+    /// R960-F8: a vend row is refused without a `sql` port, then without a
+    /// verify-key mount, and accepted with both.
+    #[test]
+    fn a_vend_row_needs_a_sql_port_and_a_verify_key_mount() {
+        let mut spec = archetype_test_spec("db-vend");
+        spec.db = vec![db_row("accounts", "accounts.db", WorkbenchKind::Vend)];
+        assert_eq!(
+            spec.db_rows().unwrap_err(),
+            DbDeclError::VendWithoutSqlPort { name: "accounts".into() }
+        );
+        spec.expose.mesh.ports.push(MeshPort::named(SQL_PORT_NAME));
+        assert_eq!(
+            spec.db_rows().unwrap_err(),
+            DbDeclError::VendWithoutVerifyKey { name: "accounts".into() }
+        );
+        spec.secrets.push(verify_key_mount());
+        spec.db_rows().expect("sql port + verify key is a complete vend row");
+        assert_eq!(
+            spec.served_capabilities(),
+            vec![ServedCapability {
+                capability: SQL_HRANA_CAPABILITY.into(),
+                port: SQL_PORT_NAME.into(),
+                db: Some("accounts".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_capability_on_an_undeclared_port_is_refused() {
+        let mut spec = archetype_test_spec("caps");
+        spec.capabilities =
+            vec![WorkloadCapability { name: "events.query".into(), port: "events".into() }];
+        assert_eq!(
+            spec.db_rows().unwrap_err(),
+            DbDeclError::CapabilityPortUndeclared {
+                capability: "events.query".into(),
+                port: "events".into(),
+            }
+        );
+        spec.expose.mesh.ports.push(MeshPort::named("events"));
+        spec.db_rows().expect("a declared port binds");
+    }
+
+    #[test]
+    fn a_spec_without_a_db_key_decodes_as_no_db_rows() {
+        let mut spec = archetype_test_spec("db-digest");
+        let mut json = serde_json::to_value(&spec).unwrap();
+        // A pre-field peer's frame carries no `db`.
+        json.as_object_mut().unwrap().remove("db");
+        let back: WorkloadSpec = serde_json::from_value(json).unwrap();
+        assert!(back.db.is_empty());
+        spec.db = vec![db_row("a", "a.db", WorkbenchKind::None)];
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["db"][0]["workbench"], "none");
     }
 
     // ── R850-F1: the engine and subject axes ─────────────────────────────────

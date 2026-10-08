@@ -1314,6 +1314,8 @@ mod tests {
                 scratch_floor_mb: None,
             },
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             depends_on: vec![],
             requires: vec![],
             healthcheck: None,

@@ -19,7 +19,6 @@
 //!
 //! @yah:relay(R630, "Object-store correctness + tooling gaps surfaced by standing up the cr.yah.dev registry")
 //! @yah:at(2026-07-23T03:06:57Z)
-//! @yah:status(open)
 //! @yah:next("Both children were found while building yah-cr (the R2-backed OCI registry) on 2026-07-22 and are independent of that work — they are latent defects in shared object-store code that any caller can hit.")
 //! @yah:next("Start with the SigV4 child: it is a correctness bug that fails closed but silently constrains every key namespace we can use. The bucket-delete child is additive and can follow.")
 //! @yah:gotcha("The SigV4 defect is why cr.yah.dev stores OCI digests as sha256/<hex> instead of the natural sha256:<hex>. That workaround is load-bearing in two files that must stay in lockstep (app/yah/cli/src/cr.rs digest_key, app/yah/workers/yah-cr/src/index.ts digestKey). If the signing bug is fixed, those can be simplified — but only together, and only with a migration for keys already written.")

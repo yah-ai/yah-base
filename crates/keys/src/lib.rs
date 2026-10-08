@@ -25,41 +25,14 @@
 //! - `credentials.enc` — `[12-byte nonce | ciphertext_with_tag]`,
 //!                        plaintext is `serde_json::Value` map (provider → token)
 //!
-//! @yah:relay(R043, "Unify credential storage: desktop api_keys → keys vault (Keychain → AES file)")
-//! @yah:status(handoff)
-//! @yah:assignee(agent:claude)
-//! @yah:handoff("Today the workspace has two parallel secret stores: the CLI/cloud uses crates/yah/keys (AES-256-GCM file at ProjectDirs::data_dir(), works headless/over-SSH/on-Linux-yubaba) while the desktop uses app/yah/desktop/src/api_keys.rs (macOS Keychain via the keyring crate). Same machine, two vaults, inconsistent slot naming (CLI 'hetzner-api-token' vs desktop 'hetzner'). User asked to bridge them with the encrypted-file backend as the canonical store so dev-machine UX (desktop) and headless infra (yubaba, agentd, ssh'd camps) share one source of truth. F9 already lifted KeysStore into a shared crate and explicitly named this as its R040-Tx follow-up.")
-//! @yah:next("Three phases below — F1 lands the bridge, F2 normalizes slot names, F3 drops the keyring dep once soaked.")
 //! @arch:see(crates/yah/keys/src/lib.rs)
 //! @arch:see(app/yah/desktop/src/api_keys.rs)
 //!
-//! @yah:relay(R044, "DRY credential resolution: KeysStore::get_or_env (vault → env fallback) for CLI + headless")
-//! @yah:status(review)
-//! @yah:assignee(agent:claude)
-//! @yah:verify("cargo test -p keys -p cloud -p desktop -p yah")
+//! archived: R044 — history: `yah board history oss/yah-base/crates/keys/src/lib.rs`
 //! @arch:see(crates/yah/keys/src/lib.rs)
 //! @arch:see(crates/yah/cloud/src/provider/hetzner.rs)
-//! @yah:handoff("DRY landed. New keys::KeysStore::get_or_env(slot, env_var) instance method + free function keys::get_or_env(slot, env_var). The instance method propagates vault errors (corrupt machine.key, decrypt failure — real signals); the free function additionally swallows vault-OPEN errors so a machine with no vault still resolves env-supplied creds. Refactored HetznerDriver::from_default_sources from ~30 lines of hand-rolled lookup to 3 one-liners. Wired all desktop sibling modules (hetzner.rs, identities.rs, agent.rs — ~7 call sites total) to use keys::get_or_env directly with paired (slot, env) constants per credential, bypassing the api_keys layer (api_keys keeps its Tauri-validation contract for command-surface writes). Same treatment in CLI (yah agent, yah-agentd) — also caught and fixed an F2 gap there: agentd/agent had been reading bare 'openai' while desktop wrote canonical 'openai-api-key', so a token set from the desktop UI wasn't visible to yah-agentd. Now both use canonical 'openai-api-key' with OPENAI_API_KEY env fallback. handle_provision's resolve_headscale_preauth_key collapsed to a one-liner using the helper too. main.rs (yah keys CRUD) intentionally left vault-only — that's the user-facing storage surface, env fallback there would be confusing. Tests: 4 new in keys (vault-wins, env-fallback, both-miss, decrypt-error-propagates), all 10 keys + 30 cloud + 17 yah cloud:: + 81 desktop pass. Frontend typecheck + build green. Stale 'keychain read failed' / 'no token in keychain' error messages updated to mention the env var path so users see both options.")
-//! @yah:next("Cleanup chance for whoever picks the bridge work back up: api_keys.rs's HetznerError::Vault(String) and GithubProbeError::Vault(String) variants (now used by hetzner.rs / identities.rs) currently take an opaque string. If keys::Result errors get richer typing later, these could carry the structured error instead.")
-//! @yah:next("If a future ticket adds aws-s3-access-key / digitalocean-api-token / cloudflare-api-token slots in real consumers (today they only exist in CLOUD_SECRETS metadata), apply the same get_or_env discipline at those call sites.")
-//! @yah:handoff("Credential DRY work is correct and clean. Review found two pre-existing test failures unrelated to R044 that block the verify command:\n\n1. FIXED: app/yah/desktop/tests/agent_writers_e2e.rs — two write_arch_doc calls used rel_path pointing into authored/ but omitted folder:\"authored\", causing sandbox check to fail (defaults to working). Added \"folder\":\"authored\" to both json! invocations. This fix is already in the branch.\n\n2. NEEDS FIX: app/yah/cli/tests/arch_dogfood.rs — 8 tests fail because: (a) workspace_root() goes only one level up from CARGO_MANIFEST_DIR (app/yah/cli -> app/yah) instead of two, and (b) assertions reference rs-hack era files (editor.rs, surgical.rs) and roles (emit, diff, traverse) that no longer exist in the yah workspace. Tests need to be rewritten for the current yah architecture OR workspace_root() corrected to the repo root and assertions updated to match current @arch:layer/@arch:role annotations. Once arch_dogfood is fixed, re-run cargo test -p keys -p cloud -p desktop -p yah — everything else is green.")
 //!
-//! @yah:ticket(R043-F4, "yah keys export/import: portable vault transfer for camp bootstrap")
-//! @yah:at(2026-05-04T21:17:55Z)
-//! @yah:assignee(agent:claude)
-//! @yah:status(review)
-//! @yah:phase(P4)
-//! @yah:parent(R043)
-//! @yah:next("Lands after R043-F1/F2/F3 stabilize the unified vault. Use case: operator has creds on desktop, needs them on a remote yah-camp (Path 2 SSH or Path 3 yubaba) without re-entering everything.")
-//! @yah:next("Two operations: yah keys export [--plain | --password] [--slots <names>] [--out <path>] and yah keys import [--strategy {merge,replace,skip}] <file>. Symmetric — import auto-detects format, prompts for passphrase if encrypted.")
-//! @yah:next("Password-protected format: Argon2id KEK derivation (sane defaults — m=64MiB, t=3, p=1) + AES-256-GCM payload. File extension .yahkeys with magic bytes + version header so future format bumps are safe.")
-//! @yah:next("Selective slots from day 1: --slots anthropic,openai sends only those. Least-privilege matters — Hetzner cloud token belongs on the operator desktop, not on a Hetzner VM that already has scoped IAM.")
-//! @yah:next("Plain export prints a yelling warning + refuses without --yes-really-export-plain. Pipe-friendly default (yah keys export --password | ssh box yah keys import) means stdout/stdin handling needs to coexist with TTY passphrase prompting (read passphrase from /dev/tty when stdout is a pipe).")
-//! @yah:next("Bootstrap flow this unblocks: yah keys export --password --slots anthropic | ssh <box> yah keys import — passphrase in operator's head, ciphertext over SSH, no long-lived plaintext on disk anywhere.")
-//! @yah:next("Yubaba integration is a follow-up: yubaba as credential broker (either operator-driven 'yah cloud machine attach' triggers vault transfer, or yubaba pulls from cluster-shared encrypted store). Punt until R040-F20 (yubaba openraft) lands; export/import is the building block.")
-//! @yah:verify("yah keys export --password --out /tmp/v.yahkeys; yah keys import /tmp/v.yahkeys on a fresh ~/.config/yah — slots restored byte-identical after passphrase entry")
-//! @yah:verify("yah keys export --slots anthropic --plain | yah keys import --strategy replace round-trips a single slot")
-//! @yah:verify("Wrong passphrase on import returns a clean error, no partial state in the target vault")
+//! archived: R043 — history: `yah board history oss/yah-base/crates/keys/src/lib.rs`
 //! @arch:see(.yah/docs/architecture/A043-yah-on-machine-daemons.md)
 //!
 //! @yah:relay(R219, "Agent vault-lease: time-boxed credential injection via MCP + CLI")

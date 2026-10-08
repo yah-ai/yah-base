@@ -130,7 +130,6 @@
 //!
 //! @yah:relay(R894, "Trust as a declared axis: admission derives minimum isolation substrate")
 //! @yah:at(2026-09-11T22:22:59Z)
-//! @yah:status(handoff)
 //! @yah:assignee(agent:user-custom-char-gul2)
 //! @yah:next("Operator call (2026-09-11, chat session:d6fc1d54): workload trust becomes a declared property from which admission derives minimum isolation, making 'untrusted code never shares a kernel with the fleet' one checkable rule instead of a convention distributed across dispatchers. Today only the mechanism is recorded (yah.exec substrate marker) and the sole trust-shaped gate is kamaji's tier==\"infra\" check. R823 (untrusted camp vending on microVMs) is the first consumer of this rule.")
 //! @arch:see(oss/yubaba/crates/cloud/src/config.rs)

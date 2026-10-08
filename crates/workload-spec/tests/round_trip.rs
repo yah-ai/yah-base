@@ -54,6 +54,8 @@ fn sidecar_spec() -> WorkloadSpec {
         },
         labels: HashMap::new(),
         durability: None,
+        db: Vec::new(),
+        capabilities: Vec::new(),
         annotations: HashMap::new(),
         files: Vec::new(),
     }
@@ -211,6 +213,8 @@ fn full_spec() -> WorkloadSpec {
             m
         },
         durability: None,
+        db: Vec::new(),
+        capabilities: Vec::new(),
         annotations: {
             let mut m = HashMap::new();
             m.insert("yah.created-by".into(), "agent:claude".into());
@@ -598,6 +602,8 @@ fn minimal_spec_round_trips_through_json_and_postcard() {
         },
         labels: HashMap::new(),
         durability: None,
+        db: Vec::new(),
+        capabilities: Vec::new(),
         annotations: HashMap::new(),
         files: Vec::new(),
     };

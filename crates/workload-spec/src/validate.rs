@@ -66,6 +66,8 @@ pub enum FieldPath {
     Annotation(String),
     /// `durability.<sub>` — e.g. `Durability("subjects")`.
     Durability(&'static str),
+    /// `db` — a `[[db]]` row failed [`WorkloadSpec::db_rows`].
+    Db,
 }
 
 impl fmt::Display for FieldPath {
@@ -92,6 +94,7 @@ impl fmt::Display for FieldPath {
             FieldPath::Asset(i, sub) => write!(f, "asset[{i}].{sub}"),
             FieldPath::Annotation(key) => write!(f, "annotations[\"{key}\"]"),
             FieldPath::Durability(sub) => write!(f, "durability.{sub}"),
+            FieldPath::Db => write!(f, "db"),
         }
     }
 }
@@ -646,6 +649,10 @@ pub fn shape(spec: &WorkloadSpec) -> Result<Vec<ShapeWarning>, ShapeError> {
     // stop. See `WorkloadSpec::durability`.
     let durability = spec.durability().map_err(|e| ShapeError::Field {
         path: FieldPath::Durability(durability_error_field(&e)),
+        reason: e.to_string(),
+    })?;
+    spec.db_rows().map_err(|e| ShapeError::Field {
+        path: FieldPath::Db,
         reason: e.to_string(),
     })?;
     // R850-F1: a bytes-shipping tier's subjects are volume-relative, so there

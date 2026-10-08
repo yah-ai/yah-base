@@ -224,6 +224,8 @@ impl CloudflaredIngressSpec {
             },
             labels,
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations,
             files: Vec::new(),
         };
