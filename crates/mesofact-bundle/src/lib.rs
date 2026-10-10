@@ -119,6 +119,12 @@ pub use assemble::{
     assemble_vanilla_bundle, collect_component_files, collect_dir, BundleFile, ServeBinSource,
 };
 
+/// Per-file serving metadata for a served static tree (MFT-R825-F1): the
+/// asset index (`ETag`, declared immutability, precompressed encodings) every
+/// assembly entry point writes, and that `mesofact serve` and yubaba's R2
+/// publish both read. Types-only plus brotli/gzip; no store.
+pub mod assets;
+
 #[cfg(feature = "store")]
 mod store;
 #[cfg(feature = "store")]
@@ -192,6 +198,12 @@ pub enum BundleError {
     /// (always available) and by the `store` feature's publish/materialize.
     #[error("bundle io: {0}")]
     Io(String),
+
+    /// A component's declared serving policy is unusable — a malformed
+    /// `workload.toml` or an `[build] immutable` pattern
+    /// [`assets::ImmutableGlobs::new`] refuses (MFT-R825-F1).
+    #[error("{0}")]
+    AssetPolicy(String),
 
     /// A blob referenced by the manifest was absent from the store during
     /// materialize (only constructed under `store`).

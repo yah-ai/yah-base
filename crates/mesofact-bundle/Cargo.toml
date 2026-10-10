@@ -31,9 +31,17 @@ serde_json = "1"
 blake3 = "1"
 toml = "0.8"
 thiserror = "1"
+# Asset index + publish-time precompression (MFT-R825-F1, src/assets.rs).
+# sha256 because an asset's ETag is the same digest a mesofact manifest records
+# as `content_hash`. Unconditional rather than feature-gated on purpose: every
+# assembly entry point finalizes, so a feature-off build would assemble bundles
+# that silently differ from a feature-on one.
+sha2 = "0.10"
+brotli = "8"
+flate2 = "1"
 
 # Only linked when the `store` feature is on.
-yah-object-store = { path = "../object-store", version = "0.8.43", optional = true }
+yah-object-store = { path = "../object-store", version = "0.8.45", optional = true }
 
 [dev-dependencies]
 serde_json = "1"

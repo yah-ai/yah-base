@@ -176,6 +176,7 @@ pub fn assemble_vanilla_bundle(
     project_root: &Path,
     out_dir: &Path,
 ) -> Result<BundleManifest, BundleError> {
+    crate::assets::finalize_component_output(project_root, out_dir)?;
     let mut files = collect_dir("app/dist", out_dir)?;
     stage_app_config(project_root, &mut files);
     stage_data_inputs(project_root, out_dir, &mut files)?;
@@ -248,6 +249,7 @@ pub fn assemble_self_bundle_with(
     sidecar_bins: &[(String, String, PathBuf)],
     built_against: Option<String>,
 ) -> Result<BundleManifest, BundleError> {
+    crate::assets::finalize_component_output(project_root, out_dir)?;
     let mut files = collect_dir("app/dist", out_dir)?;
     stage_app_config(project_root, &mut files);
     stage_data_inputs(project_root, out_dir, &mut files)?;
@@ -383,12 +385,18 @@ pub fn assemble_bundle_from_files(
 /// on every path. The unmounted primary needs no `html/` here because its own
 /// `out_dir` already contains one: a mesofact-spa/static build emits
 /// `dist/html/**`, and that tree lands under `app/dist/`.
+///
+/// Finalizes `out_dir` in place first ([`crate::assets::finalize_component_output`]):
+/// the component's asset index and precompressed variants are written into
+/// its own output, so they stage at the component's mount with everything
+/// else and `mesofact serve` finds them by walking up from a file.
 pub fn collect_component_files(
     project_root: &Path,
     out_dir: &Path,
     mount: Option<&str>,
     include_config: bool,
 ) -> Result<Vec<BundleFile>, BundleError> {
+    crate::assets::finalize_component_output(project_root, out_dir)?;
     let dist_prefix = match mount {
         Some(m) if !m.is_empty() => format!("app/dist/html/{m}"),
         _ => "app/dist".to_string(),
@@ -530,9 +538,13 @@ mod tests {
         let files =
             collect_component_files(dir.path(), dir.path(), Some("app"), false).unwrap();
         let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        // The component's asset index (MFT-R825-F1) stages at its mount with
+        // everything else, which is what lets `mesofact serve` find it by
+        // walking up from a file without knowing mounts exist.
         assert_eq!(
             paths,
             vec![
+                "app/dist/html/app/.mesofact-assets.json",
                 "app/dist/html/app/app-abc123_bg.wasm",
                 "app/dist/html/app/index.html",
             ]
@@ -557,7 +569,11 @@ mod tests {
         let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             paths,
-            vec!["app/dist/html/index.html", "app/dist/html/market.html"]
+            vec![
+                "app/dist/html/.mesofact-assets.json",
+                "app/dist/html/index.html",
+                "app/dist/html/market.html",
+            ]
         );
     }
 

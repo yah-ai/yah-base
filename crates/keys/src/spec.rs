@@ -1562,6 +1562,51 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         onepassword: None,
     },
     CredentialSpec {
+        // R965-F3: the first pair minted by `yah cloud cf token create
+        // --profile r2-bucket` rather than by hand. The noisetable camp mounts
+        // it (R811-F5); the vault is per-machine, so its spec lives here.
+        slot: "noisetable-account-assets-access-key-id",
+        env: None,
+        purpose: "R2 access key id scoped to the `noisetable-assets` bucket alone (CF token \
+                  noisetable-account-assets, Bucket Item Read + Write), minted by \
+                  `cf token create --profile r2-bucket --access rw` and probed live at mint \
+                  (list/put/get/delete 2xx, a foreign bucket 403). Procedure: \
+                  .yah/docs/guides/cloudflare-credentials.md",
+        consumers: &["~/ss/noisetable (R811-F5) — account-assets cluster-secret mount"],
+        provider: Provider::Cloudflare,
+        domain: Domain::Infra,
+        // Re-minting is one `cf token create` off `cloudflare-legacy-yah`.
+        band: Band::Automatable,
+        provider_cap_days: None,
+        // Minted with a Cloudflare TTL (`expires_on`, 365d default), and the
+        // verb records that date in the health sidecar.
+        expiry_kind: ExpiryKind::Declared,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
+        slot: "noisetable-account-assets-secret-key",
+        env: None,
+        purpose: "secret half of the noisetable-assets bucket pair — SHA-256 hex of the \
+                  Cloudflare token value; the token value itself is stored nowhere",
+        consumers: &["~/ss/noisetable (R811-F5) — see the access-key-id half above"],
+        provider: Provider::Cloudflare,
+        domain: Domain::Infra,
+        band: Band::Automatable,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Declared,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+    },
+    CredentialSpec {
         slot: "noisetable-account-magic-link-key",
         env: None,
         purpose: "magic-link codec key for the noisetable-account appliance. Nothing in-tree \
