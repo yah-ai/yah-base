@@ -2552,8 +2552,13 @@ impl LifecycleArchetype {
     /// is the existing forge/run-once convention (see
     /// [`RestartPolicy::Never`]'s doc comment) → [`Self::Job`]. Everything
     /// else defaults to the common case, [`Self::Server`].
+    ///
+    /// A [`VolumeMount::from_secret_mount`] bind does not count: yubaba appends
+    /// one per materialized File secret, so counting it made every deployed
+    /// secret-mounting workload read as an `Appliance` (R854), and a deployed
+    /// spec could not be asked its own archetype (R966).
     fn infer(volumes: &[VolumeMount], restart_policy: &RestartPolicy) -> Self {
-        if !volumes.is_empty() {
+        if volumes.iter().any(|v| !v.from_secret_mount) {
             LifecycleArchetype::Appliance
         } else if matches!(restart_policy, RestartPolicy::Never) {
             LifecycleArchetype::Job
@@ -7393,6 +7398,24 @@ blake3   = "{HASH_64}"
         json.as_object_mut().unwrap().remove("archetype");
         let back: WorkloadSpec = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back.archetype, None);
+    }
+
+    #[test]
+    fn a_materialized_secret_bind_does_not_make_a_workload_an_appliance() {
+        // R854/R966: yubaba appends one of these per File secret, so a deployed
+        // spec read back from kamaji must still report the authored archetype.
+        let mut spec = archetype_test_spec("secret-only");
+        spec.volumes = vec![VolumeMount {
+            source: VolumeSource::Bind {
+                host_path: PathBuf::from("/run/yah/secrets/secret-only/tls.key"),
+            },
+            target: PathBuf::from("/etc/tls.key"),
+            read_only: true,
+            from_secret_mount: true,
+        }];
+        spec.restart_policy = RestartPolicy::Always;
+        spec.archetype = None;
+        assert_eq!(spec.effective_archetype(), LifecycleArchetype::Server);
     }
 
     #[test]

@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "fob"
-version = "0.8.45"
+version = "0.8.46"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2386,7 +2386,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "yah-local-driver"
-version = "0.8.45"
+version = "0.8.46"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2406,7 +2406,7 @@ dependencies = [
 
 [[package]]
 name = "yah-mesofact-bundle"
-version = "0.8.45"
+version = "0.8.46"
 dependencies = [
  "blake3",
  "brotli",
@@ -2422,7 +2422,7 @@ dependencies = [
 
 [[package]]
 name = "yah-object-store"
-version = "0.8.45"
+version = "0.8.46"
 dependencies = [
  "fob",
  "hex",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "yah-tenant-move"
-version = "0.8.45"
+version = "0.8.46"
 dependencies = [
  "thiserror 1.0.69",
  "yah-object-store",
@@ -2444,7 +2444,7 @@ dependencies = [
 
 [[package]]
 name = "yah-tenant-pointer"
-version = "0.8.45"
+version = "0.8.46"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -2454,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "yah-workload-spec"
-version = "0.8.45"
+version = "0.8.46"
 dependencies = [
  "aes-gcm",
  "anyhow",
