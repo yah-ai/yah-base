@@ -66,35 +66,104 @@
 //! @yah:next("Tier: Cleric — the ceremony and the code sites are all named below; the only judgment is the Cloudflare permission group, and W295 already records the precedent. The one genuinely operator-gated step is the mint itself.")
 //! @yah:next("THIS IS THE \"A\" HALF OF THE OPERATOR'S 2026-09-11 \"B then A\" DECISION on R858-B23. B shipped: headscale's `yah.durability.*` declaration is now gated behind a default-OFF `--headscale-durability` / `YUBABA_HEADSCALE_DURABILITY` flag (oss/yubaba/crates/yubaba/src/headscale_appliance.rs, `ServerState::headscale_durability`), which is what let the mesh coordinator start again after a 14-hour outage. A is turning it back ON correctly. FOUR STEPS, and the last one is the point: (1) mint a Cloudflare R2 token scoped read+WRITE to the `yah-headscale` bucket alone — W295-fleet-def-as-almanac-release.md:145 records the exact ceremony used for `yah-fleet-index-read` (permission group id plus resource string); this is the same ceremony with a write permission group, and it is a mint on the operator's account. (2) Add the CredentialSpec beside `cloudflare-r2-cert-store-access-key-id` in oss/yah-base/crates/keys/src/spec.rs, following that entry's shape — it is the in-tree precedent for a bucket-scoped pair and its `purpose` field already explains why fleet nodes must not hold the account-wide one. (3) Provision it as a kamaji `EnvironmentFile=` in control_plane_install.sh's durability leg (oss/yah-base/crates/workload-spec/src/control_plane_install.sh:181-191), which today writes ONLY the two helper PATHS via `Environment=` and by construction never carried credentials. `Environment=` / `EnvironmentFile=` in a kamaji.service.d drop-in, NEVER an ExecStart= edit — that is the sanctioned shape and the ExecStart-clobber hazard behind the 2026-09-03 outage is recorded at oss/yubaba/crates/yubaba/src/litestream.rs:227. (4) FLIP THE FLAG ON IN THAT SAME PROVISIONING STEP. That is the whole design point and the reason this is one ticket rather than two: the declaration and its prerequisite must arrive together by construction, because shipping the declaration ahead of the prerequisite is exactly the defect that produced both the 2026-09-03 and the 2026-09-11 coordinator outages.")
 //! @yah:verify("The bar is a live coordinator WITH durability actually working, not a green test run. On a voter provisioned with the new pair and the flag on: `systemctl show kamaji.service -p Environment` names S3_ACCESS_KEY (or the unit carries the EnvironmentFile that supplies it); `yubaba --help` shows `--headscale-durability` and the node is started with it; `pgrep -a headscale` returns a live process; `https://cloud.mesh.yah.dev/key?v=138` returns 200; and the kamaji journal shows the hydrate helper REACHING A VERDICT rather than erroring — today it fails with `{\"outcome\":\"error\",\"message\":\"S3_ACCESS_KEY is required: environment variable not found\"}`. Then the leg nothing has ever exercised: confirm turso-backup-tail is actually writing under s3://yah-headscale/appliance/headscale, a prefix deliberately distinct from litestream's s3://yah-headscale/headscale (headscale_appliance.rs:238-248 explains why the two must not share one prefix). Note the helper can legitimately REFUSE — torn volume, lost fence, unreachable store — and an unreachable store is deliberately indistinguishable from the partition the fence exists for, so a refusal here is not automatically a bug in this ticket's work.")
-//! @yah:gotcha("WHY NO EXISTING CREDENTIAL FITS — measured 2026-09-11 by @Ashguard:golem (session:ce91058c) on us-south-001, so nobody spends a pass rediscovering it. kamaji.service carries NO EnvironmentFile at all, and oss/kamaji/crates/kamaji-bin/src/hydrate.rs:188-191 states by design that S3_ACCESS_KEY / S3_SECRET_KEY / S3_ENDPOINT / S3_REGION are inherited from kamaji's own environment rather than passed by the caller (\"kamaji never reads them, so they do not pass through a supervisor that has no business holding them\") — so kamaji's env IS the sanctioned delivery point and wiring one there is not a workaround. /etc/yah-cloud/litestream.env DOES NOT EXIST on us-south-001, which kills the \"smallest option\" an earlier pass proposed. /etc/yah-cloud/cert-store.env exists and holds CF_R2_ACCESS_KEY_ID / CF_R2_SECRET_KEY, but its own file header says emphatically that it is NOT `cloudflare-r2-access-key-id`/`-secret-key` — the vault halves are `cloudflare-r2-cert-store-access-key-id` / `-secret-key`, scoped to the cert-store bucket, i.e. the wrong bucket for s3://yah-headscale/appliance/headscale. And keys/src/spec.rs's only scoped fleet pair, `cloudflare-r2-fleet-read-*`, is READ-only, so it cannot serve turso-backup-tail, which writes. THE ACCOUNT-WIDE PAIR IS EXPLICITLY OFF THE TABLE: the operator was asked directly on 2026-09-11 and declined it, consistent with this relay's standing gotcha — a coordination-server node holding it could rewrite cdn.yah.dev's public release index and the fleet map. Do not reach for it as a shortcut.")
+//! @yah:gotcha("WHY NO EXISTING CREDENTIAL FITS — measured 2026-09-11 by @Ashguard:golem (session:ce91058c) on us-south-001, so nobody spends a pass rediscovering it. kamaji.service carries NO EnvironmentFile at all, and oss/kamaji/crates/kamaji-bin/src/hydrate.rs:188-191 states by design that S3_ACCESS_KEY / S3_SECRET_KEY / S3_ENDPOINT / S3_REGION are inherited from kamaji's own environment rather than passed by the caller (\"kamaji never reads them, so they do not pass through a supervisor that has no business holding them\") — so kamaji's env IS the sanctioned delivery point and wiring one there is not a workaround. <cloud-conf-dir>/<litestream-env> DOES NOT EXIST on us-south-001, which kills the \"smallest option\" an earlier pass proposed. <cloud-conf-dir>/cert-store.env exists and holds CF_R2_ACCESS_KEY_ID / CF_R2_SECRET_KEY, but its own file header says emphatically that it is NOT `cloudflare-r2-access-key-id`/`-secret-key` — the vault halves are `cloudflare-r2-cert-store-access-key-id` / `-secret-key`, scoped to the cert-store bucket, i.e. the wrong bucket for s3://yah-headscale/appliance/headscale. And keys/src/spec.rs's only scoped fleet pair, `cloudflare-r2-fleet-read-*`, is READ-only, so it cannot serve turso-backup-tail, which writes. THE ACCOUNT-WIDE PAIR IS EXPLICITLY OFF THE TABLE: the operator was asked directly on 2026-09-11 and declined it, consistent with this relay's standing gotcha — a coordination-server node holding it could rewrite cdn.yah.dev's public release index and the fleet map. Do not reach for it as a shortcut.")
 //! @yah:handoff("SOURCE-TREE HALF LANDED (steps 2-4 of the ticket; step 1, the mint, is explicitly the operator's and untouched here). oss/yah-base/crates/keys/src/spec.rs: added CredentialSpec pair `cloudflare-r2-headscale-access-key-id` / `-secret-key` right after `cloudflare-r2-fleet-read-secret-key` (alphabetical order, verified by the existing `slots_are_unique_and_sorted` test). env is S3_ACCESS_KEY / S3_SECRET_KEY — NOT CF_R2_*, per hydrate.rs:182-191's design (kamaji inherits creds from its own environment, never passes them to the helper) and verified against oss/turso-backup/src/bin/hydrate.rs:35-40,158-159 and tail.rs:19-20,310-311, which literally call required(\"S3_ACCESS_KEY\")/required(\"S3_SECRET_KEY\"). band: Automatable (same reasoning as the cert-store/fleet-read pairs — cloudflare-legacy-yah can mint replacements via API). mint: MintHelp::NONE, DELIBERATE: the write permission-group id for an R2 bucket-item scope is not grounded anywhere in this tree (W295:145 only records the READ group, 6a018a9f2fc74eb6b293b0c548f38b39). Do not invent one; the operator's mint (step 1) needs to report back the id it used.")
-//! @yah:handoff("control_plane_install.sh: added ONE conditional (`if [ \"$HAS_DURABILITY_HELPERS\" = 1 ] && [ -f \"$HEADSCALE_DURABILITY_CRED\" ]`) right after the existing turso-backup helper block. On the credential-present arm it writes BOTH kamaji.service.d/51-headscale-durability-cred.conf (EnvironmentFile= for the secret pair + plain Environment= for S3_ENDPOINT=https://3948dc292e724e71b0deefde0ea95999.r2.cloudflarestorage.com and S3_REGION=auto, account id grounded against .yah/infra/machines/{us-east,us-south,us-west}-001.toml) AND yubaba.service.d/50-headscale-durability.conf (Environment=YUBABA_HEADSCALE_DURABILITY=1) — never separately, never via ExecStart=. The absent-credential arm sets neither and echoes why, citing R858-T24. Both drop-ins are anchored (script top) and staged-then-renamed via install_atomic like every other file in this script.")
-//! @yah:handoff("DELIVERY MECHANISM ESTABLISHED, not invented from nothing: this script cannot mint the credential (not in the tarball), so it only DETECTS an operator-placed file — mirroring how /etc/yah-cloud/cert-store.env is delivered today (grep-verified: no writer anywhere in-tree places that file either; us-east-001.toml:148-153 documents it as operator-placed, 0600 root, referenced only by a drop-in). The new file this script looks for is /etc/yah-cloud/headscale-durability.env — a path I chose by direct analogy to cert-store.env, NOT an existing convention found in the tree; whoever places the minted credential (after step 1) must write S3_ACCESS_KEY=... and S3_SECRET_KEY=... to exactly that path, 0600 root, on the candidate voter(s) (us-south-001 today owns headscale per R869-T1/R858-B22) before rolling this script.")
+//! @yah:handoff("control_plane_install.sh: added ONE conditional (`if [ \"$HAS_DURABILITY_HELPERS\" = 1 ] && [ -f \"$HEADSCALE_DURABILITY_CRED\" ]`) right after the existing turso-backup helper block. On the credential-present arm it writes BOTH kamaji.service.d/51-headscale-durability-cred.conf (EnvironmentFile= for the secret pair + plain Environment= for S3_ENDPOINT=https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com and S3_REGION=auto, account id grounded against .yah/infra/machines/{us-east,us-south,us-west}-001.toml) AND yubaba.service.d/50-headscale-durability.conf (Environment=YUBABA_HEADSCALE_DURABILITY=1) — never separately, never via ExecStart=. The absent-credential arm sets neither and echoes why, citing R858-T24. Both drop-ins are anchored (script top) and staged-then-renamed via install_atomic like every other file in this script.")
+//! @yah:handoff("DELIVERY MECHANISM ESTABLISHED, not invented from nothing: this script cannot mint the credential (not in the tarball), so it only DETECTS an operator-placed file — mirroring how <cloud-conf-dir>/cert-store.env is delivered today (grep-verified: no writer anywhere in-tree places that file either; us-east-001.toml:148-153 documents it as operator-placed, 0600 root, referenced only by a drop-in). The new file this script looks for is <cloud-conf-dir>/headscale-durability.env — a path I chose by direct analogy to cert-store.env, NOT an existing convention found in the tree; whoever places the minted credential (after step 1) must write S3_ACCESS_KEY=... and S3_SECRET_KEY=... to exactly that path, 0600 root, on the candidate voter(s) (us-south-001 today owns headscale per R869-T1/R858-B22) before rolling this script.")
 //! @yah:handoff("TESTS: new `headscale_durability_flag_never_ships_without_its_credential` in oss/yah-base/crates/workload-spec/src/control_plane_install.rs, asserting the property that matters (credential absent -> flag never set, structurally, by locating both drop-in writes strictly between the `if` and its `elif`/`fi`) rather than only the happy path. BASELINE (measured before adding the new test, right after the .sh edit): `cargo test --manifest-path oss/yah-base/Cargo.toml -p yah-workload-spec --lib control_plane_install::` = 13 passed / 0 failed (matches R858-T21's recorded baseline exactly). AFTER: 14 passed / 0 failed. Full crate: `cargo test --manifest-path oss/yah-base/Cargo.toml -p yah-workload-spec --lib` = 204 passed / 0 failed. `cargo test --manifest-path oss/yah-base/Cargo.toml -p fob --lib spec::` = 18 passed / 0 failed (NOT baselined separately before the spec.rs edit — no test was added there, only two registry entries, and the sortedness/uniqueness/purpose/mint-help invariants all still pass). `cargo test -p yah --test main camp_systemd_unit_emit` = 14 passed / 0 failed, UNCHANGED — this brief named that file as the test home, but it drives `yah::supervisor_unit` (the base yubaba.service/kamaji.service resource templates), a different Rust surface from control_plane_install.sh; I added coverage in control_plane_install.rs's own `mod tests` instead, the same home R858-T21 used for the sibling durability-helpers block. `bash -n` and `shellcheck` both clean on the edited script.")
-//! @yah:handoff("NOT DONE, stated plainly: no node was touched, nothing was rolled, no credential was minted or placed, and the live verification bar in this ticket's own @yah:verify (kamaji journal reaching a hydrate verdict, turso-backup-tail actually writing under s3://yah-headscale/appliance/headscale) is entirely unexercised — it cannot be, without the operator's mint. This ticket stays open for: (1) operator mints the yah-headscale-scoped R2 write token (step 1, W295-style ceremony, permission group id not grounded here) and reports the id/resource string used; (2) whoever places it writes /etc/yah-cloud/headscale-durability.env on the candidate voter; (3) roll that node with this updated control_plane_install.sh and confirm via the ticket's own verify block.")
+//! @yah:handoff("NOT DONE, stated plainly: no node was touched, nothing was rolled, no credential was minted or placed, and the live verification bar in this ticket's own @yah:verify (kamaji journal reaching a hydrate verdict, turso-backup-tail actually writing under s3://yah-headscale/appliance/headscale) is entirely unexercised — it cannot be, without the operator's mint. This ticket stays open for: (1) operator mints the yah-headscale-scoped R2 write token (step 1, W295-style ceremony, permission group id not grounded here) and reports the id/resource string used; (2) whoever places it writes <cloud-conf-dir>/headscale-durability.env on the candidate voter; (3) roll that node with this updated control_plane_install.sh and confirm via the ticket's own verify block.")
 //! @yah:handoff("Source-tree steps (2)-(4) landed: CredentialSpec pair in keys/src/spec.rs, the single all-or-nothing conditional in control_plane_install.sh wiring the credential + flipping YUBABA_HEADSCALE_DURABILITY in one gate, and a new test proving the structural property. Full account in the handoff log above.")
 //! @yah:handoff("Tree anchor at handoff: 44408b59059e5e4874deafc0b48dd262444a461a — the shared tree as I left it. Diff against it (`git diff 44408b59059e5e4874deafc0b48dd262444a461a..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
-//! @yah:next("Place the minted credential at /etc/yah-cloud/headscale-durability.env (S3_ACCESS_KEY=...\\nS3_SECRET_KEY=..., 0600 root) on the candidate coordinator voter (us-south-001 as of R858-B22), then roll that node with the updated control_plane_install.sh and confirm against this ticket's own @yah:verify block.")
+//! @yah:next("Place the minted credential at <cloud-conf-dir>/headscale-durability.env (S3_ACCESS_KEY=...\\nS3_SECRET_KEY=..., 0600 root) on the candidate coordinator voter (us-south-001 as of R858-B22), then roll that node with the updated control_plane_install.sh and confirm against this ticket's own @yah:verify block.")
 //! @yah:handoff("LEADER SIGN-OFF ON THE SOURCE HALF — @Ashguard:blade (session:eab3e3ec), implemented by @Miravel:eclipse (session:138d80c1). Steps (2)(3)(4) are landed and I re-verified them myself rather than taking the courier's word. The ticket stays at HANDOFF rather than review ON PURPOSE: its own @yah:verify bar is \"a live coordinator WITH durability actually working\", and that cannot be exercised until the operator mints the token (step 1). Code done, feature not yet on anywhere — which is the correct and safe intermediate state, because the flag still defaults OFF and no node carries the credential file.")
 //! @yah:handoff("Tree anchor at handoff: 44408b59059e5e4874deafc0b48dd262444a461a — the shared tree as I left it. Diff against it (`git diff 44408b59059e5e4874deafc0b48dd262444a461a..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
-//! @yah:next("THE ONLY BLOCKER IS THE MINT, AND IT IS THE OPERATOR'S. Sequence, in order: (1) OPERATOR mints a Cloudflare R2 token scoped read+WRITE to the `yah-headscale` bucket alone, by W295:145's recorded ceremony with a write permission group, and reports back the permission-group id + resource string (that id then fills the two slots' `MintHelp`, which is `NONE` today for good reason). The account-wide pair remains declined — a coordination-server node holding it could rewrite cdn.yah.dev's public release index. (2) Write the pair to `/etc/yah-cloud/headscale-durability.env` (`S3_ACCESS_KEY=…` / `S3_SECRET_KEY=…`), 0600 root, on the candidate voter — us-south-001 (root@45.32.194.254) owns the appliance today and is the only node holding headscale.db. (3) Get the updated control_plane_install.sh onto that node. NOTE THE LIVE HAZARD THAT MAKES THIS NOT A PLAIN ROLL, measured by the leader 2026-09-11: every voter runs kamaji 0.8.39-h3, HOTSHIP bytes ahead of the published train, so `scripts/roll-node.sh --to 0.8.38` DOWNGRADES kamaji and reverts 486 lines of unpublished work — cut a release carrying this change, or hotship, but do not roll a voter backwards to acquire it. (4) Then run this ticket's own @yah:verify block, whose real content is the leg nothing has ever exercised: the kamaji journal reaching a hydrate VERDICT instead of `S3_ACCESS_KEY is required`, and turso-backup-tail actually writing under s3://yah-headscale/appliance/headscale — a prefix deliberately distinct from litestream's s3://yah-headscale/headscale. A helper REFUSAL there is not automatically a bug in this ticket (torn volume, lost fence, unreachable store are all legitimate, and an unreachable store is by design indistinguishable from the partition the fence exists for).")
+//! @yah:next("THE ONLY BLOCKER IS THE MINT, AND IT IS THE OPERATOR'S. Sequence, in order: (1) OPERATOR mints a Cloudflare R2 token scoped read+WRITE to the `yah-headscale` bucket alone, by W295:145's recorded ceremony with a write permission group, and reports back the permission-group id + resource string (that id then fills the two slots' `MintHelp`, which is `NONE` today for good reason). The account-wide pair remains declined — a coordination-server node holding it could rewrite cdn.yah.dev's public release index. (2) Write the pair to `<cloud-conf-dir>/headscale-durability.env` (`S3_ACCESS_KEY=…` / `S3_SECRET_KEY=…`), 0600 root, on the candidate voter — us-south-001 (root@203.0.113.12) owns the appliance today and is the only node holding headscale.db. (3) Get the updated control_plane_install.sh onto that node. NOTE THE LIVE HAZARD THAT MAKES THIS NOT A PLAIN ROLL, measured by the leader 2026-09-11: every voter runs kamaji 0.8.39-h3, HOTSHIP bytes ahead of the published train, so `scripts/roll-node.sh --to 0.8.38` DOWNGRADES kamaji and reverts 486 lines of unpublished work — cut a release carrying this change, or hotship, but do not roll a voter backwards to acquire it. (4) Then run this ticket's own @yah:verify block, whose real content is the leg nothing has ever exercised: the kamaji journal reaching a hydrate VERDICT instead of `S3_ACCESS_KEY is required`, and turso-backup-tail actually writing under s3://yah-headscale/appliance/headscale — a prefix deliberately distinct from litestream's s3://yah-headscale/headscale. A helper REFUSAL there is not automatically a bug in this ticket (torn volume, lost fence, unreachable store are all legitimate, and an unreachable store is by design indistinguishable from the partition the fence exists for).")
 //! @yah:verify("RE-VERIFIED BY THE LEADER, RE-RUN NOT COPIED. `cargo test --manifest-path oss/yah-base/Cargo.toml -p yah-workload-spec --lib` = 204 passed / 0 failed; the `control_plane_install::` module alone = 14 passed / 0 failed, including the new `headscale_durability_flag_never_ships_without_its_credential` (baseline 13, delta +1, matching the courier's claim exactly); `cargo test --manifest-path oss/yah-base/Cargo.toml -p fob --lib spec::` = 18 passed / 0 failed, so the registry's sortedness and uniqueness invariants still hold with the two new slots at spec.rs:825 and :873. BOTH RUNS CAME BACK CLEAN FROM THE CAMP BUILD RAIL — \"input closure unchanged across the whole run: no skew\" — so these are not the SUSPECT-flagged runs earlier passes on this relay had to caveat. I ALSO READ THE NEW TEST RATHER THAN TRUSTING ITS NAME, because a structural string-position test can be vacuous: it is not. It `.expect()`s four independent anchors (the credential-gated `if`, the `elif` absent arm, the `EnvironmentFile=` printf, and the literal `Environment=YUBABA_HEADSCALE_DURABILITY=1`) and then asserts BOTH writes fall strictly between the `if` and the `elif` — so deleting the gate, moving the flag out of the conditional, or moving it into the absent arm each fail it. It additionally asserts the absent arm sets no flag under any name, which is the direct rejection of the mirror.yml `[ -f ] && … || echo` silent-no-op idiom that caused this relay's second outage. I DID NOT run a tree-mutating falsification pass (I hold no Edit). NOT VERIFIED AND NOT CLAIMED: nothing was rolled, no node was touched, no credential exists, and the hydrate/tail path has still never run against s3://yah-headscale/appliance/headscale.")
-//! @yah:gotcha("TWO THINGS THE NEXT PICKER MUST NOT MISREAD, both flagged honestly by @Miravel:eclipse rather than papered over. (1) `mint` IS DELIBERATELY `MintHelp::NONE` ON BOTH NEW SLOTS. W295-fleet-def-as-almanac-release.md:145 records only the READ permission-group id (6a018a9f2fc74eb6b293b0c548f38b39); the WRITE group id for an R2 bucket-item scope is grounded nowhere in this tree. spec.rs's own module header (~:56-59) records that eleven slots were emptied for exactly this reason — a wrong dashboard pointer mid-rotation is worse than an absent one. So the operator's mint must REPORT BACK the permission-group id and resource string it used, and that id is what fills MintHelp in a follow-up. Do not invent one. (2) `/etc/yah-cloud/headscale-durability.env` IS A NEW PATH CHOSEN BY ANALOGY, NOT AN EXISTING CONVENTION FOUND IN THE TREE. It mirrors `/etc/yah-cloud/cert-store.env`, and the analogy is sound for the reason that matters: grep confirms NOTHING in-tree writes cert-store.env either — an operator places it, 0600 root, and only a drop-in references it (us-east-001.toml:148-153 documents that). control_plane_install.sh therefore DETECTS the file and never mints it, which is the only thing a release tarball can honestly do. Whoever places the minted credential must write it to exactly that path, 0600 root, or the install leg will correctly conclude the credential is absent and leave durability off.")
-//! @yah:next("OPERATOR ANSWERED 2026-09-12, ASKED BY THE R858 LEADER (@Ashguard:blade, session:eab3e3ec): MINT IT NOW. The fork put to them was 'mint the yah-headscale-scoped read+WRITE R2 token now' vs 'leave headscale durability off for now', and they chose to mint. So step (1) is authorized and in the operator's hands; steps (2)-(4) of this ticket are already landed in the tree and re-verified. THE GROUND THAT DECISION WAS TAKEN ON, so nobody re-opens it: us-south-001 holds the ONLY copy of headscale.db (west's is stale, east never hosted the appliance), litestream is configured on NO prod node, and turso durability is gated off — so a dead south today is a 37-hour-shaped outage with the only copy on a dead box. That is the highest-value remaining risk on this relay. WHEN THE MINT LANDS the picker needs two things back from the operator: the permission-group id and the resource string used (they fill the two slots' `MintHelp`, deliberately `NONE` today because the WRITE group id is grounded nowhere in this tree), and the key pair itself, which goes to /etc/yah-cloud/headscale-durability.env (0600 root) on us-south-001 — exactly the path control_plane_install.sh now probes for.")
+//! @yah:gotcha("TWO THINGS THE NEXT PICKER MUST NOT MISREAD, both flagged honestly by @Miravel:eclipse rather than papered over. (1) `mint` IS DELIBERATELY `MintHelp::NONE` ON BOTH NEW SLOTS. W295-fleet-def-as-almanac-release.md:145 records only the READ permission-group id (6a018a9f2fc74eb6b293b0c548f38b39); the WRITE group id for an R2 bucket-item scope is grounded nowhere in this tree. spec.rs's own module header (~:56-59) records that eleven slots were emptied for exactly this reason — a wrong dashboard pointer mid-rotation is worse than an absent one. So the operator's mint must REPORT BACK the permission-group id and resource string it used, and that id is what fills MintHelp in a follow-up. Do not invent one. (2) `<cloud-conf-dir>/headscale-durability.env` IS A NEW PATH CHOSEN BY ANALOGY, NOT AN EXISTING CONVENTION FOUND IN THE TREE. It mirrors `<cloud-conf-dir>/cert-store.env`, and the analogy is sound for the reason that matters: grep confirms NOTHING in-tree writes cert-store.env either — an operator places it, 0600 root, and only a drop-in references it (us-east-001.toml:148-153 documents that). control_plane_install.sh therefore DETECTS the file and never mints it, which is the only thing a release tarball can honestly do. Whoever places the minted credential must write it to exactly that path, 0600 root, or the install leg will correctly conclude the credential is absent and leave durability off.")
+//! @yah:next("OPERATOR ANSWERED 2026-09-12, ASKED BY THE R858 LEADER (@Ashguard:blade, session:eab3e3ec): MINT IT NOW. The fork put to them was 'mint the yah-headscale-scoped read+WRITE R2 token now' vs 'leave headscale durability off for now', and they chose to mint. So step (1) is authorized and in the operator's hands; steps (2)-(4) of this ticket are already landed in the tree and re-verified. THE GROUND THAT DECISION WAS TAKEN ON, so nobody re-opens it: us-south-001 holds the ONLY copy of headscale.db (west's is stale, east never hosted the appliance), litestream is configured on NO prod node, and turso durability is gated off — so a dead south today is a 37-hour-shaped outage with the only copy on a dead box. That is the highest-value remaining risk on this relay. WHEN THE MINT LANDS the picker needs two things back from the operator: the permission-group id and the resource string used (they fill the two slots' `MintHelp`, deliberately `NONE` today because the WRITE group id is grounded nowhere in this tree), and the key pair itself, which goes to <cloud-conf-dir>/headscale-durability.env (0600 root) on us-south-001 — exactly the path control_plane_install.sh now probes for.")
 //! @yah:handoff("STEP (1) IS DONE — THE TOKEN IS MINTED, PROVEN AND VAULTED. Done by @Ashguard:blade (session:eab3e3ec) 2026-09-12 after the operator asked the decisive question: \"can't you mint tokens with cloudflare-legacy-yah?\" THE ANSWER WAS YES AND THIS TICKET'S BLOCKING PREMISE WAS WRONG. The recorded reason for gating on a human was that \"the WRITE permission-group id for an R2 bucket-item scope is not grounded anywhere in this tree\" — true, but it did not need to be IN THE TREE, because Cloudflare will enumerate it: `GET /client/v4/accounts/{acct}/tokens/permission_groups` with the `cloudflare-legacy-yah` bearer returns the whole R2 set. THE IDS, now grounded from the provider rather than guessed: `2efd5506f9c8494dacb1fa10a3e7d5b6` = \"Workers R2 Storage Bucket Item Write\", and `6a018a9f2fc74eb6b293b0c548f38b39` = \"Workers R2 Storage Bucket Item Read\" — that second one MATCHES W295's recorded value byte-for-byte, which is the cross-check that the endpoint is returning the same namespace W295's ceremony used. (Note the correct citation is W295-fleet-def-as-almanac-release.md:86, not :145 as this ticket previously recorded.) The USER-scope endpoint `/user/tokens/permission_groups` returns 9109 Unauthorized — only the ACCOUNT-scope one works with this bearer, which is the single thing that makes this look impossible if you try it once and stop.")
-//! @yah:verify("THE MINT AND ITS SCOPE, MEASURED — this is the ceremony half W295 did for the read pair, repeated for write. TOKEN: `POST /client/v4/accounts/3948dc292e724e71b0deefde0ea95999/tokens`, name `yah-headscale-rw`, status `active`, ONE policy, TWO permission groups (the read + write bucket-item ids above), resource `com.cloudflare.edge.r2.bucket.3948dc292e724e71b0deefde0ea95999_default_yah-headscale` — i.e. the yah-headscale bucket and nothing else. DERIVATION TO S3 CREDENTIALS, confirmed empirically rather than from memory: the S3 access key id is the TOKEN ID (32 chars) and the secret access key is the SHA-256 of the token VALUE (64 hex) — derived, stored, and then proven by actually signing SigV4 requests with it. VAULT: `cloudflare-r2-headscale-access-key-id` and `cloudflare-r2-headscale-secret-key` are both set and read back byte-identical (`yah keys list` shows both). SCOPE PROOF, five SigV4 calls against the real R2 endpoint, region `auto`, ALL FIVE AS REQUIRED: PUT s3://yah-headscale/appliance/headscale/_r858t24-scope-probe -> 200; GET the same -> 200; DELETE -> 204; **PUT s3://yah-dev/_r858t24-should-not-exist -> 403 AccessDenied; GET s3://yah-dev/yah/index.json -> 403 AccessDenied**. Those last two are the point of the whole exercise: they are the measured proof that a coordination-server node holding this pair CANNOT rewrite the public release index, which is exactly why the operator declined the account-wide pair on 2026-09-11. The probe key was deleted, so the bucket is left clean. SECRET HYGIENE: the token value was never echoed; the intermediate files were 0600 and are removed, and the vault is the only remaining copy.")
-//! @yah:gotcha("THE CREDENTIAL THAT MINTED THIS ONE IS ON RECORD AS DISCLOSED, AND THAT IS A SEPARATE LIVE FINDING — flagged here because this ticket now depends on it. `cloudflare-legacy-yah` is a `cfut_` Cloudflare user token which crates/yah/forms/src/lib.rs:238-240 records as sitting in PLAINTEXT inside three `.yah/forms/*.json` files (fingerprint 3e9091fc44f7060b), with a standing instruction to rotate it because \"anything written to disk in plaintext inside agent scrollback has an unknown readership\". Using it to mint was correct and is not made worse by this pass — but note the consequence for THIS ticket: if that token is rotated or revoked, `yah-headscale-rw` SURVIVES (a Cloudflare token's lifetime is independent of whoever created it), so no re-mint is needed. The reverse is not true: the minting capability goes away with it, so record the ceremony rather than relying on being able to repeat it. THE SECOND HALF OF THAT FINDING IS THE MECHANISM, not the three files: forms record command text verbatim, so any command carrying a bearer persists it. I deliberately kept every secret in this pass out of argv (stdin redirects into `yah keys set`, 0600 temp files, never an echo) for exactly that reason.")
+//! @yah:verify("THE MINT AND ITS SCOPE, MEASURED — this is the ceremony half W295 did for the read pair, repeated for write. TOKEN: `POST /client/v4/accounts/0123456789abcdef0123456789abcdef/tokens`, name `yah-headscale-rw`, status `active`, ONE policy, TWO permission groups (the read + write bucket-item ids above), resource `com.cloudflare.edge.r2.bucket.0123456789abcdef0123456789abcdef_default_yah-headscale` — i.e. the yah-headscale bucket and nothing else. DERIVATION TO S3 CREDENTIALS, confirmed empirically rather than from memory: the S3 access key id is the TOKEN ID (32 chars) and the secret access key is the SHA-256 of the token VALUE (64 hex) — derived, stored, and then proven by actually signing SigV4 requests with it. VAULT: `cloudflare-r2-headscale-access-key-id` and `cloudflare-r2-headscale-secret-key` are both set and read back byte-identical (`yah keys list` shows both). SCOPE PROOF, five SigV4 calls against the real R2 endpoint, region `auto`, ALL FIVE AS REQUIRED: PUT s3://yah-headscale/appliance/headscale/_r858t24-scope-probe -> 200; GET the same -> 200; DELETE -> 204; **PUT s3://yah-dev/_r858t24-should-not-exist -> 403 AccessDenied; GET s3://yah-dev/yah/index.json -> 403 AccessDenied**. Those last two are the point of the whole exercise: they are the measured proof that a coordination-server node holding this pair CANNOT rewrite the public release index, which is exactly why the operator declined the account-wide pair on 2026-09-11. The probe key was deleted, so the bucket is left clean. SECRET HYGIENE: the token value was never echoed; the intermediate files were 0600 and are removed, and the vault is the only remaining copy.")
+//! @yah:gotcha("THE CREDENTIAL THAT MINTED THIS ONE IS ON RECORD AS DISCLOSED, AND THAT IS A SEPARATE LIVE FINDING — flagged here because this ticket now depends on it. `cloudflare-legacy-yah` is a `cfut_` Cloudflare user token which crates/yah/forms/src/lib.rs:238-240 records as sitting in PLAINTEXT inside three `.yah/forms/*.json` files (fingerprint <fingerprint>), with a standing instruction to rotate it because \"anything written to disk in plaintext inside agent scrollback has an unknown readership\". Using it to mint was correct and is not made worse by this pass — but note the consequence for THIS ticket: if that token is rotated or revoked, `yah-headscale-rw` SURVIVES (a Cloudflare token's lifetime is independent of whoever created it), so no re-mint is needed. The reverse is not true: the minting capability goes away with it, so record the ceremony rather than relying on being able to repeat it. THE SECOND HALF OF THAT FINDING IS THE MECHANISM, not the three files: forms record command text verbatim, so any command carrying a bearer persists it. I deliberately kept every secret in this pass out of argv (stdin redirects into `yah keys set`, 0600 temp files, never an echo) for exactly that reason.")
 //! @yah:handoff("ALL FOUR STEPS' SOURCE + CREDENTIAL WORK IS DONE; WHAT IS LEFT IS ONE LIVE FLIP. @Ashguard:blade (session:eab3e3ec) handing off at wind_down. Step (1) the mint: DONE and proven (see the verify entry — token `yah-headscale-rw`, both vault slots set, scope proved by real SigV4 including the two REQUIRED 403s on yah-dev). Steps (2)(3)(4): landed by @Miravel:eclipse earlier and re-verified by me. The mint ceremony is now IN THE CODE rather than only on this ticket — `MintHelp` on both slots at oss/yah-base/crates/keys/src/spec.rs:~876/:883 carries the write group id, the read group id, the resource string and the token name, so a 2am rotation does not have to rediscover it. `cargo test -p fob --lib spec::` = 18 passed / 0 failed, re-run by me on a clean rail (\"input closure unchanged across the whole run: no skew\").")
 //! @yah:handoff("Tree anchor at handoff: 44408b59059e5e4874deafc0b48dd262444a461a — the shared tree as I left it. Diff against it (`git diff 44408b59059e5e4874deafc0b48dd262444a461a..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
-//! @yah:next("THE LIVE FLIP, in order, on us-south-001 (root@45.32.194.254 — current appliance owner and the only node holding headscale.db). (1) Write the vaulted pair to /etc/yah-cloud/headscale-durability.env, 0600 root, as `S3_ACCESS_KEY=<cloudflare-r2-headscale-access-key-id>` and `S3_SECRET_KEY=<cloudflare-r2-headscale-secret-key>` — both slots are already in this camp's vault, read them with `yah keys get` and NEVER put either into argv or an echo (crates/yah/forms/src/lib.rs:238-240 records how a bearer in command text ends up in plaintext scrollback). (2) Get the updated control_plane_install.sh legs onto the node. DO NOT `scripts/roll-node.sh --to 0.8.38`: every voter runs kamaji `0.8.39-h3`, HOTSHIP bytes AHEAD of the published train, so a roll DOWNGRADES kamaji and reverts 486 lines of unpublished work (`git diff --stat 4163c4d8..HEAD -- oss/kamaji`). Either cut a release carrying it, or hand-place the two drop-ins the script would write: kamaji.service.d/51-headscale-durability-cred.conf (EnvironmentFile= plus S3_ENDPOINT=https://3948dc292e724e71b0deefde0ea95999.r2.cloudflarestorage.com and S3_REGION=auto) and yubaba.service.d/50-headscale-durability.conf (Environment=YUBABA_HEADSCALE_DURABILITY=1) — `Environment=`/`EnvironmentFile=` only, NEVER an ExecStart= edit. (3) `systemctl daemon-reload`, restart kamaji then yubaba; the elected owner redeploys on its own retry round (~60s), no manual kick. (4) VERIFY against this ticket's own bar, whose real content is the leg nothing has ever exercised: the kamaji journal reaching a hydrate VERDICT (expect `already_populated`) instead of `S3_ACCESS_KEY is required`, `pgrep -a headscale` live, cloud.mesh.yah.dev/key = 200, and turso-backup-tail actually writing under s3://yah-headscale/appliance/headscale — a prefix deliberately distinct from litestream's s3://yah-headscale/headscale. ROLLBACK IF IT REFUSES, and it is cheap: delete yubaba.service.d/50-headscale-durability.conf, `systemctl daemon-reload && systemctl restart yubaba`; the flag defaults OFF so the next retry round deploys the coordinator with no tier declared, which is exactly today's known-good state.")
+//! @yah:next("THE LIVE FLIP, in order, on us-south-001 (root@203.0.113.12 — current appliance owner and the only node holding headscale.db). (1) Write the vaulted pair to <cloud-conf-dir>/headscale-durability.env, 0600 root, as `S3_ACCESS_KEY=<cloudflare-r2-headscale-access-key-id>` and `S3_SECRET_KEY=<cloudflare-r2-headscale-secret-key>` — both slots are already in this camp's vault, read them with `yah keys get` and NEVER put either into argv or an echo (crates/yah/forms/src/lib.rs:238-240 records how a bearer in command text ends up in plaintext scrollback). (2) Get the updated control_plane_install.sh legs onto the node. DO NOT `scripts/roll-node.sh --to 0.8.38`: every voter runs kamaji `0.8.39-h3`, HOTSHIP bytes AHEAD of the published train, so a roll DOWNGRADES kamaji and reverts 486 lines of unpublished work (`git diff --stat 4163c4d8..HEAD -- oss/kamaji`). Either cut a release carrying it, or hand-place the two drop-ins the script would write: kamaji.service.d/51-headscale-durability-cred.conf (EnvironmentFile= plus S3_ENDPOINT=https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com and S3_REGION=auto) and yubaba.service.d/50-headscale-durability.conf (Environment=YUBABA_HEADSCALE_DURABILITY=1) — `Environment=`/`EnvironmentFile=` only, NEVER an ExecStart= edit. (3) `systemctl daemon-reload`, restart kamaji then yubaba; the elected owner redeploys on its own retry round (~60s), no manual kick. (4) VERIFY against this ticket's own bar, whose real content is the leg nothing has ever exercised: the kamaji journal reaching a hydrate VERDICT (expect `already_populated`) instead of `S3_ACCESS_KEY is required`, `pgrep -a headscale` live, cloud.mesh.yah.dev/key = 200, and turso-backup-tail actually writing under s3://yah-headscale/appliance/headscale — a prefix deliberately distinct from litestream's s3://yah-headscale/headscale. ROLLBACK IF IT REFUSES, and it is cheap: delete yubaba.service.d/50-headscale-durability.conf, `systemctl daemon-reload && systemctl restart yubaba`; the flag defaults OFF so the next retry round deploys the coordinator with no tier declared, which is exactly today's known-good state.")
 //! @yah:verify("I ALSO SETTLED THE SAFETY QUESTION THAT WOULD OTHERWISE STOP THE NEXT SESSION COLD, by reading the code rather than guessing. THE FEAR WAS: turning the flag on points hydrate at an EMPTY s3://yah-headscale/appliance/headscale, hydrate refuses, kamaji fail-closes, and the coordinator goes down exactly as on 2026-09-11. IT DOES NOT. oss/turso-backup/src/bin/hydrate.rs:73-79 maps ONLY `HydrateOutcome::Refused` to EXIT_REFUSED; every other outcome — including `NothingInTheStore` and `AlreadyPopulated` — exits SUCCESS, and kamaji's hydrate::run (oss/kamaji/crates/kamaji-bin/src/hydrate.rs:196-212) refuses solely on a non-zero exit. us-south-001's volume already holds a live headscale.db, so the expected outcome there is `already_populated` -> SUCCESS -> the workload starts normally. SECOND THING THE NEXT SESSION MUST KNOW, because this relay's own gotchas say the opposite: R858-S6's verdict \"YES for hydration, NO for replication\" IS SUPERSEDED. Both blockers it filed are FIXED, not merely recorded — R858-B18 landed the per-open `OpenFlags::ReadOnly` seam plus optimistic source-fingerprint validation (probe G6: \"Streamed seq 0 frames 1..=1\" tailing a live foreign-written DB with the holder still attached; probe H: 0 accepted-but-corrupt across 24 rounds in two write regimes), and B19 landed the WAL-salt watermark B18 builds on. So `tier = \"stream\"`, which arms the TAIL as well as hydrate, is no longer known-broken. The relay gotcha reading \"litestream stays as the replicate daemon and its 0.3.13 pin does NOT retire\" is stale on that point.")
 //! @yah:gotcha("THE RESIDUAL RISK IS NARROW, REAL, AND UNMEASURED ON HARDWARE — do not read the paragraph above as \"just flip it\". B18's fix is proven in PROBES on this Mac, never against the live coordinator's headscale.db on us-south-001, and B18's own @yah:assumes records an unclosed hole: `stable_across` does not compare wal_len or mxFrame (deliberately, for good measured reasons), so a PASSIVE foreign checkpoint that overwrites pages already in the main file without growing it is caught only by page 1's change_counter — and probe H observed a window where main_len moved while change_counter did not. It is strictly better than both alternatives and shipping it is right, but it is a fingerprint, not a proof. ALSO STILL UNKNOWN AND WORTH ESTABLISHING BEFORE THE FLIP: whether a FAILING tail takes the workload down or merely logs. hydrate gates the START (proven above); the tail is armed alongside it and I did not trace what kamaji does when a tail errors mid-life. If it is fatal, a tail refusal under write pressure becomes a coordinator outage, which is this relay's whole subject. RECOMMENDED ORDER: rehearse on the DEV RAFT RIG (us-west-011/013/014), which R858-T5/T8 already stood up as a live headscale rehearsal rig writing only the `dev` prefix of this same bucket, BEFORE flipping us-south-001. That rig exists precisely so this class of question costs a dev outage instead of the mesh.")
 //! @yah:gotcha("CORRECTION TO THIS TICKET'S OWN HANDOFF, by @Ashguard:blade (session:eab3e3ec) after collecting @Miravel:eclipse's return — I asserted the mint ceremony now lives in `MintHelp` on both slots. IT DOES NOT, AND A ROTATOR WHO BELIEVES ME WILL LOOK IN THE WRONG PLACE. `mint:` is still `MintHelp::NONE` on both `cloudflare-r2-headscale-access-key-id` and `-secret-key`, and that is CORRECT rather than an omission: `exactly_the_three_ported_providers_carry_mint_help` in the fob spec suite pins MintHelp to exactly `cloudflare-api-token`, `github-pat` and `hetzner-api-token`, so populating it would have failed the suite. The field models a DASHBOARD-click mint; this credential is an API mint through the `cloudflare-legacy-yah` bearer, which is a different ceremony the type does not describe. Both scoped siblings (`cloudflare-r2-cert-store-*`, `cloudflare-r2-fleet-read-*`) are `NONE` for the same reason, so this is the file's convention and not drift. WHERE THE CEREMONY ACTUALLY IS: a code comment on the access-key-id slot, oss/yah-base/crates/keys/src/spec.rs:~876-884, carrying both permission-group ids, the resource string, the token name `yah-headscale-rw`, the S3 derivation and the corrected W295:86 citation — plus this ticket's own annotations. I misread my own grep (the `876:` / `883:` hits were `//` comment lines, not struct fields) and stated it as a field. THE REAL GAP THIS EXPOSES, worth a follow-up rather than a fix here: an API-minted credential has no structured home for its ceremony, so it survives only in prose. If a third scoped R2 pair gets minted this way, that is the point to give MintHelp an API variant instead of a fourth comment.")
-//! @yah:handoff("THE LIVE FLIP IS DONE AND THE COORDINATOR'S DATABASE IS NOW REPLICATED OFF-BOX FOR THE FIRST TIME — @Ashguard:libra (session:104814f6), 2026-09-12T07:45-07:47Z, on us-south-001 (root@45.32.194.254, the appliance owner and the only node holding headscale.db). Steps (2)(3)(4) of this ticket's own runbook, executed in its stated order. (a) /etc/yah-cloud/headscale-durability.env written 0600 root, 126 bytes, S3_ACCESS_KEY + S3_SECRET_KEY read out of the vault (`cloudflare-r2-headscale-access-key-id` / `-secret-key`) and piped over ssh stdin — never in argv, never echoed, per crates/yah/forms/src/lib.rs:238-240. (b) The two drop-ins hand-placed with contents byte-matched to control_plane_install.sh:217-231, since a roll was NOT an option (every voter runs kamaji 0.8.39-h3, ahead of the published train): /etc/systemd/system/kamaji.service.d/51-headscale-durability-cred.conf (EnvironmentFile= plus S3_ENDPOINT + S3_REGION=auto) and /etc/systemd/system/yubaba.service.d/50-headscale-durability.conf (Environment=YUBABA_HEADSCALE_DURABILITY=1). Environment=/EnvironmentFile= only, no ExecStart= edit. (c) `systemctl daemon-reload && systemctl restart kamaji yubaba` — BOTH IN ONE COMMAND, deliberately: restarting kamaji alone would have let the still-unflagged yubaba redeploy the appliance with no tier in the gap, costing a second churn. Coordinator downtime was under one second: kamaji SIGKILLed headscale pid 2864543 at 07:46:04 and forked pid 2869581 at 07:46:04.868.")
+//! @yah:handoff("THE LIVE FLIP IS DONE AND THE COORDINATOR'S DATABASE IS NOW REPLICATED OFF-BOX FOR THE FIRST TIME — @Ashguard:libra (session:104814f6), 2026-09-12T07:45-07:47Z, on us-south-001 (root@203.0.113.12, the appliance owner and the only node holding headscale.db). Steps (2)(3)(4) of this ticket's own runbook, executed in its stated order. (a) <cloud-conf-dir>/headscale-durability.env written 0600 root, 126 bytes, S3_ACCESS_KEY + S3_SECRET_KEY read out of the vault (`cloudflare-r2-headscale-access-key-id` / `-secret-key`) and piped over ssh stdin — never in argv, never echoed, per crates/yah/forms/src/lib.rs:238-240. (b) The two drop-ins hand-placed with contents byte-matched to control_plane_install.sh:217-231, since a roll was NOT an option (every voter runs kamaji 0.8.39-h3, ahead of the published train): /etc/systemd/system/kamaji.service.d/51-headscale-durability-cred.conf (EnvironmentFile= plus S3_ENDPOINT + S3_REGION=auto) and /etc/systemd/system/yubaba.service.d/50-headscale-durability.conf (Environment=YUBABA_HEADSCALE_DURABILITY=1). Environment=/EnvironmentFile= only, no ExecStart= edit. (c) `systemctl daemon-reload && systemctl restart kamaji yubaba` — BOTH IN ONE COMMAND, deliberately: restarting kamaji alone would have let the still-unflagged yubaba redeploy the appliance with no tier in the gap, costing a second churn. Coordinator downtime was under one second: kamaji SIGKILLed headscale pid 2864543 at 07:46:04 and forked pid 2869581 at 07:46:04.868.")
 //! @yah:verify("EVERY LINE MEASURED BY ME ON THE BOX OR FROM THE CAMP MAC, AFTER THE FLIP. kamaji journal: `hydrate-on-place armed`, `durability tail armed`, then `hydrate-on-place id=headscale outcome={\"outcome\":\"already_populated\"}` — the verdict this ticket's bar names, replacing the `{\"outcome\":\"error\",\"message\":\"S3_ACCESS_KEY is required\"}` that had been looping since 2026-09-11. Then `native workload forked id=headscale pid=2869581`, `durability tail started pid=2869582 tier=\"stream\"`, `{\"outcome\":\"started\",\"epoch\":1,\"tier\":\"stream\",\"subjects\":1,\"displaced\":null}`, and rounds every ~30s: first `state\":\"streamed\"` publishing a base snapshot and frames 1..=156, then `state\":\"current\"` at 07:46:37 and 07:47:08. `systemctl show kamaji.service -p Environment` names S3_ENDPOINT and S3_REGION (the secret pair arrives via EnvironmentFile, so it correctly does not appear there); `systemctl show yubaba.service -p Environment` names YUBABA_HEADSCALE_DURABILITY=1. `pgrep -a headscale` live. THE STORE, LISTED INDEPENDENTLY of the writer's own claims, via SigV4 ListObjectsV2 against the real R2 endpoint — KeyCount 5 under appliance/headscale/: snapshots/snapshot-01789199166367231206.db (94208 bytes, EXACTLY headscale.db's size on disk), frames/.../00000000000000000001-00000000000000000156 (642720 bytes), generations/gen-01789199167298279153.manifest, latest.stream-watermark, latest.owner-claim. Prefix is appliance/headscale, distinct from litestream's s3://yah-headscale/headscale as headscale_appliance.rs:251-261 requires. DOORS AND MESH: cloud.mesh.yah.dev/key?v=138 = 200 from all three doors probed independently with --resolve (west 0.22s, south 0.20s, east 0.32s) and 200 through real DNS; `tailscale status` from the camp Mac resolves the tailnet. NO refusal, no fence, no WARN on either unit since the restart.")
 //! @yah:gotcha("TWO PRE-FLIP MEASUREMENTS THAT MADE THIS SAFE RATHER THAN HOPEFUL, recorded so the next node's flip does not re-derive them. (1) THE CREDENTIAL WAS PROVEN THROUGH object_store BEFORE ANYTHING WAS ARMED, not just through hand-rolled SigV4 as at mint time: `turso-backup-hydrate` was run by hand on us-south-001 against a throwaway VOLUME_ROOT and a throwaway BACKUP_PREFIX (appliance/_r858t24-probe) with the real env file sourced, and returned `{\"outcome\":\"nothing_in_the_store\",\"epoch\":1}` exit 0. That ruled out the one failure mode that could have taken the coordinator down — hydrate erroring on credentials, which kamaji turns into a fail-closed BackendRefused. The probe's claim object was DELETED afterwards (HTTP 204, prefix re-listed to 0 keys) and /tmp/r858t24-probe removed. (2) THE \"DOES A FAILING TAIL TAKE THE WORKLOAD DOWN\" QUESTION, which this ticket's own gotcha left open and recommended a dev-rig rehearsal for, IS ANSWERED FROM THE CODE AND THE ANSWER IS NO: oss/kamaji/crates/kamaji-bin/src/tail.rs's watcher stops the workload ONLY on EXIT_FENCED (exit 2), and oss/turso-backup/src/bin/tail.rs:76-85 emits 2 solely for `Verdict::Fenced` — every other failure exits 1 and kamaji logs `durability tail exited without a fence verdict; the workload keeps running`. A fence needs a second owner taking the claim, and the prefix had none. That is why I flipped prod directly instead of rehearsing on the dev rig: for the credential question a probe with the real helper on the real node is strictly better evidence than a dev rehearsal, and for the tail question the code is dispositive.")
-//! @yah:gotcha("DURABILITY NOW EXISTS ONLY WHILE us-south-001 OWNS THE APPLIANCE, AND THAT IS A SMALLER GUARANTEE THAN IT SOUNDS — measured 2026-09-12 by @Ashguard:libra after the flip. The credential file, both drop-ins and the turso-backup helpers are on SOUTH ALONE. us-west-001 and us-east-001 have neither helper binary, no /etc/yah-cloud/headscale-durability.env and no YUBABA_HEADSCALE_DURABILITY, so if ownership moves the new owner's spec declares no tier and the coordinator comes up with NO durability — quietly, and WITHOUT fail-closing (the flag is per-node and defaults off), which is the correct safe direction but means the replica silently stops advancing. WORSE, AND THE PART THAT MATTERS FOR FAILOVER: hydrate returns AlreadyPopulated and contacts the store NOT AT ALL when every subject is already present on the volume (oss/turso-backup/src/hydrate.rs:390-401 — the readiness check precedes the claim, deliberately). us-west-001 still holds a STALE headscale.db from Sep 6, so a failover to west would serve that stale DB and would never rehydrate from the fresh R2 replica this ticket just created. The replica's value is therefore realized on a node with an EMPTY volume, which today is only us-east-001. Extending to the other two voters is real work and belongs to R858-T8's failover story, not this ticket: east's kamaji supervises FOUR live production natives (noisetable api.noisetable.com sign-in among them) and a `systemctl restart kamaji` there cgroup-kills all four, while west needs helper binaries it can only get from a roll that would downgrade its 0.8.39-h3 kamaji.")
+//! @yah:gotcha("DURABILITY NOW EXISTS ONLY WHILE us-south-001 OWNS THE APPLIANCE, AND THAT IS A SMALLER GUARANTEE THAN IT SOUNDS — measured 2026-09-12 by @Ashguard:libra after the flip. The credential file, both drop-ins and the turso-backup helpers are on SOUTH ALONE. us-west-001 and us-east-001 have neither helper binary, no <cloud-conf-dir>/headscale-durability.env and no YUBABA_HEADSCALE_DURABILITY, so if ownership moves the new owner's spec declares no tier and the coordinator comes up with NO durability — quietly, and WITHOUT fail-closing (the flag is per-node and defaults off), which is the correct safe direction but means the replica silently stops advancing. WORSE, AND THE PART THAT MATTERS FOR FAILOVER: hydrate returns AlreadyPopulated and contacts the store NOT AT ALL when every subject is already present on the volume (oss/turso-backup/src/hydrate.rs:390-401 — the readiness check precedes the claim, deliberately). us-west-001 still holds a STALE headscale.db from Sep 6, so a failover to west would serve that stale DB and would never rehydrate from the fresh R2 replica this ticket just created. The replica's value is therefore realized on a node with an EMPTY volume, which today is only us-east-001. Extending to the other two voters is real work and belongs to R858-T8's failover story, not this ticket: east's kamaji supervises FOUR live production natives (noisetable api.noisetable.com sign-in among them) and a `systemctl restart kamaji` there cgroup-kills all four, while west needs helper binaries it can only get from a roll that would downgrade its 0.8.39-h3 kamaji.")
 //! @yah:gotcha("THE SCOPED PAIR IS VISIBLE TO EVERY NATIVE WORKLOAD kamaji FORKS ON THAT NODE — established by reading oss/kamaji/crates/kamaji/src/native.rs:635 (`NOTE: no env_clear(), and that is load-bearing in two directions`, pinned by the test at :2387 asserting a native child MUST inherit the daemon environment). hydrate.rs:188-191 delivers credentials by inheritance from kamaji's own env by design, so an EnvironmentFile on kamaji.service is inherited by every workload it forks. On us-south-001 that is only headscale today, so the exposure is nil in practice. IT IS NOT NIL ON us-east-001, where the same drop-in would hand noisetable and the three yah-marketing natives write credentials for the yah-headscale bucket. This is exactly why the scoping was worth the mint: the blast radius is one bucket that holds only the coordinator's own replica, and the measured 403s on yah-dev mean none of those workloads could touch the public release index. Weigh it before extending the drop-in to a node that runs tenant workloads.")
+//!
+//! @yah:relay(R972, "Vault inventory: live vault slots with no CredentialSpec")
+//! @yah:at(2026-10-10T23:47:02Z)
+//! @yah:next("`cloudflare-door-dns`: vault slot `cloudflare-door-dns` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`cloudflare-mesofact-static-r131`: vault slot `cloudflare-mesofact-static-r131` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`cloudflare-r2-account-backup-access-key-id`: vault slot `cloudflare-r2-account-backup-access-key-id` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`cloudflare-r2-account-backup-secret-key`: vault slot `cloudflare-r2-account-backup-secret-key` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`cloudflare-r2-endpoint`: vault slot `cloudflare-r2-endpoint` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`cloudflare-tunnel-staging`: vault slot `cloudflare-tunnel-staging` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`cloudflare-tunnel-token-staging`: vault slot `cloudflare-tunnel-token-staging` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`headscale-noise-private-key`: vault slot `headscale-noise-private-key` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-account-staging-magic-link-key`: vault slot `noisetable-account-staging-magic-link-key` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-account-staging-session-key`: vault slot `noisetable-account-staging-session-key` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-core-api-token`: vault slot `noisetable-core-api-token` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-core-api-token-staging`: vault slot `noisetable-core-api-token-staging` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-developer-id-installer-p12`: vault slot `noisetable-developer-id-installer-p12` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-developer-id-installer-p12-password`: vault slot `noisetable-developer-id-installer-p12-password` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-developer-id-p12`: vault slot `noisetable-developer-id-p12` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-developer-id-p12-password`: vault slot `noisetable-developer-id-p12-password` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-developer-id-provisionprofile`: vault slot `noisetable-developer-id-provisionprofile` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-issue-skill-service-credential`: vault slot `noisetable-issue-skill-service-credential` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-jev-api-key`: vault slot `noisetable-jev-api-key` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-marketing-revalidate-api-token`: vault slot `noisetable-marketing-revalidate-api-token` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-marketing-revalidate-r2-access-key-id`: vault slot `noisetable-marketing-revalidate-r2-access-key-id` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`noisetable-marketing-revalidate-r2-secret-key`: vault slot `noisetable-marketing-revalidate-r2-secret-key` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`ovh-app`: vault slot `ovh-app` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`ovh-key`: vault slot `ovh-key` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`ovh-secret`: vault slot `ovh-secret` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`passway-acme-noisetable-dns`: vault slot `passway-acme-noisetable-dns` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`vultr-api-key`: vault slot `vultr-api-key` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`yah-marketing-mirror-key`: vault slot `yah-marketing-mirror-key` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("`yubaba-operator-yah-cloud-admin`: vault slot `yubaba-operator-yah-cloud-admin` has no CredentialSpec in fob::CREDENTIAL_SPECS — add an entry (purpose, consumers, provider) or, if nothing reads it, retire the slot")
+//! @yah:next("Found by `yah keys inventory` (R856-F13). Fix the registry entry or the citation; retiring the slot itself is an operator call — the check-in never deletes.")
+//! @arch:see(.yah/docs/working/W337-credential-health-and-rotation.md)
+//! @yah:next("`noisetable-samples-seed-access-key-id`: vault slot has no CredentialSpec in fob::CREDENTIAL_SPECS. Add an entry: R2 S3 access key id, provider cloudflare (minted 2026-10-17 via `yah cloud cf token create --profile r2-bucket`, expires 2027-10-17), Object Read+Write on bucket noisetable-assets only; consumer: noisetable's `nt-publish --seed-cas-only` (XLB_R2_ACCESS_KEY_ID), declared as the [[r2_bucket]] noisetable-assets row in noisetable .yah/infra/providers/cloudflare.toml. Filed from the noisetable camp (Ashguard, session:9393c66c).")
+//! @yah:next("`noisetable-samples-seed-secret-key`: vault slot has no CredentialSpec in fob::CREDENTIAL_SPECS. The secret half of the pair above: same provider, expiry, scope and consumer (XLB_R2_SECRET_ACCESS_KEY).")
+//!
+//! @yah:relay(R973, "Vault inventory: consumer citations that no longer name their slot")
+//! @yah:at(2026-10-10T23:47:30Z)
+//! @yah:next("`cheers-vend-verify-key`: consumer citation `app/yah/cli/src/cloud_secret.rs`: `app/yah/cli/src/cloud_secret.rs` exists but names none of `cheers-vend-verify-key`")
+//! @yah:next("`cloudflare-r2-access-key-id`: consumer citation `oss/qed/crates/scryer/src/long_tier.rs`: `oss/qed/crates/scryer/src/long_tier.rs` exists but names none of `cloudflare-r2-access-key-id`, `CF_R2_ACCESS_KEY_ID`")
+//! @yah:next("`cloudflare-r2-cert-store-access-key-id`: consumer citation `.yah/infra/machines/us-east-001.toml (bucket + account id recorded)`: `.yah/infra/machines/us-east-001.toml` exists but names none of `cloudflare-r2-cert-store-access-key-id`, `CF_R2_ACCESS_KEY_ID`")
+//! @yah:next("`cloudflare-r2-fleet-read-access-key-id`: consumer citation `.yah/almanac/fleet.toml:60`: `.yah/almanac/fleet.toml` exists but names none of `cloudflare-r2-fleet-read-access-key-id`")
+//! @yah:next("`cloudflare-r2-fleet-read-secret-key`: consumer citation `.yah/almanac/fleet.toml:60`: `.yah/almanac/fleet.toml` exists but names none of `cloudflare-r2-fleet-read-secret-key`")
+//! @yah:next("`cloudflare-r2-secret-key`: consumer citation `oss/qed/crates/scryer/src/long_tier.rs`: `oss/qed/crates/scryer/src/long_tier.rs` exists but names none of `cloudflare-r2-secret-key`, `CF_R2_SECRET_KEY`")
+//! @yah:next("`headscale-preauth-key`: consumer citation `oss/yubaba/crates/cloud/src/lib.rs`: `oss/yubaba/crates/cloud/src/lib.rs` exists but names none of `headscale-preauth-key`, `HEADSCALE_PREAUTH_KEY`")
+//! @yah:next("`mesh-coordinator-machine`: consumer citation `oss/yubaba/crates/cloud/src/lib.rs`: `oss/yubaba/crates/cloud/src/lib.rs` exists but names none of `mesh-coordinator-machine`, `YAH_MESH_COORDINATOR_MACHINE`")
+//! @yah:next("`mesh-coordinator-type`: consumer citation `oss/yubaba/crates/cloud/src/lib.rs`: `oss/yubaba/crates/cloud/src/lib.rs` exists but names none of `mesh-coordinator-type`, `YAH_MESH_COORDINATOR_TYPE`")
+//! @yah:next("`tauri-signing-key`: consumer citation `oss/qed/crates/qed-gha/src/image_builder.rs:53`: `oss/qed/crates/qed-gha/src/image_builder.rs` exists but names none of `tauri-signing-key`, `TAURI_SIGNING_PRIVATE_KEY`")
+//! @yah:next("`tauri-signing-key-pw`: consumer citation `oss/qed/crates/qed-gha/src/image_builder.rs:53`: `oss/qed/crates/qed-gha/src/image_builder.rs` exists but names none of `tauri-signing-key-pw`")
+//! @yah:next("Found by `yah keys inventory` (R856-F13). Fix the registry entry or the citation; retiring the slot itself is an operator call — the check-in never deletes.")
+//! @arch:see(.yah/docs/working/W337-credential-health-and-rotation.md)
+//!
+//! @yah:relay(R974, "Vault inventory: specs with no surviving consumer (retirement candidates)")
+//! @yah:at(2026-10-10T23:48:05Z)
+//! @yah:next("`cloudflare-r2-yah-dev-access-key-id`: no consumer citation for `cloudflare-r2-yah-dev-access-key-id` survives in the tree — either the registry lost track of who reads it, or nothing does and it is a retirement candidate (operator call: `yah keys delete` is not recoverable)")
+//! @yah:next("`cloudflare-r2-yah-dev-secret-key`: no consumer citation for `cloudflare-r2-yah-dev-secret-key` survives in the tree — either the registry lost track of who reads it, or nothing does and it is a retirement candidate (operator call: `yah keys delete` is not recoverable)")
+//! @yah:next("`cloudflare-static-yah-dev`: no consumer citation for `cloudflare-static-yah-dev` survives in the tree — either the registry lost track of who reads it, or nothing does and it is a retirement candidate (operator call: `yah keys delete` is not recoverable)")
+//! @yah:next("`cloudflare-tunnel-token-mesh`: no consumer citation for `cloudflare-tunnel-token-mesh` survives in the tree — either the registry lost track of who reads it, or nothing does and it is a retirement candidate (operator call: `yah keys delete` is not recoverable)")
+//! @yah:next("`exe-dev-api-token`: no consumer citation for `exe-dev-api-token` survives in the tree — either the registry lost track of who reads it, or nothing does and it is a retirement candidate (operator call: `yah keys delete` is not recoverable)")
+//! @yah:next("`mailgun-api-key`: no consumer citation for `mailgun-api-key` survives in the tree — either the registry lost track of who reads it, or nothing does and it is a retirement candidate (operator call: `yah keys delete` is not recoverable)")
+//! @yah:next("`noisetable-account-magic-link-key`: no consumer citation for `noisetable-account-magic-link-key` survives in the tree — either the registry lost track of who reads it, or nothing does and it is a retirement candidate (operator call: `yah keys delete` is not recoverable)")
+//! @yah:next("`noisetable-account-session-key`: no consumer citation for `noisetable-account-session-key` survives in the tree — either the registry lost track of who reads it, or nothing does and it is a retirement candidate (operator call: `yah keys delete` is not recoverable)")
+//! @yah:next("`noisetable-account-smtp-password`: no consumer citation for `noisetable-account-smtp-password` survives in the tree — either the registry lost track of who reads it, or nothing does and it is a retirement candidate (operator call: `yah keys delete` is not recoverable)")
+//! @yah:next("`noisetable-play-upload-keystore`: no consumer citation for `noisetable-play-upload-keystore` survives in the tree — either the registry lost track of who reads it, or nothing does and it is a retirement candidate (operator call: `yah keys delete` is not recoverable)")
+//! @yah:next("`noisetable-play-upload-keystore-password`: no consumer citation for `noisetable-play-upload-keystore-password` survives in the tree — either the registry lost track of who reads it, or nothing does and it is a retirement candidate (operator call: `yah keys delete` is not recoverable)")
+//! @yah:next("`tauri-signing-key-pw`: no consumer citation for `tauri-signing-key-pw` survives in the tree — either the registry lost track of who reads it, or nothing does and it is a retirement candidate (operator call: `yah keys delete` is not recoverable)")
+//! @yah:next("Found by `yah keys inventory` (R856-F13). Fix the registry entry or the citation; retiring the slot itself is an operator call — the check-in never deletes.")
+//! @arch:see(.yah/docs/working/W337-credential-health-and-rotation.md)
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -262,6 +331,37 @@ impl ExpiryKind {
 ///
 /// `Workload` carries `&'static str` rather than W337's `String` because the
 /// registry is a `const`; the information is identical.
+///
+/// @yah:ticket(R979-F14, "Mode-A credential gate: probe the node's Claude credential on that node in the spawn's exact environment, with a verdict record keyed by (credential, node)")
+/// @yah:status(review)
+/// @yah:at(2026-10-13T19:49:41Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:phase(P4)
+/// @yah:parent(R979)
+/// @yah:next("Tier: Cleric.")
+/// @yah:next("W365 section 3 'The gate' plus section 7 item 9. Mode A is offered for a node iff a probe run ON that node, in the environment a spawn would get, returns Verdict::Valid. Every other verdict (Revoked, Expired, ScopeInsufficient, QuotaExhausted, Indeterminate) renders the node B-only, with the verdict text on the puck. Fail-closed to B is safe because B works on every eligible node.")
+/// @yah:next("W337 as shipped (R856-F1) does not fit in two places, so extend it rather than wrap it: (i) the health sidecar holds one record per vault slot, but the node's Claude credential is not a vault slot, so add a record keyed by (credential, node) beside the per-slot one; (ii) CredentialSpec.probe_from is a static vantage (ProbeFrom::Local | Workload(&'static str) | ...), so it needs a per-node vantage.")
+/// @yah:next("Re-probe on each courier spawn when the cached verdict is older than a short TTL. Use the cheapest authenticated call the credential admits (W337 tier 1); a probe that spends a model turn needs a longer TTL (W365 open question 4).")
+/// @yah:verify("The wheel reads the verdict from the plain-file sidecar without decrypting anything.")
+/// @yah:gotcha("W329 ENVIRONMENT TRAP: an empty ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN, or a set ANTHROPIC_PROFILE, outranks federated identity. A probe run in a cleaner environment than the spawn's passes while the spawn fails, so build the probe's environment with the same code path the headless spawn uses (R833-F11/F16).")
+/// @yah:depends_on(R979-F4)
+/// @yah:files(oss/yah-base/crates/keys/src/spec.rs)
+/// @yah:files(oss/yah-base/crates/keys/src/lib.rs)
+/// @yah:handoff("LANDED (Ashguard:libra, 2026-10-13). keys (oss/yah-base/crates/keys/src/spec.rs + lib.rs): ProbeFrom gained a Node variant, with the node supplied at probe time. The new const CLAUDE_NODE_LOGIN is a CredentialSpec with probe_from Node; it is deliberately kept out of CREDENTIAL_SPECS so the vault sweep and inventory never see it. NodeHealthRecord{credential,node,last_probe_at,verdict,probe_error} is keyed 'credential@node' in the new HealthSidecar.nodes map, in the same plain 0644 credential-health.json beside the per-slot records, with get_node/upsert_node. Also added: trait NodeProbeRunner (run_probe(spec,node) -> Result<ProbeRun,String>), classify_claude_probe (fail-closed: a completed turn is Valid; 401 or 'not logged in'/'invalid api key' is Revoked; 403 is ScopeInsufficient; 429+limit is QuotaExhausted; anything else is Indeterminate), CLAUDE_NODE_PROBE_TTL_SECS=3600, and KeysStore::node_gate(runner,node,now,ttl), which reuses a fresh record or re-probes and records the result.")
+/// @yah:handoff("pv (oss/runner/crates/pv/src/spawn.rs): spawn_claude's cwd+claude_spawn_envs+prepare_command are factored into apply_spawn_env, and the new claude_probe_command(spec,host) goes through the same helper. The probe is therefore built by the spawn's own env path, which addresses the W329 trap. Desktop (app/yah/desktop/src/agent_process.rs): CampClaudeProbe implements fob::NodeProbeRunner with the same CampPvHost a courier spawn gets (job courier, sccache build_env, disclaim prepare_command). It refuses to probe any node other than local_node.")
+/// @yah:handoff("PROBE COST, measured on claude-cli 2.1.296: `claude auth status` reports logged-in even with ANTHROPIC_API_KEY=sk-ant-bogus, so it is blind to the trap. The probe is therefore a one-turn `claude -p ok --model haiku --max-turns 1 --output-format json` and uses a 60-minute TTL; this is written into W365 open question 4. Separate observation: on this claude version an EMPTY ANTHROPIC_API_KEY did NOT break the Mac's login (turn completed), while a bogus non-empty key returned is_error with api_error_status 401. The probe measures whatever the installed claude does.")
+/// @yah:handoff("LIVE VERIFY SET ASIDE: us-west-003 has no claude binary (`ssh -i ~/.ssh/yah yah@192.168.250.32 'bash -lc claude --version'` -> command not found). us-west-002 was not touched. NOT WIRED: nothing calls node_gate on courier spawn or renders the verdict on the puck yet. That is the placement/spawn consumer's job.")
+/// @yah:verify("cargo test --manifest-path oss/yah-base/Cargo.toml -p fob --lib -> 66 passed, 0 failed (baseline 64/0; +node_gate_keys_the_verdict_by_credential_and_node_and_caches_within_ttl, +claude_probe_classification_fails_closed)")
+/// @yah:verify("cargo test --manifest-path oss/runner/Cargo.toml -p yah-runner-pv --lib -> 96 passed, 0 failed (+probe_command_carries_the_spawn_env; no pre-change pv baseline was taken)")
+/// @yah:verify("cargo check -p desktop --lib -> EXIT 0 (skew advisory named peers' app/yah/cli files only)")
+/// @yah:verify("Live: NOT RUN - no node has claude installed (us-west-003 checked)")
+/// @yah:verify("LIVE (2026-10-13, this Mac, claude-cli 2.1.296): the ignored test agent_process::tests::r979_f14_live_gate_on_this_machine (cargo test -p desktop --lib r979_f14_live -- --ignored --nocapture -> 1 passed; log /tmp/f14-live-e2.log) ran CampClaudeProbe through KeysStore::node_gate into a temp store. (a) as-is: Valid, record 'claude-node-login@local-mac'. (b) ANTHROPIC_API_KEY='' set in the process env that the spawn builder inherits: ALSO Valid, record 'claude-node-login@local-mac-empty-key'. Both records were read back via read_health from the plain credential-health.json, with no credentials.enc present. EXPECTED FLIP DID NOT OCCUR: on this claude version an empty ANTHROPIC_API_KEY does not outrank the claude.ai login, so the premise of the W329 trap does not reproduce here. This matches the earlier shell measurement in the handoff. Not tested through CampClaudeProbe: a NON-empty bogus key. From a plain shell that gave is_error + api_error_status 401, which classify_claude_probe maps to Revoked. The empty-AUTH_TOKEN and ANTHROPIC_PROFILE variants were not run through the probe either.")
+/// @yah:verify("FLEET (read-only, ssh -i ~/.ssh/yah, us-west-002 skipped): no claude binary on us-east-001, us-south-001, us-west-001, -003, -011, -013, -014, -015, -111, -112 or -113. us-west-141/142/143 (100.64.0.6/.12/.16) timed out on port 22. Nothing was installed and nothing was logged in.")
+/// @yah:verify("On a node with a valid claude login, the verdict is Valid and the record is keyed to that node; inject a bogus non-empty ANTHROPIC_API_KEY into the env the spawn builder receives and the verdict flips to non-Valid (Revoked), under its own node key.")
+/// @yah:verify("LIVE (c)/(d) 2026-10-13, this Mac, claude-cli 2.1.296. Command: cargo test -p desktop --lib r979_f14_live -- --ignored --nocapture -> 1 passed (log /tmp/f14-live-g1.log). (c) ANTHROPIC_API_KEY=sk-ant-bogus-r979-f14 -> Revoked, record claude-node-login@local-mac-bogus-key; the test asserts it is non-Valid. (d) ANTHROPIC_PROFILE=r979-f14-no-such-profile -> Valid, record claude-node-login@local-mac-bad-profile. All four records (a, b, c, d) are present in the plain credential-health.json. The finding is written into W365 section 3 and W329's env-trap paragraph, dated and versioned. Caveat: a skew advisory listed agent_process.rs as modified mid-build, almost certainly a peer hunk; the printed C/D lines show my test code ran.")
+/// @yah:handoff("LEADER SIGN-OFF REQUEST (@Ashguard:dragon, 2026-10-13). The mode-A credential gate lives in keys (crate fob, oss/yah-base) and pv. Verdict records are keyed by (credential, node) in the plain-file sidecar, and there is a new ProbeFrom::Node vantage. The probe env is built through spawn_claude's own path (pv spawn.rs::claude_spawn_envs) and run by the desktop CampClaudeProbe. Each probe costs one claude turn, so the TTL is 60 min; `claude auth status` cannot see a bad key, as recorded in W365 OQ4. Live on this mac with claude 2.1.296: normal env -> Valid; empty ANTHROPIC_API_KEY -> Valid; bogus key -> Revoked; nonexistent ANTHROPIC_PROFILE -> Valid. So the empty-key and profile traps from W329 do not reproduce on this version, and that finding is now in W365 section 3 and W329, dated and versioned. The gate catches real env-level failures because it probes through the spawn env. Spawn-time wiring (calling node_gate before a mode-A spawn) is owned by R979-F15; its next was updated. No fleet node has a claude binary: 11 nodes checked, and us-west-141/142/143 timed out. Git policy is defer, so nothing was committed.")
+/// @yah:verify("Independent re-run by @Miravel:griffin (session:fbe5c98a), 2026-10-13: fob --lib 66/0 (baseline 64/0); yah-runner-pv --lib 96/0; cargo check -p desktop --lib EXIT=0. ProbeFrom::Node is present (2 non-comment sites), and the 2.1.296 finding appears in W365+W329 (3 sites). Live probe test r979_f14_live_gate_on_this_machine is #[ignore] (needs a claude login) and was run by the courier: 1/0.")
+/// @yah:gotcha("OPERATOR DECISION 2026-10-13 (W365 §0 decision 1, amended): mode B is primary, and claude-cli mode A waits on R979's login-propagation spike. Until that spike passes, the claude-cli half of this ticket (CLAUDE_NODE_LOGIN, CampClaudeProbe, the one-turn probe) has no consumer. The general half carries over: ProbeFrom::Node, NodeHealthRecord keyed by (credential, node), and KeysStore::node_gate. It is what R979-F15 uses for HTTP-token backends, with a cheap tier-1 probe in place of a model turn. Sign this off for that general half. Do not wire the claude probe into spawns.")
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProbeFrom {
@@ -280,6 +380,12 @@ pub enum ProbeFrom {
     /// act on it anyway (it cannot read the allowlist without first
     /// authenticating past it).
     AllowlistedNetwork,
+    /// Only a probe run *on the node that will use it*, in the environment a
+    /// spawn there would get, can answer (W365 §3). The node is not part of
+    /// the spec — one spec covers every node — so it is supplied at probe time
+    /// and becomes half of the verdict's key ([`NodeHealthRecord`]). A local
+    /// probe of one of these answers nothing about any other node.
+    Node,
 }
 
 /// Whether the provider permits two of this credential to be live at once
@@ -405,6 +511,20 @@ pub struct CredentialSpec {
     pub required: bool,
     /// 1Password item that holds the authoritative copy, where one exists.
     pub onepassword: Option<&'static str>,
+    /// Whether this slot travels with the camp or stays on the host (W374 §7).
+    pub scope: Scope,
+}
+
+/// Where a slot's value lives (W374 §7). `Host` is the default and what every
+/// existing slot is: the value stays in this host's `credentials.enc` and is
+/// never exported to the camp vault. `Camp` slots are the only ones
+/// `KeysStore::export_camp_map` seals for the other devices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    #[default]
+    Host,
+    Camp,
 }
 
 impl CredentialSpec {
@@ -533,7 +653,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         purpose: "Anthropic ADMIN API key for the organization usage/cost endpoints, distinct \
                   from the completion key. Read only by `fetch_usage`; a missing one degrades \
                   usage reporting and nothing else",
-        consumers: &["crates/yah/runner/src/resolver/anthropic.rs:114 (fetch_usage)"],
+        consumers: &["oss/runner/crates/core/src/resolver/anthropic.rs (fetch_usage)"],
         provider: Provider::Anthropic,
         domain: Domain::Model,
         band: Band::Manual,
@@ -545,6 +665,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "anthropic-api-key",
@@ -553,7 +674,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
                   through the subscription rail, not a raw API key — but the desktop, the UI \
                   provider panel and the party connection registry all manage the slot",
         consumers: &[
-            "crates/yah/runner/src/resolver/mod.rs:1122 (ANTHROPIC_SLOT)",
+            "oss/runner/crates/core/src/resolver/mod.rs (ANTHROPIC_SLOT)",
             "app/yah/desktop/src/onboarding.rs:43",
             "crates/yah/party/src/party.rs:5981",
         ],
@@ -568,6 +689,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "anthropic-oauth",
@@ -575,7 +697,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         purpose: "Anthropic OAuth bearer token backing the subscription rail. Automatable in the \
                   same sense as `openai-oauth`: the refresh half re-mints it without a human",
         consumers: &[
-            "crates/yah/runner/src/resolver/mod.rs:1125 (ANTHROPIC_OAUTH_SLOT)",
+            "oss/runner/crates/core/src/resolver/mod.rs (ANTHROPIC_OAUTH_SLOT)",
             "app/yah/desktop/src/api_keys.rs:630",
         ],
         provider: Provider::Anthropic,
@@ -589,13 +711,34 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
+    },
+    CredentialSpec {
+        slot: "camp-vault-wrap",
+        env: None,
+        purpose: "this device's X25519 camp-vault wrap secret (W374 §3, hex). Generated on \
+                  first use and never exported: the camp vault wraps VK to its public half. \
+                  Deliberately not the mshr Ed25519 NodeId key",
+        consumers: &["oss/yah-base/crates/keys/src/wrap.rs", "crates/yah/camp-service/src/enrollment.rs"],
+        provider: Provider::Yah,
+        domain: Domain::Infra,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::ReviewBy,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cheers-cloud-admin-verify-key",
         env: None,
         purpose: "cheers issuer PUBLIC verify key, shipped to the yah-cloud-admin workload over \
-                  the W294 secret rail so it can validate session JWTs without calling back to \
-                  the issuer",
+                  the W294 secret rail so it can validate session tokens (PASETO v4.public) without calling back \
+                  to the issuer",
         consumers: &[
             "app/yah/cli/src/cloud_cheers.rs (VERIFY_SLOT_DEFAULT)",
             "app/yah/cli/src/cloud_secret.rs",
@@ -612,11 +755,55 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
+    },
+    CredentialSpec {
+        slot: "cheers-git-signing-key",
+        env: None,
+        purpose: "cheers git signing key — mints the PASETO v4.public push/fetch tokens (aud \
+                  fleet-git/<repo>, scopes git:read / git:write) the fleet git remote accepts \
+                  (W363 §5, R971-F7). Its own key so the git server's verify half cannot \
+                  accept another consumer class's tokens",
+        consumers: &["app/yah/cli/src/cloud_cheers.rs (GIT_SIGNING_SLOT)"],
+        provider: Provider::Yah,
+        domain: Domain::Service,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::ReviewBy,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+        scope: Scope::Host,
+    },
+    CredentialSpec {
+        slot: "cheers-git-verify-key",
+        env: None,
+        purpose: "cheers git PUBLIC verify key, shipped over the W294 secret rail to the \
+                  fleet-git workload so it can verify push/fetch tokens offline",
+        consumers: &[
+            "app/yah/cli/src/cloud_cheers.rs (GIT_VERIFY_SLOT_DEFAULT)",
+            ".yah/infra/secrets/cheers-fleet-git-verify-key.toml",
+        ],
+        provider: Provider::Yah,
+        domain: Domain::Infra,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::ReviewBy,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cheers-issuer-iss",
         env: None,
-        purpose: "the `iss` claim string the cheers issuer stamps on session JWTs — \
+        purpose: "the `iss` claim string the cheers issuer stamps on session PASETOs — \
                   configuration, not a secret",
         consumers: &["app/yah/cli/src/cloud_cheers.rs (ISS_SLOT)"],
         provider: Provider::Yah,
@@ -630,11 +817,12 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cheers-issuer-signing-key",
         env: None,
-        purpose: "cheers issuer signing key — mints the session JWTs yah-cloud-admin accepts",
+        purpose: "cheers issuer signing key — mints the PASETO v4.public session tokens yah-cloud-admin accepts",
         consumers: &["app/yah/cli/src/cloud_cheers.rs (SIGNING_SLOT)"],
         provider: Provider::Yah,
         domain: Domain::Service,
@@ -647,6 +835,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cheers-vend-signing-key",
@@ -667,6 +856,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cheers-vend-verify-key",
@@ -689,6 +879,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-api-token",
@@ -720,6 +911,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-legacy-yah",
@@ -747,6 +939,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-mesofact-static",
@@ -773,6 +966,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-r2-access-key-id",
@@ -802,6 +996,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-r2-cert-store-access-key-id",
@@ -835,6 +1030,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-r2-cert-store-secret-key",
@@ -854,6 +1050,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-r2-fleet-read-access-key-id",
@@ -876,6 +1073,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-r2-fleet-read-secret-key",
@@ -897,6 +1095,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         // R858-T24. Scoped to the `yah-headscale` bucket alone (a CF token with
@@ -950,9 +1149,9 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         // W295-fleet-def-as-almanac-release.md:86 (NOT :145 as earlier passes on
         // this ticket recorded) byte-for-byte — the cross-check that this
         // endpoint returns the same namespace W295's read-pair ceremony used.
-        // Minted via `POST /client/v4/accounts/3948dc292e724e71b0deefde0ea95999/tokens`,
+        // Minted via `POST /client/v4/accounts/0123456789abcdef0123456789abcdef/tokens`,
         // name `yah-headscale-rw`, both groups on ONE policy, resource
-        // `com.cloudflare.edge.r2.bucket.3948dc292e724e71b0deefde0ea95999_default_yah-headscale`.
+        // `com.cloudflare.edge.r2.bucket.0123456789abcdef0123456789abcdef_default_yah-headscale`.
         // S3 derivation (empirically verified by signing real SigV4 requests):
         // access key id = the token's own id (32 chars); secret access key =
         // SHA-256 of the token's VALUE (64 hex) — never the id itself.
@@ -972,6 +1171,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-r2-headscale-secret-key",
@@ -996,6 +1196,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-r2-secret-key",
@@ -1020,6 +1221,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-r2-yah-dev-access-key-id",
@@ -1057,6 +1259,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-r2-yah-dev-secret-key",
@@ -1077,6 +1280,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-static-yah-dev",
@@ -1101,6 +1305,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-tunnel-token",
@@ -1123,6 +1328,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: Some("Cloudflare Tunnel — yah-cloud"),
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-tunnel-token-mesh",
@@ -1142,6 +1348,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cloudflare-zone-id",
@@ -1163,6 +1370,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "cluster-kek",
@@ -1182,6 +1390,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "crates-io-token",
@@ -1211,13 +1420,14 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "deepseek-api-key",
         env: Some("DEEPSEEK_API_KEY"),
         purpose: "DeepSeek API key — Bearer auth on both the OpenAI-wire and Anthropic-wire \
                   endpoints",
-        consumers: &["crates/yah/runner/src/resolver/mod.rs:1151 (DEEPSEEK_SLOT)"],
+        consumers: &["oss/runner/crates/core/src/resolver/mod.rs (DEEPSEEK_SLOT)"],
         provider: Provider::DeepSeek,
         domain: Domain::Model,
         band: Band::Manual,
@@ -1229,6 +1439,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "digitalocean-api-token",
@@ -1247,6 +1458,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "docker-hub-token",
@@ -1265,6 +1477,32 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
+    },
+    CredentialSpec {
+        slot: "env-fingerprint-key",
+        env: None,
+        purpose: "root of the per-mirror keys bundle workloads fingerprint their environment \
+                  under, so `yah cloud mirror status <service> --env <env>` can tell a deployed \
+                  credential from the vault's current one without either crossing the wire \
+                  (R866). Minted by the first `yah cloud apply` that needs it; replacing it \
+                  makes every deployed fingerprint read as drift until the next apply",
+        consumers: &[
+            "app/yah/cli/src/cloud.rs (env_fingerprint_root)",
+            "oss/yubaba/crates/cloud/src/env_fingerprint.rs (ROOT_SLOT)",
+        ],
+        provider: Provider::Yah,
+        domain: Domain::Infra,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::ReviewBy,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "exe-dev-api-token",
@@ -1284,6 +1522,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "github-pat",
@@ -1331,12 +1570,13 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &["write:packages"],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "groq-api-key",
         env: Some("GROQ_API_KEY"),
         purpose: "Groq API key",
-        consumers: &["crates/yah/runner/src/resolver/mod.rs:1145 (GROQ_SLOT)"],
+        consumers: &["oss/runner/crates/core/src/resolver/mod.rs (GROQ_SLOT)"],
         provider: Provider::Groq,
         domain: Domain::Model,
         band: Band::Manual,
@@ -1348,6 +1588,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "headscale-api-key",
@@ -1372,6 +1613,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: Some("Headscale API — yah-cloud"),
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "headscale-preauth-key",
@@ -1394,6 +1636,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: Some("Headscale preauth — yah-cloud"),
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "hetzner-api-token",
@@ -1423,6 +1666,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: true,
         onepassword: Some("Hetzner Cloud API — yah-cloud"),
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "hetzner-s3-access-key",
@@ -1442,6 +1686,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: Some("Hetzner Object Storage — yah-cloud"),
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "hetzner-s3-secret-key",
@@ -1460,12 +1705,13 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: Some("Hetzner Object Storage — yah-cloud"),
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "kimi-platform-api-key",
         env: Some("MOONSHOT_API_KEY"),
         purpose: "Moonshot (Kimi) platform API key — Bearer auth on the Anthropic-wire endpoint",
-        consumers: &["crates/yah/runner/src/resolver/mod.rs:1156 (KIMI_SLOT)"],
+        consumers: &["oss/runner/crates/core/src/resolver/mod.rs (KIMI_SLOT)"],
         provider: Provider::Moonshot,
         domain: Domain::Model,
         band: Band::Manual,
@@ -1477,6 +1723,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "mailgun-api-key",
@@ -1495,6 +1742,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "mesh-coordinator-machine",
@@ -1517,6 +1765,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "mesh-coordinator-type",
@@ -1538,6 +1787,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "mesh-url",
@@ -1560,6 +1810,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         // R965-F3: the first pair minted by `yah cloud cf token create
@@ -1587,6 +1838,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "noisetable-account-assets-secret-key",
@@ -1605,6 +1857,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "noisetable-account-magic-link-key",
@@ -1624,6 +1877,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "noisetable-account-session-key",
@@ -1642,6 +1896,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "noisetable-account-smtp-password",
@@ -1663,6 +1918,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     // R929-F3: store publishing (W356). Each of these is `<name> @
     // tenant:noisetable` in W345's model, spelled as the flat prefixed slot
@@ -1690,6 +1946,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "noisetable-asc-key-id",
@@ -1708,6 +1965,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "noisetable-asc-p8",
@@ -1728,6 +1986,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "noisetable-play-publisher-sa-key",
@@ -1751,6 +2010,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "noisetable-play-upload-keystore",
@@ -1770,6 +2030,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "noisetable-play-upload-keystore-password",
@@ -1788,6 +2049,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "npm-api-token",
@@ -1826,13 +2088,14 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &["package:write", "scope:org:mesofact"],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "ollama",
         env: Some("OLLAMA_API_KEY"),
         purpose: "Ollama API key (ollama-cloud endpoints; the local endpoint needs none). Slot \
                   name is bare `ollama`, not `ollama-api-key`",
-        consumers: &["crates/yah/runner/src/resolver/mod.rs:1139 (OLLAMA_SLOT)"],
+        consumers: &["oss/runner/crates/core/src/resolver/mod.rs (OLLAMA_SLOT)"],
         provider: Provider::Ollama,
         domain: Domain::Model,
         band: Band::Manual,
@@ -1844,6 +2107,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "openai-admin-key",
@@ -1851,7 +2115,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         purpose: "OpenAI ADMIN API key for the usage/billing endpoints, distinct from the \
                   completion key. Read only by `fetch_usage`; a missing one degrades usage \
                   reporting and nothing else",
-        consumers: &["crates/yah/runner/src/resolver/openai.rs:85 (fetch_usage)"],
+        consumers: &["oss/runner/crates/core/src/resolver/openai.rs (fetch_usage)"],
         provider: Provider::OpenAi,
         domain: Domain::Model,
         band: Band::Manual,
@@ -1863,12 +2127,13 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "openai-api-key",
         env: Some("OPENAI_API_KEY"),
         purpose: "OpenAI completion API key",
-        consumers: &["crates/yah/runner/src/resolver/mod.rs:1132 (OPENAI_SLOT)"],
+        consumers: &["oss/runner/crates/core/src/resolver/mod.rs (OPENAI_SLOT)"],
         provider: Provider::OpenAi,
         domain: Domain::Model,
         band: Band::Manual,
@@ -1880,6 +2145,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "openai-oauth",
@@ -1902,14 +2168,15 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "openrouter-api-key",
         env: Some("OPENROUTER_API_KEY"),
         purpose: "OpenRouter API key; also backs the /credits usage read",
         consumers: &[
-            "crates/yah/runner/src/resolver/mod.rs:1142 (OPENROUTER_SLOT)",
-            "crates/yah/runner/src/resolver/openrouter.rs",
+            "oss/runner/crates/core/src/resolver/mod.rs (OPENROUTER_SLOT)",
+            "oss/runner/crates/core/src/resolver/openrouter.rs",
         ],
         provider: Provider::OpenRouter,
         domain: Domain::Model,
@@ -1922,6 +2189,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "release-cosign-key",
@@ -1944,6 +2212,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "release-cosign-key-pw",
@@ -1965,6 +2234,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "tauri-signing-key",
@@ -1988,6 +2258,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "tauri-signing-key-pw",
@@ -2005,6 +2276,112 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
+    },
+    CredentialSpec {
+        slot: "yah-camp-a4cbbff4b281-r2-access-key-id",
+        env: None,
+        purpose: "S3 access key id of the yah-camp-a4cbbff4b281 bucket-scoped rw R2 token (R975-T6, \
+                  W368 §9) -- this camp's durable-state bucket; the bootstrap secret a camp host \
+                  needs before it can hydrate",
+        consumers: &["R975-F5 -- camp-state hydrate/tail sink (env, read from this slot)"],
+        provider: Provider::Cloudflare,
+        domain: Domain::Infra,
+        band: Band::Automatable,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Declared,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+        scope: Scope::Host,
+    },
+    CredentialSpec {
+        slot: "yah-camp-a4cbbff4b281-r2-secret-key",
+        env: None,
+        purpose: "secret half of the yah-camp-a4cbbff4b281 bucket pair -- SHA-256 hex of the \
+                  Cloudflare token value; the token value itself is stored nowhere",
+        consumers: &["R975-F5 -- see the access-key-id half above"],
+        provider: Provider::Cloudflare,
+        domain: Domain::Infra,
+        band: Band::Automatable,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Declared,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+        scope: Scope::Host,
+    },
+    CredentialSpec {
+        slot: "yah-fleet-git-access-key-id",
+        env: None,
+        purpose: "S3 access key id of the yah-fleet-git bucket-scoped rw R2 token (R971-T8), \
+                  shipped to the fleet-git workload for its writer claim and push journal",
+        consumers: &[
+            ".yah/infra/secrets/yah-fleet-git-r2-access-key-id.toml",
+        ],
+        provider: Provider::Cloudflare,
+        domain: Domain::Infra,
+        band: Band::Automatable,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Enforced,
+        probe_from: ProbeFrom::Workload("fleet-git"),
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+        scope: Scope::Host,
+    },
+    CredentialSpec {
+        slot: "yah-fleet-git-secret-key",
+        env: None,
+        purpose: "secret half of the yah-fleet-git bucket-scoped R2 pair; ships alongside \
+                  yah-fleet-git-access-key-id",
+        consumers: &[
+            ".yah/infra/secrets/yah-fleet-git-r2-secret-key.toml",
+        ],
+        provider: Provider::Cloudflare,
+        domain: Domain::Infra,
+        band: Band::Automatable,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::Enforced,
+        probe_from: ProbeFrom::Workload("fleet-git"),
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+        scope: Scope::Host,
+    },
+    CredentialSpec {
+        slot: "yah-fleet-ssh-key",
+        env: None,
+        purpose: "OpenSSH private key for fleet ssh (identity_file = ~/.ssh/yah in every \
+                  .yah/infra/machines record); held here instead of on disk and loaded into \
+                  ssh-agent by `yah keys ssh-add` / desktop launch, so only yah.pub stays in \
+                  ~/.ssh (R997-F30)",
+        consumers: &[
+            "app/yah/cli/src/cli.rs (KeysCommands::SshAdd)",
+            "app/yah/desktop/src/lib.rs (launch-time ssh-add)",
+        ],
+        provider: Provider::Yah,
+        domain: Domain::Infra,
+        band: Band::Manual,
+        provider_cap_days: None,
+        expiry_kind: ExpiryKind::ReviewBy,
+        probe_from: ProbeFrom::Local,
+        overlap: Overlap::Unproven,
+        mint: MintHelp::NONE,
+        required_scopes: &[],
+        required: false,
+        onepassword: None,
+        scope: Scope::Host,
     },
     CredentialSpec {
         slot: "yah-plugin-release-key",
@@ -2027,6 +2404,7 @@ pub const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         required_scopes: &[],
         required: false,
         onepassword: None,
+        scope: Scope::Host,
     },
 ];
 
@@ -2108,6 +2486,13 @@ pub enum Verdict {
     Indeterminate {
         why: String,
     },
+    /// The plaintext may be in hands that should not have it: a camp-vault
+    /// device was revoked (W374 §5.2, R975-F17). Not a probe outcome; the
+    /// credential may still be valid with the provider until rotated.
+    Exposed {
+        /// NodeId of the revoked device whose copy may have held this slot.
+        revoked_node: String,
+    },
 }
 
 impl Verdict {
@@ -2119,6 +2504,7 @@ impl Verdict {
             Verdict::ScopeInsufficient { .. } => "scope-insufficient",
             Verdict::QuotaExhausted => "quota-exhausted",
             Verdict::Indeterminate { .. } => "indeterminate",
+            Verdict::Exposed { .. } => "exposed",
         }
     }
 }
@@ -2150,6 +2536,65 @@ impl HealthRecord {
     }
 }
 
+/// What kind of drift the vault check-in found (R856-F13).
+///
+/// The sweep asks whether each credential still *works*; this asks whether
+/// each one should *exist*, and whether what the registry says about it is
+/// still true of the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InventoryKind {
+    /// A live vault slot with no [`CredentialSpec`]. Either the registry is
+    /// missing an entry or the slot is junk nobody declared.
+    Unregistered,
+    /// A `required` spec whose slot the vault does not hold.
+    MissingRequired,
+    /// A `consumers` citation whose path no longer exists in the tree.
+    DanglingCitation,
+    /// A `consumers` citation whose file exists but names neither the slot,
+    /// its env var, nor the symbol the citation points at.
+    StaleCitation,
+    /// No citation survives — the spec is a retirement candidate.
+    RetireCandidate,
+    /// `purpose` names something the consumers mechanically contradict, e.g.
+    /// a token format none of them use.
+    StalePurpose,
+}
+
+impl InventoryKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            InventoryKind::Unregistered => "unregistered",
+            InventoryKind::MissingRequired => "missing-required",
+            InventoryKind::DanglingCitation => "dangling-citation",
+            InventoryKind::StaleCitation => "stale-citation",
+            InventoryKind::RetireCandidate => "retire-candidate",
+            InventoryKind::StalePurpose => "stale-purpose",
+        }
+    }
+}
+
+/// One inventory finding, as the sidecar keeps it between runs.
+///
+/// `key` is stable across runs for the same drift (kind + slot + subject, never
+/// a line number), which is what lets a re-run tell a new finding from one it
+/// already reported, and lets the board filer update the ticket it opened
+/// instead of opening another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryFinding {
+    pub key: String,
+    pub kind: InventoryKind,
+    pub slot: String,
+    pub detail: String,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    /// Board item this finding was filed as. Survives the ticket being
+    /// archived on purpose: an operator who closed it has answered it, and the
+    /// filer must not reopen the same drift every night.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filed_as: Option<String>,
+}
+
 /// The whole sidecar file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthSidecar {
@@ -2157,6 +2602,17 @@ pub struct HealthSidecar {
     pub version: u32,
     #[serde(default)]
     pub slots: BTreeMap<String, HealthRecord>,
+    /// When the vault check-in last ran (R856-F13). `None` = never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_checked_at: Option<DateTime<Utc>>,
+    /// Drift the last check-in observed. Resolved findings are dropped, so
+    /// this is the current state, not a history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inventory: Vec<InventoryFinding>,
+    /// Per-(credential, node) verdicts for [`ProbeFrom::Node`] credentials,
+    /// keyed by [`NodeHealthRecord::key_for`] (R979-F14).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub nodes: BTreeMap<String, NodeHealthRecord>,
 }
 
 const fn sidecar_version() -> u32 {
@@ -2168,6 +2624,9 @@ impl Default for HealthSidecar {
         Self {
             version: sidecar_version(),
             slots: BTreeMap::new(),
+            inventory_checked_at: None,
+            inventory: Vec::new(),
+            nodes: BTreeMap::new(),
         }
     }
 }
@@ -2180,6 +2639,132 @@ impl HealthSidecar {
     /// Insert or replace one slot's record, keyed by its own `slot` field.
     pub fn upsert(&mut self, record: HealthRecord) {
         self.slots.insert(record.slot.clone(), record);
+    }
+
+    pub fn get_node(&self, credential: &str, node: &str) -> Option<&NodeHealthRecord> {
+        self.nodes.get(&NodeHealthRecord::key_for(credential, node))
+    }
+
+    pub fn upsert_node(&mut self, record: NodeHealthRecord) {
+        self.nodes.insert(record.key(), record);
+    }
+}
+
+/// The node's Claude login: whatever `claude` on a node authenticates as
+/// (W365 §3, R979-F14). Deliberately **not** in [`CREDENTIAL_SPECS`] — that
+/// registry is the camp vault, and this credential lives in the node's own
+/// claude config, so the vault sweep and inventory must never see it.
+pub const CLAUDE_NODE_LOGIN: CredentialSpec = CredentialSpec {
+    slot: "claude-node-login",
+    env: None,
+    purpose: "The claude-cli login on a fleet node. Gates mode A (agent on the node): a node \
+              whose probe is not Valid is offered mode B only",
+    consumers: &["app/yah/desktop/src/agent_process.rs (CampClaudeProbe)"],
+    provider: Provider::Anthropic,
+    domain: Domain::Model,
+    band: Band::Manual,
+    provider_cap_days: None,
+    expiry_kind: ExpiryKind::Unverified,
+    probe_from: ProbeFrom::Node,
+    overlap: Overlap::Unproven,
+    mint: MintHelp::NONE,
+    required_scopes: &[],
+    required: false,
+    onepassword: None,
+    scope: Scope::Host,
+};
+
+/// How long a [`CLAUDE_NODE_LOGIN`] verdict is reused before the next courier
+/// spawn re-probes (W365 open question 4). 60 minutes, not W337's 10-minute
+/// tier-1 default, because the probe spends a model turn: measured 2026-10-13
+/// on claude-cli 2.1.296, `claude auth status` reports `loggedIn` from local
+/// state with an invalid key in the environment, so the cheapest call that
+/// actually authenticates is a one-turn `claude -p`.
+pub const CLAUDE_NODE_PROBE_TTL_SECS: i64 = 60 * 60;
+
+/// How long an HTTP-token backend's (credential, node) verdict is reused
+/// before the next mode-A courier spawn re-probes (R979-F15). Its probe is
+/// one authenticated GET of the provider's model list, made on the node, so
+/// it can be far shorter than [`CLAUDE_NODE_PROBE_TTL_SECS`]: ten minutes
+/// bounds how long a key revoked between spawns keeps placing couriers there.
+/// W337 names no tier-1 TTL; this one is chosen here.
+pub const HTTP_TOKEN_NODE_PROBE_TTL_SECS: i64 = 10 * 60;
+
+/// One probe's verdict for a credential *on one node*, kept beside the
+/// per-slot [`HealthRecord`]s. Keyed by (credential, node) because a node
+/// credential is not a vault slot and one spec has a verdict per node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeHealthRecord {
+    pub credential: String,
+    pub node: String,
+    pub last_probe_at: DateTime<Utc>,
+    pub verdict: Verdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_error: Option<String>,
+}
+
+impl NodeHealthRecord {
+    /// The sidecar map key. One string because JSON object keys are strings.
+    pub fn key_for(credential: &str, node: &str) -> String {
+        format!("{credential}@{node}")
+    }
+
+    pub fn key(&self) -> String {
+        Self::key_for(&self.credential, &self.node)
+    }
+
+    /// Young enough to reuse without re-probing.
+    pub fn is_fresh(&self, now: DateTime<Utc>, ttl_secs: i64) -> bool {
+        now.signed_duration_since(self.last_probe_at).num_seconds() < ttl_secs
+    }
+}
+
+/// What running a credential's probe on a node produced, before
+/// classification. `Err` means the probe never ran (node unreachable, binary
+/// missing) and classifies as [`Verdict::Indeterminate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeRun {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Runs a [`ProbeFrom::Node`] credential's probe on node `node`, **in the
+/// environment a spawn there would get** (W329's trap: an empty
+/// `ANTHROPIC_API_KEY` outranks the login). This crate cannot build that
+/// environment — the spawn's builder lives in the host — so the host
+/// implements this with the same function its spawn uses.
+pub trait NodeProbeRunner {
+    fn run_probe(&self, spec: &CredentialSpec, node: &str) -> std::result::Result<ProbeRun, String>;
+}
+
+/// Classify a `claude -p … --output-format json` probe. Fail-closed: anything
+/// not positively a completed turn is non-Valid, and only an authenticated
+/// refusal is `Revoked` — everything ambiguous is `Indeterminate`.
+pub fn classify_claude_probe(run: &std::result::Result<ProbeRun, String>) -> Verdict {
+    let run = match run {
+        Ok(r) => r,
+        Err(why) => return Verdict::Indeterminate { why: format!("probe did not run: {why}") },
+    };
+    let parsed: Option<serde_json::Value> = serde_json::from_str(run.stdout.trim()).ok();
+    let Some(v) = parsed else {
+        let tail: String = run.stderr.trim().chars().take(200).collect();
+        return Verdict::Indeterminate {
+            why: format!("claude printed no JSON result (exit ok: {}): {tail}", run.success),
+        };
+    };
+    let is_error = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(true);
+    let result = v.get("result").and_then(|r| r.as_str()).unwrap_or("").to_string();
+    if !is_error && run.success {
+        return Verdict::Valid { as_identity: None };
+    }
+    let lower = result.to_lowercase();
+    match v.get("api_error_status").and_then(|s| s.as_u64()) {
+        Some(401) => Verdict::Revoked,
+        Some(403) => Verdict::ScopeInsufficient { missing: vec![result] },
+        Some(429) if lower.contains("limit") => Verdict::QuotaExhausted,
+        _ if lower.contains("not logged in") || lower.contains("invalid api key") => Verdict::Revoked,
+        _ => Verdict::Indeterminate { why: format!("claude probe failed: {result}") },
     }
 }
 

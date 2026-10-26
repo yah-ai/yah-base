@@ -2518,10 +2518,110 @@ pub enum LifecycleArchetype {
     Job,
 }
 
+/// Taint keys a workload may name in `yah.placement.requires-taint` to
+/// *require* a node (W305/R742-T4 affinity vocabulary).
+///
+/// This is a closed list on purpose. `WorkloadSpec::requires_taint` returns
+/// free text, but every producer in the tree is code — `passway_ingress.rs`
+/// and `cloudflared_ingress.rs`, both emitting [`PUBLIC_IP_TAINT`] — and no
+/// on-disk `workload.toml` sets the annotation at all. So the set of keys a
+/// node can usefully carry for affinity is knowable at compile time, which is
+/// what lets [`taint_effect`] call anything outside it inert instead of
+/// guessing.
+///
+/// **Adding an affinity key means adding it here**, in the same change that
+/// teaches a workload to require it. That coupling is the point: it makes the
+/// node side and the workload side impossible to land apart.
+///
+/// R977-B12: lives here, not in `cloud::config`, because yubaba's replica
+/// reconcile must apply the same rule and `cloud` is only a dev-dependency of
+/// yubaba. `cloud::config` re-exports it.
+pub const AFFINITY_TAINT_KEYS: &[&str] = &[PUBLIC_IP_TAINT];
+
+/// How a node taint key can affect placement.
+///
+/// W305 finding 1: before R742-T4 nothing asked this question, so a key that
+/// no scheduler path could read — `"qa"`, `"no-voter"` — parsed, validated,
+/// and quietly did nothing. Both of the findings that cost real fleet state
+/// were invisible for exactly that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaintEffect {
+    /// `"no-<archetype>"`: rejects placement outright unless the constraint
+    /// tolerates this key. See [`repelling_taint`] (R876-B7).
+    Repels(LifecycleArchetype),
+    /// A key in [`AFFINITY_TAINT_KEYS`]: a workload naming it in
+    /// `yah.placement.requires-taint` is restricted to nodes carrying it.
+    Attracts,
+    /// Neither. No placement decision can read this key.
+    Inert,
+}
+
+/// Classify one node taint key. See [`TaintEffect`].
+///
+/// The repulsion half is derived from [`LifecycleArchetype::ALL`] rather than
+/// a literal list, so a fourth archetype makes `no-<its key>` live without an
+/// edit here.
+pub fn taint_effect(key: &str) -> TaintEffect {
+    if let Some(arch) = LifecycleArchetype::ALL
+        .into_iter()
+        .find(|a| key == format!("no-{}", a.taint_key()))
+    {
+        return TaintEffect::Repels(arch);
+    }
+    if AFFINITY_TAINT_KEYS.contains(&key) {
+        return TaintEffect::Attracts;
+    }
+    TaintEffect::Inert
+}
+
+/// Every key the scheduler *can* act on, sorted — for error messages that
+/// tell the operator what the legal vocabulary actually is instead of only
+/// what was wrong.
+pub fn live_taint_keys() -> Vec<String> {
+    let mut keys: Vec<String> = LifecycleArchetype::ALL
+        .into_iter()
+        .map(|a| format!("no-{}", a.taint_key()))
+        .chain(AFFINITY_TAINT_KEYS.iter().map(|k| (*k).to_string()))
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The tolerations a placement group made of `archetypes` carries: every
+/// repelling key that is NOT one of its own classes (R876-B7). A Server group
+/// tolerates `no-appliance` and `no-job` and is still blocked by `no-server`.
+///
+/// The one derivation both placement paths use — fresh admission
+/// (`cloud::config::admission_spec`) and re-placement (yubaba's
+/// `workload_reconcile`, R977-B12) — so the two cannot admit different nodes.
+pub fn archetype_tolerations(archetypes: &[LifecycleArchetype]) -> Vec<String> {
+    LifecycleArchetype::ALL
+        .into_iter()
+        .filter(|a| !archetypes.contains(a))
+        .map(|a| format!("no-{}", a.taint_key()))
+        .collect()
+}
+
+/// The first taint on a node that repels a workload tolerating `tolerates`,
+/// or `None` when the node admits it on the taint axis.
+///
+/// Repel-by-default (R876-B7): every key [`taint_effect`] classifies as
+/// [`TaintEffect::Repels`] blocks unless named in `tolerates`. Affinity and
+/// inert keys never repel. Shared by `cloud::config::RequiredSpec::matches`
+/// and yubaba's replica reconcile (R977-B12).
+pub fn repelling_taint<'a>(taints: &'a [String], tolerates: &[String]) -> Option<&'a str> {
+    taints
+        .iter()
+        .find(|t| {
+            matches!(taint_effect(t), TaintEffect::Repels(_)) && !tolerates.iter().any(|x| x == *t)
+        })
+        .map(String::as_str)
+}
+
 impl LifecycleArchetype {
     /// Every variant, in declaration order. Exists so a consumer can enumerate
     /// the archetypes without hand-maintaining a parallel list — the taint
-    /// vocabulary in `cloud::config::taint_effect` is built from this, so
+    /// vocabulary in [`taint_effect`] is built from this, so
     /// adding a fourth archetype extends the set of live repel keys for free.
     pub const ALL: [LifecycleArchetype; 3] = [Self::Server, Self::Appliance, Self::Job];
 
@@ -3711,6 +3811,31 @@ impl WorkloadSpec {
         }
     }
 
+    /// The named volumes declared disposable caches via
+    /// [`DISPOSABLE_VOLUMES_ANNOTATION`] (R971-B9). Empty when none are.
+    pub fn disposable_volumes(&self) -> Vec<&str> {
+        self.annotations
+            .get(DISPOSABLE_VOLUMES_ANNOTATION)
+            .map(|raw| raw.split(',').map(str::trim).collect())
+            .unwrap_or_default()
+    }
+
+    /// The named volumes whose only copy lives on the node they were created
+    /// on: every [`VolumeSource::Named`] mount not declared disposable. This
+    /// is the set placement must follow (R931-B10).
+    pub fn stateful_named_volumes(&self) -> Vec<&str> {
+        let disposable = self.disposable_volumes();
+        self.volumes
+            .iter()
+            .filter_map(|v| match &v.source {
+                VolumeSource::Named { name } if !disposable.contains(&name.as_str()) => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The durability tier this workload declares for its own state, if it
     /// declares one at all (R850-P4).
     ///
@@ -4463,6 +4588,54 @@ impl fmt::Display for WritablePathsDeclError {
 impl std::error::Error for WritablePathsDeclError {}
 
 #[cfg(test)]
+mod disposable_volumes_tests {
+    use super::*;
+
+    fn spec_with(volumes: &[&str], disposable: Option<&str>) -> WorkloadSpec {
+        let image = ImageRef {
+            registry: "localhost".into(),
+            repository: "svc".into(),
+            tag: "dev".into(),
+            digest: crate::testing::test_digest(),
+        };
+        let mut spec = WorkloadSpec::for_forge("w1", image, TierTag("infra".into()), vec![]);
+        for (i, name) in volumes.iter().enumerate() {
+            spec.volumes.push(VolumeMount {
+                source: VolumeSource::Named {
+                    name: (*name).into(),
+                },
+                target: format!("/v{i}").into(),
+                read_only: false,
+                from_secret_mount: false,
+            });
+        }
+        if let Some(v) = disposable {
+            spec.annotations
+                .insert(DISPOSABLE_VOLUMES_ANNOTATION.to_string(), v.to_string());
+        }
+        spec
+    }
+
+    #[test]
+    fn an_undeclared_named_volume_is_stateful() {
+        assert_eq!(spec_with(&["data"], None).stateful_named_volumes(), vec!["data"]);
+    }
+
+    #[test]
+    fn a_declared_disposable_volume_is_not_stateful_and_the_rest_still_are() {
+        let spec = spec_with(&["cache", "data"], Some(" cache "));
+        assert_eq!(spec.stateful_named_volumes(), vec!["data"]);
+        assert!(crate::validate::shape(&spec).is_ok());
+    }
+
+    #[test]
+    fn shape_refuses_a_disposable_name_that_is_not_mounted() {
+        let err = crate::validate::shape(&spec_with(&["data"], Some("dta"))).unwrap_err();
+        assert!(err.to_string().contains("\"dta\""), "{err}");
+    }
+}
+
+#[cfg(test)]
 mod writable_paths_tests {
     use super::*;
 
@@ -4718,6 +4891,22 @@ pub const WRITABLE_PATHS_ANNOTATION: &str = "yah.writable-paths";
 /// provides, so a `yah.trust = untrusted` workload cannot reach a node on the
 /// host kernel.
 pub const TRUST_ANNOTATION: &str = "yah.trust";
+
+/// Annotation key declaring which of a workload's named volumes are
+/// **disposable caches**, as a comma-separated list of volume names (R971-B9).
+/// See [`WorkloadSpec::disposable_volumes`].
+///
+/// A disposable volume holds nothing the workload cannot rebuild on start
+/// (fleet-git rehydrates its repos from R2), so no node holds the only copy of
+/// anything and placement treats the workload as stateless: it lands on any
+/// admissible node without `--where`, and re-places after a node loss.
+///
+/// # Why an annotation and not a field on [`VolumeSource::Named`]
+///
+/// `VolumeSource` crosses the yubaba↔kamaji wire (kamaji-proto, postcard), so
+/// a field there is a kamaji protocol change, and only placement reads this.
+/// `shape` refuses a listed name that is not a mounted named volume.
+pub const DISPOSABLE_VOLUMES_ANNOTATION: &str = "yah.volumes.disposable";
 
 /// Annotation value (for [`TRUST_ANNOTATION`]) declaring that this workload's
 /// code is **not** trusted to share a kernel with the fleet. Stamped by
@@ -5163,7 +5352,10 @@ pub struct VolumeMount {
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeSource {
-    /// Yubaba-managed named volume; created on first use.
+    /// Yubaba-managed named volume; created on first use — kamaji makes
+    /// `/var/lib/yah/kamaji/volumes/<name>` before its bind-source check
+    /// (`kamaji_containerd_core::ensure_named_volume_dirs`, R971-B10). A volume named in
+    /// [`DISPOSABLE_VOLUMES_ANNOTATION`] is a cache, not state (R971-B9).
     Named { name: String },
 
     /// Operator-managed host path. Yubaba rejects bind mounts unless
@@ -5493,6 +5685,51 @@ mod secret_mount_tests {
 /// the filesystem is below [`FREE_FLOOR_BYTES`] the least-recently-used dirs go
 /// too, until it is not. The cache can therefore never consume the last few GB
 /// of a build worker's `/var`.
+pub mod forge_source_git {
+    use std::path::PathBuf;
+
+    /// Container-side dir holding the node's bare source cache repo (R971-F5,
+    /// W363 §6.4). qed's `yah-source-fetch` script uses it when present.
+    pub const CONTAINER_DIR: &str = "/yah/source-git";
+
+    /// Host dir behind it: ONE per node, shared by every forge step, so a
+    /// second dispatch fetches only the delta. Under
+    /// [`super::forge_state::HOST_ROOT`], so yubaba creates it. Concurrent
+    /// steps serialize on it with `flock`; stale refs are pruned by the script.
+    pub const HOST_DIR: &str = "/var/lib/yah/qed/source-git";
+
+    /// The bind every remote forge subprocess gets, `forge_produced`-style.
+    pub fn durable_mount() -> super::VolumeMount {
+        super::VolumeMount {
+            source: super::VolumeSource::Bind {
+                host_path: PathBuf::from(HOST_DIR),
+            },
+            target: PathBuf::from(CONTAINER_DIR),
+            read_only: false,
+            from_secret_mount: false,
+        }
+    }
+}
+
+/// @yah:ticket(R979-F3, "Relay workdir as a keyed durable mount at /work/<repo>, exempt from forge_cache idle and low-disk eviction while the relay is live, with a per-mount lock")
+/// @yah:status(review)
+/// @yah:at(2026-10-13T13:29:00Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:phase(P1)
+/// @yah:parent(R979)
+/// @yah:next("Tier: Cleric.")
+/// @yah:next("W365 section 7 item 2. Follow the forge_cache precedent in workload-spec lib.rs (durable_mount(key): host /var/lib/yah/qed/cache/<key>, writable): a sibling keyed by relay ID, container target the CONSTANT path /work/<repo>. Constant path is what lets sccache hit across relays on one node (R833-F4: 98.62 percent at a constant path, 0 at a sibling path).")
+/// @yah:next("Eviction: forge_cache::evict_plan drops dirs idle past 14 days and LRU dirs below FREE_FLOOR_BYTES (10 GiB). Its two callers are yubaba lib.rs (~7805) and qed runner.rs (~753). A live relay mount must be exempt from both: in mode A it holds edits not yet pushed as tip. The camp owns liveness (relay R979 next); the node must not infer it from idle age. Design the exemption marker the camp sets and clears (at archive and at re-placement), and share the liveness signal with R979-T2 rather than inventing a second one.")
+/// @yah:next("Lock: export the mount's lock path. The forge-step child (yah build run --relay) holds a flock on it from `git read-tree -u` until the build exits, the same pattern as the /yah/source-git fetch (forge_source_git, source_fetch.sh). Cargo's target-dir lock covers only the build, not the apply.")
+/// @yah:verify("workload-spec unit test: evict_plan never selects a mount carrying the live marker, under both the idle rule and the free-floor rule.")
+/// @yah:verify("Mount shape test mirroring durable_mount_shape: host dir under the relay root, target /work/<repo>, writable, invalid key refused.")
+/// @yah:depends_on(R979-S1)
+/// @yah:soft_depends_on(R979-T2)
+/// @yah:files(oss/yah-base/crates/workload-spec/src/lib.rs)
+/// @yah:files(oss/yubaba/crates/yubaba/src/lib.rs)
+/// @yah:files(oss/qed/crates/qed/src/runner.rs)
+/// @yah:handoff("workload-spec: new `relay_workdir` module next to forge_cache. HOST_ROOT=/var/lib/yah/qed/relay (under forge_state root, so yubaba mkdirs it); durable_mount(id, repo) binds host <root>/<id> to the constant container path /work/<repo>, writable, and returns None for an invalid id or repo. Marker <mount>/.yah-relay/live with mark_live/clear_live/is_live/marker_path; lock path container_lock(repo) = /work/<repo>/.yah-relay/lock (META_DIR, LOCK_FILE consts). The doc comment states that relay release clears the marker AND deletes refs/relays (R979-T2). forge_cache::evict_plan now takes &[CacheDir{path,mtime,pinned}] and never selects a pinned dir under either rule. New forge_cache::scan_roots(&[&Path]) reads the marker. yubaba sweep_build_cache_dirs scans the cache root and the relay root through scan_roots (spawn_blocking). The qed runner's local sweep uses scan_roots(&[root]), its own root only. Verified: workload-spec lib tests 217 -> 220 pass, 0 fail (3 new tests: pinned under both rules, scan_roots marker, relay mount shape). cargo check --tests EXIT=0 for yubaba and yah-qed.")
+/// @yah:gotcha("The marker and lock sit INSIDE the mount at .yah-relay/ so that the container can flock the lock. The whole-tree relay snapshot (R978-T1) must exclude .yah-relay/. The yubaba sweep measures free bytes on the cache root only; it assumes the relay root is on the same filesystem (/var).")
 pub mod forge_cache {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
@@ -5618,6 +5855,31 @@ pub mod forge_cache {
         })
     }
 
+    /// The node-wide cache key holding sccache's local disk cache (R978-T20).
+    /// One per node, NOT per workdir key: gate (`camp-gate`) and relay
+    /// (`<relay-id>`) builds both run at `/work/<repo>`, so binding this one
+    /// dir into every durable-workdir step is what lets them share compile
+    /// outputs. It sits under [`HOST_ROOT`] and is never pinned, so
+    /// [`evict_plan`] treats it like any other build cache.
+    pub const SCCACHE_KEY: &str = "rust-sccache";
+
+    /// Where [`sccache_mount`] lands in the container; the builder image's
+    /// `SCCACHE_DIR` (yah-musl-builder Dockerfile).
+    pub const SCCACHE_CONTAINER_DIR: &str = "/yah/sccache";
+
+    /// Host `<HOST_ROOT>/`[`SCCACHE_KEY`] → container [`SCCACHE_CONTAINER_DIR`],
+    /// writable.
+    pub fn sccache_mount() -> super::VolumeMount {
+        super::VolumeMount {
+            source: super::VolumeSource::Bind {
+                host_path: Path::new(HOST_ROOT).join(SCCACHE_KEY),
+            },
+            target: PathBuf::from(SCCACHE_CONTAINER_DIR),
+            read_only: false,
+            from_secret_mount: false,
+        }
+    }
+
     /// Which cache dirs to delete, given every dir in a cache root with its
     /// last-modified time, the current free space on that filesystem, and the
     /// floor to hold.
@@ -5637,31 +5899,289 @@ pub mod forge_cache {
     /// sustained pressure each sweep drops one more dir, and a root that is
     /// entirely evicted simply rebuilds cold — the failure mode is a slow
     /// build, never a full disk.
+    ///
+    /// A dir with `pinned` set is never selected under either rule: it is a
+    /// live relay workdir ([`super::relay_workdir`]) whose liveness the camp
+    /// owns, and whose contents may be edits not yet pushed anywhere.
     pub fn evict_plan(
-        entries: &[(PathBuf, SystemTime)],
+        entries: &[CacheDir],
         now: SystemTime,
         retention: Duration,
         free_bytes: u64,
         floor_bytes: u64,
     ) -> Vec<PathBuf> {
         let mut evict = Vec::new();
-        let mut live: Vec<&(PathBuf, SystemTime)> = Vec::new();
-        for entry in entries {
+        let mut survivors: Vec<&CacheDir> = Vec::new();
+        for entry in entries.iter().filter(|e| !e.pinned) {
             let idle = now
-                .duration_since(entry.1)
+                .duration_since(entry.mtime)
                 .map(|age| age > retention)
                 .unwrap_or(false);
             if idle {
-                evict.push(entry.0.clone());
+                evict.push(entry.path.clone());
             } else {
-                live.push(entry);
+                survivors.push(entry);
             }
         }
-        if free_bytes < floor_bytes && !live.is_empty() {
-            live.sort_by_key(|(_, mtime)| *mtime);
-            evict.push(live[0].0.clone());
+        if free_bytes < floor_bytes && !survivors.is_empty() {
+            survivors.sort_by_key(|e| e.mtime);
+            evict.push(survivors[0].path.clone());
         }
         evict
+    }
+
+    /// One evictable directory as [`evict_plan`] sees it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CacheDir {
+        pub path: PathBuf,
+        pub mtime: SystemTime,
+        /// Carries [`super::relay_workdir::LIVE_MARKER`]; exempt from eviction.
+        pub pinned: bool,
+    }
+
+    /// Every subdirectory of each root in `roots`, as [`evict_plan`] input.
+    /// A missing or unreadable root contributes nothing. Both sweepers call
+    /// this with [`HOST_ROOT`] and [`super::relay_workdir::HOST_ROOT`] (or
+    /// their local equivalents), so relay workdirs share the one policy
+    /// instead of getting a second evictor.
+    pub fn scan_roots(roots: &[&Path]) -> Vec<CacheDir> {
+        let mut dirs = Vec::new();
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if !meta.is_dir() {
+                    continue;
+                }
+                let Ok(mtime) = meta.modified() else { continue };
+                let path = entry.path();
+                let pinned = super::relay_workdir::is_live(&path);
+                dirs.push(CacheDir { path, mtime, pinned });
+            }
+        }
+        dirs
+    }
+}
+
+// ── Relay workdir durable mount (R979-F3, W365 §2 / §7 item 2) ────────────────
+
+/// A relay's tree and target dir on a build node, kept across builds.
+///
+/// Sibling of [`forge_cache`]: a keyed, writable, host-persistent bind under
+/// [`forge_state::HOST_ROOT`] (so yubaba's `ensure_forge_state_dirs` creates
+/// it), keyed by fleet-git repo AND relay ID instead of pipeline+step+triple.
+///
+/// # The host path is `<HOST_ROOT>/<repo>/<relay-id>`
+///
+/// A relay ID is only unique within its camp: yah and noisetable both number
+/// relays `R###`, and two camps' `R847` on one node must not share a tree
+/// (R979-F8). The repo is the camp identifier the step already carries
+/// (`/work/<repo>`), and it is the namespace `refs/relays/<R>` lives in on
+/// fleet-git, so a mount and its refs have one identity.
+///
+/// # The container path is constant
+///
+/// Every relay's mount appears at `/work/<repo>`, whichever relay it is.
+/// sccache keys on cwd: R833-F4 measured 98.62% hits at a constant path and 0%
+/// at a sibling path, so a per-relay container path would make every relay on
+/// a node compile cold.
+///
+/// # Liveness is camp-written, never inferred
+///
+/// In mode A the mount holds edits not yet pushed as `tip`, so idle age says
+/// nothing about whether it may be deleted. The camp creates [`LIVE_MARKER`]
+/// when it materialises the mount and removes it on **relay release**
+/// (archive, or re-placement onto another node). [`forge_cache::evict_plan`]
+/// never selects a dir carrying it, under either rule.
+///
+/// Relay release is ONE camp act with two effects: it clears this marker AND
+/// deletes the relay's `refs/relays/<R###>/**` in fleet-git (R979-T2). Both
+/// are the same liveness signal; neither is cleared without the other.
+///
+/// # Lock
+///
+/// Apply and build are one critical section per mount: the relay forge step
+/// (R979-F4) holds `flock` on [`CONTAINER_LOCK`] from `git read-tree -u` until
+/// the build exits, the same pattern as `source_fetch.sh`'s fetch lock.
+/// Cargo's target-dir lock covers only the build.
+///
+/// Marker and lock live in [`META_DIR`] inside the mount, so the container can
+/// reach the lock. The relay's whole-tree snapshot (R978-T1) must exclude it.
+pub mod relay_workdir {
+    use std::path::{Path, PathBuf};
+
+    /// Host root; each relay gets `<HOST_ROOT>/<repo>/<relay-id>/`. Its
+    /// [`repo_dirs`] are swept alongside [`super::forge_cache::HOST_ROOT`] by
+    /// the same `evict_plan`.
+    pub const HOST_ROOT: &str = "/var/lib/yah/qed/relay";
+
+    /// Container parent; the mount target is `/work/<repo>`.
+    pub const CONTAINER_PARENT: &str = "/work";
+
+    /// Reserved dir at the mount root holding the marker and the lock.
+    pub const META_DIR: &str = ".yah-relay";
+
+    /// Present ⇒ the relay is live and its mount is exempt from eviction.
+    pub const LIVE_MARKER: &str = "live";
+
+    /// The flock target, relative to the mount root.
+    pub const LOCK_FILE: &str = "lock";
+
+    /// Whether `id` / `repo` are safe single path components. Same alphabet as
+    /// [`super::forge_cache::is_valid_key`].
+    pub fn is_valid_key(key: &str) -> bool {
+        super::forge_cache::is_valid_key(key)
+    }
+
+    /// Host dir for relay `id` of fleet-git repo `repo` under `root`; `None`
+    /// if either key is invalid. The one place a mount's host path is built.
+    pub fn dir_under(root: &Path, repo: &str, id: &str) -> Option<PathBuf> {
+        (is_valid_key(repo) && is_valid_key(id)).then(|| root.join(repo).join(id))
+    }
+
+    /// Host dir for relay `id` of `repo` under [`HOST_ROOT`].
+    pub fn host_dir(repo: &str, id: &str) -> Option<PathBuf> {
+        dir_under(Path::new(HOST_ROOT), repo, id)
+    }
+
+    /// The per-repo dirs under `root`, each holding one dir per relay mount.
+    /// This is what the evictor scans; never `root` itself, whose children
+    /// are repos, not mounts.
+    pub fn repo_dirs(root: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter(|e| e.file_name().to_str().is_some_and(is_valid_key))
+            .map(|e| e.path())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The constant container path `/work/<repo>`; `None` for an invalid repo.
+    pub fn container_dir(repo: &str) -> Option<PathBuf> {
+        is_valid_key(repo).then(|| Path::new(CONTAINER_PARENT).join(repo))
+    }
+
+    /// The lock path as the step sees it: `/work/<repo>/.yah-relay/lock`.
+    pub fn container_lock(repo: &str) -> Option<PathBuf> {
+        Some(container_dir(repo)?.join(META_DIR).join(LOCK_FILE))
+    }
+
+    /// The bind for relay `id` of `repo`: host `<HOST_ROOT>/<repo>/<id>` →
+    /// container `/work/<repo>`, writable. `None` if either key is invalid —
+    /// refuse, never mount something else.
+    pub fn durable_mount(id: &str, repo: &str) -> Option<super::VolumeMount> {
+        Some(super::VolumeMount {
+            source: super::VolumeSource::Bind {
+                host_path: host_dir(repo, id)?,
+            },
+            target: container_dir(repo)?,
+            read_only: false,
+            from_secret_mount: false,
+        })
+    }
+
+    /// R987-F11: host root of the relay TARGET mounts, a separate tree from
+    /// [`HOST_ROOT`]; each relay gets `<TARGET_HOST_ROOT>/<repo>/<relay-id>/`.
+    /// Separate so the live marker (which exempts the SOURCE root only) cannot
+    /// pin build output: the target is evictable, source is not.
+    pub const TARGET_HOST_ROOT: &str = "/var/lib/yah/qed/relay-target";
+
+    /// Container parent of the target mount: `/cargo-target/<repo>`. Constant
+    /// per repo, so a relay's absolute paths (and sccache keys) are stable.
+    pub const TARGET_CONTAINER_PARENT: &str = "/cargo-target";
+
+    /// Host target dir for relay `id` of `repo` under [`TARGET_HOST_ROOT`].
+    pub fn target_host_dir(repo: &str, id: &str) -> Option<PathBuf> {
+        dir_under(Path::new(TARGET_HOST_ROOT), repo, id)
+    }
+
+    /// The constant container path `/cargo-target/<repo>`; this is the
+    /// relay step's `CARGO_TARGET_DIR`.
+    pub fn container_target_dir(repo: &str) -> Option<PathBuf> {
+        is_valid_key(repo).then(|| Path::new(TARGET_CONTAINER_PARENT).join(repo))
+    }
+
+    /// The bind for the target of relay `id` of `repo`: host
+    /// `<TARGET_HOST_ROOT>/<repo>/<id>` → [`container_target_dir`], writable.
+    pub fn target_mount(id: &str, repo: &str) -> Option<super::VolumeMount> {
+        Some(super::VolumeMount {
+            source: super::VolumeSource::Bind {
+                host_path: target_host_dir(repo, id)?,
+            },
+            target: container_target_dir(repo)?,
+            read_only: false,
+            from_secret_mount: false,
+        })
+    }
+
+    /// The flock file a target dir's evictor must hold while it deletes: the
+    /// SOURCE mount's `<source_root>/<repo>/<id>/.yah-relay/lock`, the same
+    /// lock `relay_step.sh` holds through apply + build. `source_root` is the
+    /// counterpart of [`HOST_ROOT`] (a parameter for tests).
+    pub fn lock_path_under(source_root: &Path, repo: &str, id: &str) -> Option<PathBuf> {
+        Some(dir_under(source_root, repo, id)?.join(META_DIR).join(LOCK_FILE))
+    }
+
+    /// Marker path for a mount rooted at host dir `dir`.
+    pub fn marker_path(dir: &Path) -> PathBuf {
+        dir.join(META_DIR).join(LIVE_MARKER)
+    }
+
+    /// Whether the mount at `dir` carries the live marker.
+    pub fn is_live(dir: &Path) -> bool {
+        marker_path(dir).exists()
+    }
+
+    /// Camp side, at materialisation: create the marker (and its dir).
+    pub fn mark_live(dir: &Path) -> std::io::Result<()> {
+        let marker = marker_path(dir);
+        std::fs::create_dir_all(marker.parent().expect("marker has a parent"))?;
+        std::fs::write(marker, b"")
+    }
+
+    /// Camp side, at relay release: remove the marker. Absent is success.
+    pub fn clear_live(dir: &Path) -> std::io::Result<()> {
+        match std::fs::remove_file(marker_path(dir)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// One relay mount found under a root: its repo, id and live-marker state.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RelayMount {
+        pub repo: String,
+        pub id: String,
+        pub live: bool,
+    }
+
+    /// Warm relay mounts under `root`: every `<repo>/<id>` directory whose
+    /// names are valid keys, with its [`is_live`] state, sorted by repo then
+    /// id. A missing or unreadable root is empty. A released-but-not-yet-
+    /// evicted mount is still listed (`live: false`) — it is warm cache.
+    pub fn list_mounts(root: &Path) -> Vec<RelayMount> {
+        let mut out = Vec::new();
+        for repo_dir in repo_dirs(root) {
+            let Some(repo) = repo_dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
+            let Ok(entries) = std::fs::read_dir(&repo_dir) else { continue };
+            for e in entries.flatten() {
+                if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let Ok(id) = e.file_name().into_string() else { continue };
+                let Some(dir) = dir_under(root, &repo, &id) else { continue };
+                out.push(RelayMount { live: is_live(&dir), repo: repo.clone(), id });
+            }
+        }
+        out.sort_by(|a, b| (&a.repo, &a.id).cmp(&(&b.repo, &b.id)));
+        out
     }
 }
 
@@ -5734,19 +6254,148 @@ mod forge_cache_tests {
     fn idle_dirs_are_evicted_and_fresh_ones_are_kept_when_there_is_room() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let entries = vec![
-            (PathBuf::from("/c/old"), now - RETENTION - Duration::from_secs(1)),
-            (PathBuf::from("/c/fresh"), now - Duration::from_secs(60)),
+            dir("/c/old", now - RETENTION - Duration::from_secs(1), false),
+            dir("/c/fresh", now - Duration::from_secs(60), false),
         ];
         let plan = evict_plan(&entries, now, RETENTION, FREE_FLOOR_BYTES * 2, FREE_FLOOR_BYTES);
         assert_eq!(plan, vec![PathBuf::from("/c/old")]);
+    }
+
+    fn dir(p: &str, mtime: SystemTime, pinned: bool) -> CacheDir {
+        CacheDir { path: PathBuf::from(p), mtime, pinned }
+    }
+
+    /// A live relay mount survives the idle rule AND the free-floor rule,
+    /// even when it is both the oldest and the least recently used.
+    #[test]
+    fn a_pinned_dir_is_never_evicted_under_either_rule() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
+        let ancient = now - RETENTION * 3;
+        let entries = vec![
+            dir("/r/R1", ancient, true),
+            dir("/c/cool", now - Duration::from_secs(6000), false),
+        ];
+        let plan = evict_plan(&entries, now, RETENTION, FREE_FLOOR_BYTES * 2, FREE_FLOOR_BYTES);
+        assert!(plan.is_empty(), "idle rule took a pinned dir: {plan:?}");
+        let plan = evict_plan(&entries, now, RETENTION, 0, FREE_FLOOR_BYTES);
+        assert_eq!(plan, vec![PathBuf::from("/c/cool")]);
+        let only_pinned = vec![dir("/r/R1", now - Duration::from_secs(1), true)];
+        assert!(evict_plan(&only_pinned, now, RETENTION, 0, FREE_FLOOR_BYTES).is_empty());
+    }
+
+    #[test]
+    fn scan_roots_reads_the_camp_written_marker() {
+        let base = std::env::temp_dir().join(format!("r979f3-{}", std::process::id()));
+        let (cache, relay) = (base.join("cache"), base.join("relay"));
+        let mount = relay.join("yah").join("R1");
+        std::fs::create_dir_all(cache.join("k")).unwrap();
+        std::fs::create_dir_all(&mount).unwrap();
+        super::relay_workdir::mark_live(&mount).unwrap();
+        // The evictor scans each repo dir, so every candidate is one mount.
+        let repos = super::relay_workdir::repo_dirs(&relay);
+        let missing = base.join("missing");
+        let mut roots: Vec<&Path> = vec![cache.as_path(), missing.as_path()];
+        roots.extend(repos.iter().map(|p| p.as_path()));
+        let mut seen = scan_roots(&roots);
+        seen.sort_by(|a, b| a.path.cmp(&b.path));
+        let pins: Vec<_> = seen.iter().map(|d| (d.path.clone(), d.pinned)).collect();
+        assert_eq!(pins, vec![(cache.join("k"), false), (mount.clone(), true)]);
+        super::relay_workdir::clear_live(&mount).unwrap();
+        super::relay_workdir::clear_live(&mount).unwrap(); // idempotent
+        assert!(!super::relay_workdir::is_live(&mount));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn relay_durable_mount_shape() {
+        use super::relay_workdir as rw;
+        let m = rw::durable_mount("R979", "yah").expect("valid keys");
+        assert_eq!(m.target, PathBuf::from("/work/yah"));
+        assert!(!m.read_only, "a relay workdir the step cannot write is useless");
+        match &m.source {
+            super::VolumeSource::Bind { host_path } => {
+                assert_eq!(host_path, &PathBuf::from(rw::HOST_ROOT).join("yah").join("R979"));
+                assert!(super::forge_state::is_forge_state_path(host_path));
+            }
+            other => panic!("expected a bind, got {other:?}"),
+        }
+        // Constant per repo: a different relay mounts at the same path.
+        assert_eq!(rw::durable_mount("R980", "yah").unwrap().target, m.target);
+        assert_eq!(
+            rw::container_lock("yah").unwrap(),
+            PathBuf::from("/work/yah/.yah-relay/lock")
+        );
+        for bad in ["", ".", "..", "../etc", "a/b"] {
+            assert!(rw::durable_mount(bad, "yah").is_none(), "id {bad:?}");
+            assert!(rw::durable_mount("R979", bad).is_none(), "repo {bad:?}");
+        }
+    }
+
+    /// R987-F11: the target is its own keyed mount on a separate host root, at
+    /// a constant per-repo container path, so the live marker (source root
+    /// only) cannot pin it and sccache keys stay stable.
+    #[test]
+    fn relay_target_mount_is_a_separate_root_at_a_constant_path() {
+        use super::relay_workdir as rw;
+        let src = rw::durable_mount("R987", "yah").unwrap();
+        let t = rw::target_mount("R987", "yah").expect("valid keys");
+        assert_eq!(t.target, PathBuf::from("/cargo-target/yah"));
+        assert_eq!(rw::container_target_dir("yah").unwrap(), t.target);
+        assert!(!t.read_only);
+        assert_ne!(t.target, src.target);
+        match (&t.source, &src.source) {
+            (
+                super::VolumeSource::Bind { host_path: th },
+                super::VolumeSource::Bind { host_path: sh },
+            ) => {
+                assert_eq!(th, &PathBuf::from(rw::TARGET_HOST_ROOT).join("yah").join("R987"));
+                assert!(!th.starts_with(sh) && !sh.starts_with(th), "disjoint roots");
+                assert!(super::forge_state::is_forge_state_path(th));
+            }
+            other => panic!("expected binds, got {other:?}"),
+        }
+        assert_eq!(rw::target_mount("R988", "yah").unwrap().target, t.target);
+        assert_eq!(
+            rw::lock_path_under(std::path::Path::new("/s"), "yah", "R987").unwrap(),
+            PathBuf::from("/s/yah/R987/.yah-relay/lock")
+        );
+        for bad in ["", ".", "..", "../etc", "a/b"] {
+            assert!(rw::target_mount(bad, "yah").is_none(), "id {bad:?}");
+            assert!(rw::target_mount("R987", bad).is_none(), "repo {bad:?}");
+            assert!(rw::lock_path_under(std::path::Path::new("/s"), "yah", bad).is_none());
+        }
+    }
+
+    /// R979-F8: relay ids are only unique within a camp. Two camps' R847 on
+    /// one node get two mounts, and the listing tells them apart.
+    #[test]
+    fn two_camps_with_the_same_relay_id_get_distinct_mounts() {
+        use super::relay_workdir as rw;
+        let host = |m: super::VolumeMount| match m.source {
+            super::VolumeSource::Bind { host_path } => host_path,
+            other => panic!("expected a bind, got {other:?}"),
+        };
+        let yah = host(rw::durable_mount("R847", "yah").unwrap());
+        let noisetable = host(rw::durable_mount("R847", "noisetable").unwrap());
+        assert_ne!(yah, noisetable);
+        assert_eq!(noisetable, PathBuf::from(rw::HOST_ROOT).join("noisetable").join("R847"));
+
+        let base = std::env::temp_dir().join(format!("r979f8-mounts-{}", std::process::id()));
+        for repo in ["yah", "noisetable"] {
+            std::fs::create_dir_all(rw::dir_under(&base, repo, "R847").unwrap()).unwrap();
+        }
+        rw::mark_live(&rw::dir_under(&base, "noisetable", "R847").unwrap()).unwrap();
+        let seen: Vec<_> = rw::list_mounts(&base).into_iter().map(|m| (m.repo, m.id, m.live)).collect();
+        assert_eq!(seen, vec![("noisetable".into(), "R847".into(), true), ("yah".into(), "R847".into(), false)]);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
     fn disk_pressure_evicts_the_least_recently_used_survivor() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let entries = vec![
-            (PathBuf::from("/c/hot"), now - Duration::from_secs(60)),
-            (PathBuf::from("/c/cool"), now - Duration::from_secs(6000)),
+            dir("/c/hot", now - Duration::from_secs(60), false),
+            dir("/c/cool", now - Duration::from_secs(6000), false),
         ];
         let plan = evict_plan(&entries, now, RETENTION, 1, FREE_FLOOR_BYTES);
         assert_eq!(plan, vec![PathBuf::from("/c/cool")]);

@@ -21,7 +21,9 @@
 //! crate the canonical store, drop the keyring backend once soaked.
 //!
 //! Layout:
-//! - `machine.key`     — 32 raw bytes, mode 0600
+//! - `machine.key`     — 32 raw bytes, mode 0600; absent on macOS for the
+//!                        conventional store, whose key is held in the login
+//!                        Keychain instead (see [`kek`])
 //! - `credentials.enc` — `[12-byte nonce | ciphertext_with_tag]`,
 //!                        plaintext is `serde_json::Value` map (provider → token)
 //!
@@ -167,13 +169,17 @@
 //! @yah:handoff("MID-RUN INCIDENT worth recording, since it briefly broke the camp. A python heredoc I used to append the T11 test block over-escaped a newline and wrote a literal two-character `\\n` into app/yah/cli/src/keys_doctor.rs:4331, which made the file fail to PARSE and took `cargo check --workspace` red for everyone. @Ashguard:polaris (R860-T1) caught it, correctly did not edit my in-flight file, and pinged; fixed with Edit inside ~2 minutes and confirmed back to them. Lesson for the next agent appending a test block here: splice with a real newline or use Edit, and re-run the suite before moving on — a parse error in this file is camp-wide, not local. Separately, three of my verification runs failed inside oss/yubaba/crates/cloud/src/config.rs (repel_archetype -> repel_archetypes, then admission_spec gaining a second parameter) — a peer's in-flight W338 placement-group refactor, not mine and not touched; the suite went green once they landed.")
 //! @yah:verify("cargo test -p fob --manifest-path oss/yah-base/Cargo.toml -> 62 pass / 0 fail (F9 baseline 55). cargo test -p yah --lib keys_doctor -> 75 pass / 0 fail (F9 baseline 69).")
 pub mod adjacent;
+pub mod kek;
 pub mod spec;
+pub mod vault;
+pub mod wrap;
 
 pub use adjacent::{AdjacentRecord, AdjacentStore, AdjacentValue};
 pub use spec::{
     parse_sidecar, render_sidecar, spec, specs_in_domain, Band, CredentialSpec, Domain, Expiry,
-    ExpiryKind, HealthRecord, HealthSidecar, MintHelp, Overlap, ProbeFrom, Provider, Verdict,
-    CREDENTIAL_SPECS,
+    ExpiryKind, HealthRecord, HealthSidecar, InventoryFinding, InventoryKind, MintHelp, Overlap,
+    ProbeFrom, Provider, Scope, Verdict, CREDENTIAL_SPECS, classify_claude_probe, NodeHealthRecord,
+    NodeProbeRunner, ProbeRun, CLAUDE_NODE_LOGIN, CLAUDE_NODE_PROBE_TTL_SECS,
 };
 
 use aes_gcm::{
@@ -207,6 +213,12 @@ const ADJACENT_FILE: &str = "credentials-adjacent.enc";
 
 pub struct KeysStore {
     dir: PathBuf,
+    kek: kek::Kek,
+}
+
+/// The conventional store directory, `None` when it cannot be resolved.
+fn conventional_dir() -> Option<PathBuf> {
+    ProjectDirs::from("com", "yah", "yah").map(|p| p.data_dir().to_path_buf())
 }
 
 impl KeysStore {
@@ -215,11 +227,8 @@ impl KeysStore {
     /// machine key — that's `init`'s job, lazily invoked by `set` so
     /// first-time use Just Works.
     pub fn open() -> Result<Self> {
-        let proj = ProjectDirs::from("com", "yah", "yah")
-            .context("could not determine yah data directory")?;
-        let dir = proj.data_dir().to_path_buf();
-        ensure_dir_secure(&dir)?;
-        Ok(Self { dir })
+        let dir = conventional_dir().context("could not determine yah data directory")?;
+        Self::at(dir)
     }
 
     /// Open a store rooted at an explicit directory.
@@ -227,11 +236,77 @@ impl KeysStore {
     /// [`Self::open`] resolves through `ProjectDirs` with no HOME override, so
     /// anything that exercises a real round-trip in-process would write to the
     /// developer's actual vault (see the note at `app/yah/cli/src/camp.rs:708`).
-    /// This is the seam that makes the sidecar testable; `open` is unchanged.
+    /// This is the seam that makes the sidecar testable.
+    ///
+    /// The machine key's holder follows the directory, not the constructor
+    /// (see [`kek`]): the conventional dir gets the platform key holder
+    /// whichever way it was opened, any other dir keeps `machine.key`.
     pub fn at(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
+        let conventional = conventional_dir();
+        if conventional.as_deref() == Some(dir.as_path()) && kek::under_test_harness() {
+            bail!("refusing to open the real credential store from a test binary; use KeysStore::at(<tempdir>)");
+        }
         ensure_dir_secure(&dir)?;
-        Ok(Self { dir })
+        let kek = kek::default_for(&dir, conventional.as_deref());
+        let store = Self { dir, kek };
+        store.migrate_file_kek_best_effort();
+        Ok(store)
+    }
+
+    /// Test seam: a store whose machine key is held by `slot`.
+    #[cfg(test)]
+    fn with_kek_slot(dir: &Path, slot: std::sync::Arc<dyn kek::KekSlot>) -> Self {
+        ensure_dir_secure(dir).unwrap();
+        Self { dir: dir.to_path_buf(), kek: kek::Kek::Held(slot) }
+    }
+
+    fn migrate_file_kek_best_effort(&self) {
+        if let Err(e) = self.migrate_file_kek() {
+            eprintln!("warning: machine key migration skipped, {} kept: {e:#}", MACHINE_KEY_FILE);
+        }
+    }
+
+    /// Move a legacy `machine.key` into the held slot. Returns whether a file
+    /// was removed. The file is deleted only after the slot reads back the
+    /// identical key and every encrypted file in the store opens under it;
+    /// any failure returns early with the file untouched.
+    fn migrate_file_kek(&self) -> Result<bool> {
+        let kek::Kek::Held(slot) = &self.kek else {
+            return Ok(false);
+        };
+        let path = self.machine_key_path();
+        if !path.exists() {
+            return Ok(false);
+        }
+        let file_key = read_key_file(&path)?;
+        match slot.get()? {
+            None => slot.set(&file_key)?,
+            Some(held) if held == file_key => {}
+            Some(_) => bail!(
+                "{} and {} hold different keys; resolve by hand",
+                path.display(),
+                slot.describe()
+            ),
+        }
+        if slot.get()?.as_deref() != Some(&file_key[..]) {
+            bail!("{} did not read back the migrated key", slot.describe());
+        }
+        // Prove the held key opens what is on disk, through the same path
+        // every reader uses, before the file goes.
+        self.read_creds()?;
+        self.read_encrypted(&self.adjacent_path(), "slot-adjacent")?;
+        fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        Ok(true)
+    }
+
+    /// Whether a machine key exists in this store's key holder (or a legacy
+    /// file awaiting migration).
+    fn kek_exists(&self) -> Result<bool> {
+        match &self.kek {
+            kek::Kek::File => Ok(self.machine_key_path().exists()),
+            kek::Kek::Held(slot) => Ok(slot.get()?.is_some() || self.machine_key_path().exists()),
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -267,6 +342,66 @@ impl KeysStore {
         self.write_health(&sidecar)
     }
 
+    /// The mode-A credential gate for one node (W365 §3, R979-F14): the cached
+    /// (`CLAUDE_NODE_LOGIN`, `node`) verdict if younger than `ttl_secs`,
+    /// otherwise a fresh probe run by `runner` — which must build the spawn's
+    /// own environment — recorded in the sidecar before it is returned. Mode A
+    /// is offered iff the returned verdict is [`Verdict::Valid`].
+    pub fn node_gate(
+        &self,
+        runner: &dyn spec::NodeProbeRunner,
+        node: &str,
+        now: DateTime<Utc>,
+        ttl_secs: i64,
+    ) -> Result<spec::NodeHealthRecord> {
+        let cred = spec::CLAUDE_NODE_LOGIN;
+        self.node_verdict(cred.slot, node, now, ttl_secs, || {
+            let run = runner.run_probe(&cred, node);
+            (spec::classify_claude_probe(&run), run.err())
+        })
+    }
+
+    /// The mode-A gate for any credential on one node (W365 §3): the cached
+    /// (`credential`, `node`) verdict if younger than `ttl_secs`, otherwise
+    /// `probe`'s `(verdict, probe_error)`, recorded in the sidecar before it is
+    /// returned. [`Self::node_gate`] is this with the claude-cli login and its
+    /// one-turn probe; R979-F15's HTTP-token backends pass a tier-1
+    /// authenticated call made on the node.
+    pub fn node_verdict(
+        &self,
+        credential: &str,
+        node: &str,
+        now: DateTime<Utc>,
+        ttl_secs: i64,
+        probe: impl FnOnce() -> (spec::Verdict, Option<String>),
+    ) -> Result<spec::NodeHealthRecord> {
+        if let Some(rec) = self.read_health().get_node(credential, node) {
+            if rec.is_fresh(now, ttl_secs) {
+                return Ok(rec.clone());
+            }
+        }
+        let (verdict, probe_error) = probe();
+        let record = spec::NodeHealthRecord {
+            credential: credential.to_string(),
+            node: node.to_string(),
+            last_probe_at: now,
+            probe_error,
+            verdict,
+        };
+        self.record_node(record.clone())?;
+        Ok(record)
+    }
+
+    /// Replace one (credential, node) verdict. Besides [`Self::node_verdict`],
+    /// the writer is a verdict observed rather than probed: a mode-A courier
+    /// that blocked on auth mid-turn (W365 §3), which must send the relay's
+    /// next courier to mode B without waiting out the TTL.
+    pub fn record_node(&self, record: spec::NodeHealthRecord) -> Result<()> {
+        let mut sidecar = self.read_health();
+        sidecar.upsert_node(record);
+        self.write_health(&sidecar)
+    }
+
     /// Record one slot's expiry without disturbing the rest of its record.
     ///
     /// [`Self::record_health`] takes a whole [`spec::HealthRecord`] and
@@ -288,6 +423,21 @@ impl KeysStore {
         self.write_health(&sidecar)
     }
 
+    /// Replace the inventory section of the sidecar (R856-F13), leaving every
+    /// slot's probe record alone. Same read-modify-write shape as
+    /// [`Self::record_expiry`], for the same reason: the sweep writes verdicts
+    /// on its own schedule and neither writer may drop the other's half.
+    pub fn record_inventory(
+        &self,
+        checked_at: DateTime<Utc>,
+        findings: Vec<spec::InventoryFinding>,
+    ) -> Result<()> {
+        let mut sidecar = self.read_health();
+        sidecar.inventory_checked_at = Some(checked_at);
+        sidecar.inventory = findings;
+        self.write_health(&sidecar)
+    }
+
     fn machine_key_path(&self) -> PathBuf {
         self.dir.join(MACHINE_KEY_FILE)
     }
@@ -300,39 +450,39 @@ impl KeysStore {
     /// existing key is preserved (rotating it would orphan any existing
     /// credentials.enc, since this layer doesn't yet do re-encryption).
     pub fn init(&self, force: bool) -> Result<bool> {
-        let path = self.machine_key_path();
-        if path.exists() && !force {
+        if self.kek_exists()? && !force {
             return Ok(false);
         }
         let mut key = [0u8; MACHINE_KEY_BYTES];
         rand::thread_rng().fill_bytes(&mut key);
-        write_secure(&path, &key)?;
+        match &self.kek {
+            kek::Kek::File => write_secure(&self.machine_key_path(), &key)?,
+            kek::Kek::Held(slot) => {
+                slot.set(&key)?;
+                // A rotated key supersedes any legacy file outright.
+                let path = self.machine_key_path();
+                if path.exists() {
+                    fs::remove_file(&path)
+                        .with_context(|| format!("remove {}", path.display()))?;
+                }
+            }
+        }
         Ok(true)
     }
 
     fn load_machine_key(&self) -> Result<[u8; MACHINE_KEY_BYTES]> {
         let path = self.machine_key_path();
+        if let kek::Kek::Held(slot) = &self.kek {
+            if let Some(held) = slot.get()? {
+                return key_from_bytes(&held, &slot.describe());
+            }
+            // Fall through: a legacy file whose migration has not succeeded
+            // yet stays readable, so the vault is never stranded.
+        }
         if !path.exists() {
-            bail!(
-                "machine key missing at {} — run `yah keys init`",
-                path.display()
-            );
+            bail!("machine key missing — run `yah keys init`");
         }
-        let mut buf = Vec::new();
-        File::open(&path)
-            .with_context(|| format!("open {}", path.display()))?
-            .read_to_end(&mut buf)?;
-        if buf.len() != MACHINE_KEY_BYTES {
-            bail!(
-                "machine key at {} is {} bytes, expected {}",
-                path.display(),
-                buf.len(),
-                MACHINE_KEY_BYTES
-            );
-        }
-        let mut out = [0u8; MACHINE_KEY_BYTES];
-        out.copy_from_slice(&buf);
-        Ok(out)
+        read_key_file(&path)
     }
 
     fn cipher(&self) -> Result<Aes256Gcm> {
@@ -413,7 +563,7 @@ impl KeysStore {
     /// `yah keys recover` can put it back.
     pub fn set(&self, provider: &str, token: &str) -> Result<()> {
         validate_provider(provider)?;
-        if !self.machine_key_path().exists() {
+        if !self.kek_exists()? {
             self.init(false)?;
         }
         let mut creds = self.read_creds()?;
@@ -495,6 +645,41 @@ impl KeysStore {
         Ok(creds.get(provider).and_then(|v| v.as_str()).map(str::to_string))
     }
 
+    /// Load the OpenSSH private key in `slot` into the running ssh-agent
+    /// (`SSH_AUTH_SOCK`) without it touching disk or stdout: the key is
+    /// written to `ssh-add -` over a pipe. Callers then select it by its
+    /// `.pub` with `-o IdentityFile=<path>`; the private file can be absent.
+    pub fn ssh_add(&self, slot: &str) -> Result<()> {
+        let Some(mut key) = self.get(slot)? else {
+            bail!("no vault slot {slot}: store the key with `yah keys set {slot} < <private-key-file>`");
+        };
+        // `keys set` trims the trailing newline; OpenSSH's PEM parser wants it.
+        if !key.ends_with('\n') {
+            key.push('\n');
+        }
+        let mut child = std::process::Command::new("ssh-add")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("spawning ssh-add")?;
+        child
+            .stdin
+            .take()
+            .expect("stdin piped")
+            .write_all(key.as_bytes())?;
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!(
+                "ssh-add failed for vault slot {slot} ({}): {}; is SSH_AUTH_SOCK set to a running agent?",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     /// Read `slot` from this vault, falling back to `env_var` on miss.
     /// Vault errors propagate (corrupt machine.key, decrypt failure —
     /// real signals the caller should see); a clean miss falls through
@@ -572,7 +757,7 @@ impl KeysStore {
         if store.slots.is_empty() {
             return Ok(());
         }
-        if !self.machine_key_path().exists() {
+        if !self.kek_exists()? {
             self.init(false)?;
         }
         let plaintext = adjacent::render_adjacent(store).context("serialize slot-adjacent store")?;
@@ -879,7 +1064,7 @@ impl KeysStore {
         incoming: &Map<String, Value>,
         strategy: MergeStrategy,
     ) -> Result<usize> {
-        if !self.machine_key_path().exists() {
+        if !self.kek_exists()? {
             self.init(false)?;
         }
         let existing = self.read_creds()?;
@@ -1027,6 +1212,28 @@ fn validate_provider(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn read_key_file(path: &Path) -> Result<[u8; MACHINE_KEY_BYTES]> {
+    let mut buf = Vec::new();
+    File::open(path)
+        .with_context(|| format!("open {}", path.display()))?
+        .read_to_end(&mut buf)?;
+    key_from_bytes(&buf, &path.display().to_string())
+}
+
+fn key_from_bytes(buf: &[u8], from: &str) -> Result<[u8; MACHINE_KEY_BYTES]> {
+    if buf.len() != MACHINE_KEY_BYTES {
+        bail!(
+            "machine key at {from} is {} bytes, expected {MACHINE_KEY_BYTES}",
+            buf.len()
+        );
+    }
+    let mut out = [0u8; MACHINE_KEY_BYTES];
+    out.copy_from_slice(buf);
+    Ok(out)
+}
+
+/// Create the store dir at 0700 and mark it backup-excluded. Both run on
+/// every open, so a dir created before either rule existed converges.
 fn ensure_dir_secure(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     #[cfg(unix)]
@@ -1035,6 +1242,7 @@ fn ensure_dir_secure(dir: &Path) -> Result<()> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("chmod 0700 {}", dir.display()))?;
     }
+    kek::mark_backup_excluded(dir)?;
     Ok(())
 }
 
@@ -1112,7 +1320,7 @@ mod tests {
 
     fn store_in(dir: &Path) -> KeysStore {
         ensure_dir_secure(dir).unwrap();
-        KeysStore { dir: dir.to_path_buf() }
+        KeysStore { dir: dir.to_path_buf(), kek: kek::Kek::File }
     }
 
     #[test]
@@ -1505,6 +1713,102 @@ mod tests {
         );
     }
 
+    /// R979-F14 test double: counts runs, replays canned claude JSON.
+    struct FakeNodeProbe {
+        stdout: &'static str,
+        runs: std::cell::Cell<u32>,
+    }
+
+    impl spec::NodeProbeRunner for FakeNodeProbe {
+        fn run_probe(
+            &self,
+            spec: &spec::CredentialSpec,
+            _node: &str,
+        ) -> std::result::Result<spec::ProbeRun, String> {
+            assert_eq!(spec.probe_from, spec::ProbeFrom::Node);
+            self.runs.set(self.runs.get() + 1);
+            Ok(spec::ProbeRun { success: true, stdout: self.stdout.into(), stderr: String::new() })
+        }
+    }
+
+    #[test]
+    fn node_gate_keys_the_verdict_by_credential_and_node_and_caches_within_ttl() {
+        let tmp = TempDir::new().unwrap();
+        let s = KeysStore::at(tmp.path()).unwrap();
+        s.record_health(spec::HealthRecord::new("github-pat")).unwrap();
+        let ok = FakeNodeProbe { stdout: r#"{"is_error":false,"result":"ok"}"#, runs: 0.into() };
+        let t0 = Utc::now();
+        let rec = s.node_gate(&ok, "us-west-003", t0, spec::CLAUDE_NODE_PROBE_TTL_SECS).unwrap();
+        assert_eq!(rec.verdict, spec::Verdict::Valid { as_identity: None });
+        assert_eq!(rec.node, "us-west-003");
+
+        // Plain file, no machine key: the wheel's read path.
+        let reader = KeysStore::at(tmp.path()).unwrap().read_health();
+        assert!(!s.machine_key_path().exists());
+        assert!(reader.get_node("claude-node-login", "us-west-003").is_some());
+        assert!(reader.get_node("claude-node-login", "us-west-001").is_none());
+        assert!(reader.get("github-pat").is_some(), "per-slot records survive beside node ones");
+
+        s.node_gate(&ok, "us-west-003", t0 + chrono::Duration::minutes(59), 3600).unwrap();
+        assert_eq!(ok.runs.get(), 1, "fresh verdict reused");
+        s.node_gate(&ok, "us-west-003", t0 + chrono::Duration::minutes(61), 3600).unwrap();
+        assert_eq!(ok.runs.get(), 2, "stale verdict re-probed");
+
+        let bad = FakeNodeProbe {
+            stdout: r#"{"is_error":true,"result":"Invalid API key · Fix external API key","api_error_status":401}"#,
+            runs: 0.into(),
+        };
+        let rec = s.node_gate(&bad, "us-west-001", t0, 3600).unwrap();
+        assert_eq!(rec.verdict, spec::Verdict::Revoked);
+    }
+
+    /// R979-F15: an HTTP-token credential's verdict is keyed by its own name
+    /// and node, reused inside the TTL, and an observed verdict replaces it.
+    #[test]
+    fn node_verdict_caches_per_credential_and_node_and_takes_observed_verdicts() {
+        let tmp = TempDir::new().unwrap();
+        let s = KeysStore::at(tmp.path()).unwrap();
+        let ttl = spec::HTTP_TOKEN_NODE_PROBE_TTL_SECS;
+        let runs = std::cell::Cell::new(0);
+        let valid = || {
+            runs.set(runs.get() + 1);
+            (spec::Verdict::Valid { as_identity: None }, None)
+        };
+        let t0 = Utc::now();
+        let rec = s.node_verdict("deepseek-api-key", "us-west-003", t0, ttl, valid).unwrap();
+        assert_eq!((rec.credential.as_str(), rec.verdict.as_str()), ("deepseek-api-key", "valid"));
+        s.node_verdict("deepseek-api-key", "us-west-003", t0 + chrono::Duration::seconds(ttl - 1), ttl, valid).unwrap();
+        assert_eq!(runs.get(), 1, "fresh verdict reused");
+        s.node_verdict("deepseek-api-key", "us-west-001", t0, ttl, valid).unwrap();
+        assert_eq!(runs.get(), 2, "another node is its own record");
+
+        s.record_node(spec::NodeHealthRecord {
+            credential: "deepseek-api-key".into(),
+            node: "us-west-003".into(),
+            last_probe_at: t0,
+            verdict: spec::Verdict::Revoked,
+            probe_error: Some("observed: blocked on api_auth mid-turn".into()),
+        })
+        .unwrap();
+        let rec = s.node_verdict("deepseek-api-key", "us-west-003", t0, ttl, valid).unwrap();
+        assert_eq!(rec.verdict, spec::Verdict::Revoked, "the observed verdict stands until it is stale");
+        assert_eq!(runs.get(), 2);
+        let rec = s.node_verdict("deepseek-api-key", "us-west-003", t0 + chrono::Duration::seconds(ttl), ttl, valid).unwrap();
+        assert_eq!((rec.verdict.as_str(), runs.get()), ("valid", 3), "a stale one is re-probed");
+    }
+
+    #[test]
+    fn claude_probe_classification_fails_closed() {
+        let run = |ok: bool, out: &str| Ok(spec::ProbeRun { success: ok, stdout: out.into(), stderr: String::new() });
+        let v = spec::classify_claude_probe;
+        assert_eq!(v(&Err("ssh: no route".into())).as_str(), "indeterminate");
+        assert_eq!(v(&run(false, "")).as_str(), "indeterminate");
+        assert_eq!(v(&run(false, r#"{"is_error":false,"result":"ok"}"#)).as_str(), "indeterminate");
+        assert_eq!(v(&run(true, r#"{"is_error":true,"result":"Not logged in · Please run /login"}"#)).as_str(), "revoked");
+        assert_eq!(v(&run(true, r#"{"is_error":true,"result":"Usage limit reached","api_error_status":429}"#)).as_str(), "quota-exhausted");
+        assert_eq!(v(&run(true, r#"{"is_error":true,"result":"overloaded","api_error_status":529}"#)).as_str(), "indeterminate");
+    }
+
     #[test]
     fn sidecar_is_0644_not_0600() {
         let tmp = TempDir::new().unwrap();
@@ -1885,5 +2189,142 @@ mod tests {
             let m = at(&"y".repeat(len)).masked();
             assert_eq!(m, format!("{}... ({len} chars)", "y".repeat(8)), "{m}");
         }
+    }
+
+    /// In-memory stand-in for the Keychain: no test touches a real item.
+    #[derive(Default)]
+    struct MemSlot {
+        key: std::sync::Mutex<Option<Vec<u8>>>,
+        fail_set: bool,
+    }
+
+    impl kek::KekSlot for MemSlot {
+        fn get(&self) -> Result<Option<Vec<u8>>> {
+            Ok(self.key.lock().unwrap().clone())
+        }
+        fn set(&self, key: &[u8]) -> Result<()> {
+            if self.fail_set {
+                bail!("slot refused the write");
+            }
+            *self.key.lock().unwrap() = Some(key.to_vec());
+            Ok(())
+        }
+        fn describe(&self) -> String {
+            "mem slot".into()
+        }
+    }
+
+    /// A file-keyed store with live ciphertext in both encrypted files.
+    fn legacy_store(dir: &Path) -> Vec<u8> {
+        let legacy = store_in(dir);
+        legacy.set("alpha", "one").unwrap();
+        legacy.set("alpha", "two").unwrap(); // stashes "one" into credentials-adjacent.enc
+        assert!(legacy.adjacent_path().exists());
+        std::fs::read(dir.join(MACHINE_KEY_FILE)).unwrap()
+    }
+
+    #[test]
+    fn migration_moves_the_key_out_of_the_dir_and_the_vault_still_opens() {
+        let tmp = TempDir::new().unwrap();
+        let file_key = legacy_store(tmp.path());
+        let slot = std::sync::Arc::new(MemSlot::default());
+        let s = KeysStore::with_kek_slot(tmp.path(), slot.clone());
+
+        assert!(s.migrate_file_kek().unwrap());
+        assert!(!tmp.path().join(MACHINE_KEY_FILE).exists(), "key file must be gone");
+        assert_eq!(slot.key.lock().unwrap().as_deref(), Some(&file_key[..]));
+        assert_eq!(s.get("alpha").unwrap().as_deref(), Some("two"));
+        assert_eq!(s.previous("alpha").unwrap().len(), 1);
+        // Idempotent: a second pass has nothing to move.
+        assert!(!s.migrate_file_kek().unwrap());
+        // A copy of the dir alone no longer opens: no key file travels with it.
+        let copy = store_in(tmp.path());
+        assert!(copy.get("alpha").is_err());
+    }
+
+    #[test]
+    fn a_failed_migration_keeps_the_file_and_the_vault_readable() {
+        let tmp = TempDir::new().unwrap();
+        legacy_store(tmp.path());
+        let slot = std::sync::Arc::new(MemSlot { fail_set: true, ..Default::default() });
+        let s = KeysStore::with_kek_slot(tmp.path(), slot);
+
+        assert!(s.migrate_file_kek().is_err());
+        assert!(tmp.path().join(MACHINE_KEY_FILE).exists());
+        assert_eq!(s.get("alpha").unwrap().as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn migration_refuses_when_slot_and_file_disagree() {
+        let tmp = TempDir::new().unwrap();
+        legacy_store(tmp.path());
+        let slot = std::sync::Arc::new(MemSlot::default());
+        *slot.key.lock().unwrap() = Some(vec![7u8; MACHINE_KEY_BYTES]);
+        let s = KeysStore::with_kek_slot(tmp.path(), slot.clone());
+
+        assert!(s.migrate_file_kek().is_err());
+        assert!(tmp.path().join(MACHINE_KEY_FILE).exists(), "file kept on conflict");
+        assert_eq!(slot.key.lock().unwrap().as_deref(), Some(&[7u8; MACHINE_KEY_BYTES][..]));
+    }
+
+    #[test]
+    fn migration_refuses_a_key_that_does_not_open_the_ciphertext() {
+        let tmp = TempDir::new().unwrap();
+        legacy_store(tmp.path());
+        // Corrupt the ciphertext: the read-back proof must fail before delete.
+        std::fs::write(tmp.path().join(CREDENTIALS_FILE), [0u8; 64]).unwrap();
+        let s = KeysStore::with_kek_slot(tmp.path(), std::sync::Arc::new(MemSlot::default()));
+
+        assert!(s.migrate_file_kek().is_err());
+        assert!(tmp.path().join(MACHINE_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn a_held_store_never_writes_a_key_file() {
+        let tmp = TempDir::new().unwrap();
+        let s = KeysStore::with_kek_slot(tmp.path(), std::sync::Arc::new(MemSlot::default()));
+        s.set("beta", "v").unwrap();
+        assert!(!tmp.path().join(MACHINE_KEY_FILE).exists());
+        assert_eq!(s.get("beta").unwrap().as_deref(), Some("v"));
+    }
+
+    #[test]
+    fn tests_can_never_open_the_real_store() {
+        assert!(kek::under_test_harness());
+        let err = KeysStore::open().err().expect("open() must refuse under test");
+        assert!(err.to_string().contains("refusing to open the real credential store"));
+        // The free helper degrades to the env fallback instead of touching it.
+        assert!(get_or_env("any-slot", "R997_UNSET_ENV_VAR").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_non_conventional_dir_keeps_the_file_key() {
+        let tmp = TempDir::new().unwrap();
+        let s = KeysStore::at(tmp.path()).unwrap();
+        assert!(matches!(s.kek, kek::Kek::File));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_store_dir_is_excluded_from_time_machine() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("store");
+        KeysStore::at(&dir).unwrap();
+        let path = CString::new(dir.as_os_str().as_bytes()).unwrap();
+        let mut buf = [0u8; 128];
+        let n = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                kek::BACKUP_EXCLUDE_XATTR.as_ptr().cast(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                0,
+            )
+        };
+        assert!(n > 0, "exclusion xattr missing");
+        assert!(buf[..n as usize].starts_with(b"bplist00"));
     }
 }

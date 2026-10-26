@@ -9,7 +9,7 @@
 # @yah:verify("cargo metadata --format-version 1 >/dev/null")
 # @yah:assumes("Stage 1 verified cargo metadata RESOLUTION only, not a full cargo build/test.")
 # @yah:assumes("yah- renames assume package= alias keeps Rust use workload_spec working without code edits — verify on first rename.")
-# @yah:handoff("COMPLETE. (1) Split yah-base + kamaji out of yubaba (acyclic DAG yah-base <- {qed,kamaji} <- yubaba). (2) yah- renamed workload-spec->yah-workload-spec, local-driver->yah-local-driver via package= aliases (use lines unchanged). (3) Publish-enablement: version+[patch] cross-deps, strip-on-export in export-oss.sh, OIDC release.yml on yah-base/kamaji. (4) PUBLISHED all 11 crates @0.8.16 to crates.io (yah-base x4 by 1e1f w/ yah-human co-owner accepted; qed x4 + kamaji x3 by yah-human). (5) Mirrors live + patch-stripped: yah-ai/{yah-base,kamaji} first-time-populated, yah-ai/{qed,yubaba} refreshed — verified kamaji mirror has NO [patch.crates-io] and kamaji-bin deps yah-workload-spec by version from crates.io. (6) R539 archived (subsumed).")
+# @yah:handoff("COMPLETE. (1) Split yah-base + kamaji out of yubaba (acyclic DAG yah-base <- {qed,kamaji} <- yubaba). (2) yah- renamed workload-spec->yah-workload-spec, local-driver->yah-local-driver via package= aliases (use lines unchanged). (3) Publish-enablement: version+[patch] cross-deps, strip-on-export in export-oss.sh, OIDC release.yml on yah-base/kamaji. (4) PUBLISHED all 11 crates @0.8.16 to crates.io (yah-base x4 by <personal-account> w/ yah-human co-owner accepted; qed x4 + kamaji x3 by yah-human). (5) Mirrors live + patch-stripped: yah-ai/{yah-base,kamaji} first-time-populated, yah-ai/{qed,yubaba} refreshed — verified kamaji mirror has NO [patch.crates-io] and kamaji-bin deps yah-workload-spec by version from crates.io. (6) R539 archived (subsumed).")
 # @yah:handoff("Commits 75d8df7 (split+rename) + e19ef66 (publish-prep) on main, not pushed/tagged. New tooling: scripts/commit-oss-split.sh, commit-oss-publish-prep.sh, export-oss-clean.sh (runs export from a clean worktree at HEAD — the right way to export off the always-dirty shared camp tree).")
 # @yah:handoff("Original goal achieved: yubaba mirror's cross-repo deps (yah-base + velveteen + kamaji-bin) all resolve from crates.io, so its cargo test --workspace passes. yubaba publishes nothing (all members publish=false).")
 # @yah:gotcha("RESOLVED 2026-07-20 (was: kamaji-bin publish=false broke the standalone yubaba mirror's cargo test --workspace). kamaji-bin no longer carries publish=false and is on crates.io at 0.8.20, so the yubaba mirror resolves it from the registry.")
@@ -20,7 +20,7 @@
 # @yah:next("COMPLETE 2026-07-21. The full oss publish chain is live: 17 crates at 0.8.20 on crates.io, all 6 mirrors (yah-base, kamaji, qed, xlb, mshr, srcgraph) current and each carrying an OIDC release.yml, and all 17 crates configured with a crates.io Trusted Publisher (owner yah-ai/<repo>, workflow release.yml). Future releases are a tag push, not a manual oss-publish.sh run.")
 # @yah:next("New tooling: scripts/set-trusted-publishers.sh — idempotent (GET-checks and skips existing configs), DRY_RUN=1 supported, accepts a crate allowlist. Verified idempotent by a second run reporting all 17 as skip.")
 # @yah:next("Remaining, and NOT this relay's: R610's HELD_ON_OSS in scripts/internal-publish.sh can drop every name held on srcgraph/yah-base/kamaji/qed/xlb. Names held on yubaba/cloud stay blocked — oss/yubaba has ZERO publishable members (all publish=false), which is a design question, not a publish.")
-# @yah:next("Optional cosmetic: cargo owner --remove 1e1f from the 4 original yah-base crates once yah-human sole ownership is wanted (operator previously said not yet).")
+# @yah:next("Optional cosmetic: cargo owner --remove <personal-account> from the 4 original yah-base crates once yah-human sole ownership is wanted (operator previously said not yet).")
 
 [workspace]
 members = [
@@ -41,7 +41,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.46"
+version = "0.8.48"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

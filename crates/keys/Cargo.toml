@@ -18,6 +18,17 @@ directories = "6.0"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# R975-F15: HKDF-SHA256 turns the X25519 shared secret into the AES key of a
+# device's VK wrap (wrap.rs). Same majors the yah root lockfile already carries.
+hkdf = "0.12"
+sha2 = "0.10"
+
+# R997-B7: the conventional store's machine key lives in the login Keychain
+# (kek.rs), and the store dir carries the Time Machine exclusion xattr.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+security-framework = "3"
 
 [dev-dependencies]
 tempfile = "3.23"

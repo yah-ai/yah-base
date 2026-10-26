@@ -706,6 +706,22 @@ pub fn shape(spec: &WorkloadSpec) -> Result<Vec<ShapeWarning>, ShapeError> {
         }
     }
 
+    // R971-B9: a disposable declaration must name a mounted named volume. A
+    // typo would otherwise leave the real volume stateful and fail placement
+    // with no hint why the declaration did nothing.
+    for name in spec.disposable_volumes() {
+        let mounted = spec
+            .volumes
+            .iter()
+            .any(|v| matches!(&v.source, VolumeSource::Named { name: n } if n == name));
+        if !mounted {
+            return Err(ShapeError::Field {
+                path: FieldPath::Annotation(crate::DISPOSABLE_VOLUMES_ANNOTATION.to_string()),
+                reason: format!("{name:?} is not a named volume this spec mounts"),
+            });
+        }
+    }
+
     if durability.is_none()
         && spec.effective_archetype() == LifecycleArchetype::Appliance
         && spec

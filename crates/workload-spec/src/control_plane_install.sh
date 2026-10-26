@@ -36,10 +36,56 @@ cd "$WORK"
 
 echo "== fetch + verify (sha256 from signed manifest) =="
 curl -fsSL -o pair.tar.gz "$URL"
-printf '%s  pair.tar.gz\n' "$SHA" | sha256sum -c -
+if [ "$(uname -s)" = Darwin ]; then
+  # macOS ships no sha256sum; shasum takes the same check-file format.
+  printf '%s  pair.tar.gz\n' "$SHA" | shasum -a 256 -c -
+else
+  printf '%s  pair.tar.gz\n' "$SHA" | sha256sum -c -
+fi
 mkdir x && tar -xzf pair.tar.gz -C x
 D="$(find x -maxdepth 1 -type d -name 'yubaba-*' | head -1)"
 [ -n "$D" ] || { echo 'tarball layout unexpected: no yubaba-* dir' >&2; exit 1; }
+
+# ── darwin (us-west-015) ────────────────────────────────────────────────────
+# A darwin node is a different install, not a variant of the one below: the
+# pair runs as the console user's launchd agents (dev.yah.kamaji /
+# dev.yah.yubaba, gui/<uid>) out of ~/.local/bin, the tarball carries the two
+# binaries only, and the plists are node state (DOCKER_HOST, --state path) that
+# a roll must not overwrite. No sudo: the service account owns ~/.local/bin.
+# Runs under macOS's /bin/bash 3.2 — keep it free of bash-4 syntax.
+if [ "$(uname -s)" = Darwin ]; then
+  BIN="${YAH_BIN_DIR:-$HOME/.local/bin}"
+  DOMAIN="gui/$(id -u)"
+  for b in yubaba kamaji; do
+    [ -x "$D/$b" ] || { echo "darwin tarball carries no $b" >&2; exit 1; }
+    launchctl print "$DOMAIN/dev.yah.$b" >/dev/null 2>&1 \
+      || { echo "no launchd agent $DOMAIN/dev.yah.$b — provision the node first" >&2; exit 1; }
+  done
+  echo "== rollback anchors (.rollback-$STAMP) =="
+  for b in yubaba kamaji; do
+    f="$BIN/$b"
+    [ -e "$f" ] || continue
+    if [ ! -e "$f.rollback-$STAMP" ]; then cp -p "$f" "$f.rollback-$STAMP"; echo "  anchored $f.rollback-$STAMP"
+    else echo "  kept existing $f.rollback-$STAMP (pre-roll build for today)"; fi
+  done
+  echo "== install (atomic, yubaba + kamaji as one pair) =="
+  for b in yubaba kamaji; do
+    install -m0755 "$D/$b" "$BIN/$b.roll-new.$$"
+    mv -f "$BIN/$b.roll-new.$$" "$BIN/$b"
+  done
+  echo "== assert by CONTENT, not by version string =="
+  for b in yubaba kamaji; do
+    want="$(shasum -a 256 "$D/$b" | awk '{print $1}')"
+    got="$(shasum -a 256 "$BIN/$b" | awk '{print $1}')"
+    [ "$want" = "$got" ] || { echo "content assertion FAILED for $BIN/$b: tarball has $want, installed file has $got" >&2; exit 1; }
+    echo "  $BIN/$b sha256=$got"
+  done
+  echo "== restart agents (kamaji then yubaba, W154 order) =="
+  launchctl kickstart -k "$DOMAIN/dev.yah.kamaji"
+  launchctl kickstart -k "$DOMAIN/dev.yah.yubaba"
+  echo "installed target=$VER yubaba=$("$BIN/yubaba" --version 2>/dev/null) kamaji=$("$BIN/kamaji" --version 2>/dev/null)"
+  exit 0
+fi
 
 echo "== rollback anchors (.rollback-$STAMP) =="
 # The convention these boxes already carry: /usr/local/bin/kamaji.rollback-YYYYMMDD,
@@ -205,7 +251,7 @@ fi
 #
 # This script CANNOT MINT the credential — it is not in the release tarball —
 # so it can only detect an operator-placed credential file and wire it,
-# mirroring how /etc/yah-cloud/cert-store.env is delivered for the cert store
+# mirroring how <cloud-conf-dir>/cert-store.env is delivered for the cert store
 # (us-east-001.toml:148-153: no in-tree writer places that file either, an
 # operator does, and yubaba.service.d/50-cert-store.conf only references it).
 HEADSCALE_DURABILITY_CRED=/etc/yah-cloud/headscale-durability.env
